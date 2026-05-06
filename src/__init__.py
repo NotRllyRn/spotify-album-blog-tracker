@@ -1,0 +1,1 @@
+# Spotify WordPress Album Tracker package
