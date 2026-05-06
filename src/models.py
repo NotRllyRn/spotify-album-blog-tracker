@@ -89,7 +89,7 @@ class WordPressPost:
 class DiscordPrompt:
     id: int
     prompt_type: str
+    discord_message_id: str
+    state: str
     release_id: Optional[str] = None
     wordpress_post_id: Optional[int] = None
-    discord_message_id: str
-    state: str  # pending, accepted, declined, used, expired
