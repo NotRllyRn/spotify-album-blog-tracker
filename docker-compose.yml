@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  spotify-wordpress-tracker:
+    build: .
+    container_name: spotify-wordpress-tracker
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./.spotify_tokens:/app/.spotify_tokens
+      - ./album_tracker.db:/app/album_tracker.db
+    restart: unless-stopped
+    stdin_open: true
+    tty: true

@@ -127,6 +127,22 @@ class Database:
         await self.connection.commit()
         return release_id
 
+    async def delete_release(self, spotify_id: str) -> bool:
+        """Delete a release and its associated data by Spotify ID."""
+        cursor = await self.connection.execute(
+            "SELECT id FROM release_lifecycle WHERE spotify_id = ?",
+            (spotify_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return False
+
+        release_id = row[0]
+        await self.connection.execute("DELETE FROM discord_prompt WHERE release_id = ?", (spotify_id,))
+        await self.connection.execute("DELETE FROM release_lifecycle WHERE id = ?", (release_id,))
+        await self.connection.commit()
+        return True
+
     async def get_active_releases(self) -> List[Release]:
         """Get all active releases."""
         cursor = await self.connection.execute("""
@@ -283,6 +299,35 @@ class Database:
             SELECT id, prompt_type, release_id, wordpress_post_id, discord_message_id, state
             FROM discord_prompt WHERE discord_message_id = ?
         """, (message_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return DiscordPrompt(
+            id=row[0],
+            prompt_type=row[1],
+            release_id=row[2],
+            wordpress_post_id=row[3],
+            discord_message_id=row[4],
+            state=row[5]
+        )
+
+    async def has_discord_prompt(self, release_id: str, prompt_type: str) -> bool:
+        """Check whether a Discord prompt already exists for a release."""
+        cursor = await self.connection.execute("""
+            SELECT 1 FROM discord_prompt
+            WHERE release_id = ? AND prompt_type = ?
+            LIMIT 1
+        """, (release_id, prompt_type))
+        return await cursor.fetchone() is not None
+
+    async def get_discord_prompt_by_release_and_type(self, release_id: str, prompt_type: str) -> Optional[DiscordPrompt]:
+        """Get the latest Discord prompt for a release and prompt type."""
+        cursor = await self.connection.execute("""
+            SELECT id, prompt_type, release_id, wordpress_post_id, discord_message_id, state
+            FROM discord_prompt
+            WHERE release_id = ? AND prompt_type = ?
+            ORDER BY id DESC LIMIT 1
+        """, (release_id, prompt_type))
         row = await cursor.fetchone()
         if not row:
             return None

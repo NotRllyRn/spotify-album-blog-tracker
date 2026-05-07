@@ -10,17 +10,18 @@ from typing import Optional, Dict, Any
 from config import Config
 from database import Database
 from spotify_client import SpotifyClient
-from models import PlaybackState, Release, Track, Artist, ReleaseType, LifecycleStatus
+from models import PlaybackState, Release, Track, Artist, ReleaseType, LifecycleStatus, PromptType, PromptState, DiscordPrompt
 from utils import normalize_text, normalize_artist_list, compute_release_type
 
 logger = logging.getLogger(__name__)
 
 class Tracker:
-    def __init__(self, config: Config, db: Database, publisher=None):
+    def __init__(self, config: Config, db: Database, publisher=None, discord_bot=None):
         self.config = config
         self.db = db
         self.spotify = SpotifyClient(config)
         self.publisher = publisher
+        self.discord_bot = discord_bot
         self.running = False
 
         # Polling intervals (seconds)
@@ -28,6 +29,9 @@ class Tracker:
         self.paused_interval = 8
         self.idle_interval = 15
         self.backoff_interval = 60
+
+    def set_discord_bot(self, discord_bot):
+        self.discord_bot = discord_bot
 
     async def run(self):
         """Main tracking loop."""
@@ -77,7 +81,7 @@ class Tracker:
             await self._recompute_release_progress(release)
 
             # Check for prompts
-            if release.progress >= 0.75 and not self._has_75_prompt(release):
+            if release.progress >= 0.75 and not await self._has_75_prompt(release):
                 await self._send_75_prompt(release)
 
             if release.progress >= 1.0:
@@ -106,7 +110,7 @@ class Tracker:
         if state.item is None:
             return False
 
-        if state.item.get("currently_playing_type") != "track":
+        if state.item.get("type") != "track":
             return False
 
         if state.item.get("is_local", False):
@@ -222,12 +226,17 @@ class Tracker:
 
         await self.db.save_release(release)
 
-    def _has_75_prompt(self, release: Release) -> bool:
+    async def _has_75_prompt(self, release: Release) -> bool:
         """Check if 75% prompt has been sent."""
-        # Check database if release has a pending 75% prompt
-        prompt_states = ["75_percent", "awaiting_75_decision"]
-        # This will be checked when updating prompts from Discord
-        return release.status == LifecycleStatus.AWAITING_75_DECISION
+        if release.status == LifecycleStatus.AWAITING_75_DECISION:
+            return True
+        return await self.db.has_discord_prompt(release.spotify_id, PromptType.PROMPT_75_PERCENT.value)
+
+    async def _has_relisten_prompt(self, release: Release) -> bool:
+        """Check if a relisten prompt has been sent."""
+        if release.status == LifecycleStatus.AWAITING_RELISION_DECISION:
+            return True
+        return await self.db.has_discord_prompt(release.spotify_id, PromptType.PROMPT_RELISTEN.value)
 
     async def _send_75_prompt(self, release: Release):
         """Send 75% completion prompt."""
@@ -237,12 +246,34 @@ class Tracker:
             "spotify_id": release.spotify_id,
             "release_title": release.title
         })
+
+        if self.discord_bot:
+            message = await self.discord_bot.send_75_percent_prompt(release)
+            if message:
+                prompt = DiscordPrompt(
+                    id=0,
+                    prompt_type=PromptType.PROMPT_75_PERCENT.value,
+                    release_id=release.spotify_id,
+                    wordpress_post_id=None,
+                    discord_message_id=str(message.id),
+                    state=PromptState.PENDING.value
+                )
+                await self.db.save_discord_prompt(prompt)
+
         logger.info(f"75% prompt sent for {release.title}")
 
     async def _handle_completion(self, release: Release):
         """Handle release completion."""
+        if release.status in (
+            LifecycleStatus.PUBLISHED,
+            LifecycleStatus.TRASHED_POST,
+            LifecycleStatus.IGNORED_SINGLE,
+            LifecycleStatus.DELETED
+        ):
+            return
+
         release.completed_at = datetime.now()
-        
+
         # Check for duplicates
         if release.duplicate_state is None:
             duplicate_post = await self._check_duplicate(release)
@@ -250,10 +281,14 @@ class Tracker:
                 release.duplicate_state = "found"
                 release.duplicate_post_id = duplicate_post.id
                 release.status = LifecycleStatus.AWAITING_RELISION_DECISION
-                await self._send_relisten_prompt(release)
+                if not await self._has_relisten_prompt(release):
+                    await self._send_relisten_prompt(release)
             else:
                 release.duplicate_state = "none"
                 await self._publish_release(release)
+        elif release.duplicate_state == "found" and not await self._has_relisten_prompt(release):
+            release.status = LifecycleStatus.AWAITING_RELISION_DECISION
+            await self._send_relisten_prompt(release)
 
         await self.db.save_release(release)
 
@@ -284,21 +319,59 @@ class Tracker:
             "spotify_id": release.spotify_id,
             "release_title": release.title
         })
+
+        if self.discord_bot:
+            message = await self.discord_bot.send_relisten_prompt(release)
+            if message:
+                prompt = DiscordPrompt(
+                    id=0,
+                    prompt_type=PromptType.PROMPT_RELISTEN.value,
+                    release_id=release.spotify_id,
+                    wordpress_post_id=None,
+                    discord_message_id=str(message.id),
+                    state=PromptState.PENDING.value
+                )
+                await self.db.save_discord_prompt(prompt)
+
         logger.info(f"Relisten prompt sent for {release.title}")
 
-    async def _publish_release(self, release: Release):
+    async def publish_release_now(self, release: Release, as_relisten: bool = False):
+        """Publish a release immediately from a Discord prompt action."""
+        if release.status == LifecycleStatus.PUBLISHED:
+            return release
+
+        release.status = LifecycleStatus.PUBLISHING
+        await self.db.save_release(release)
+        await self._publish_release(release, as_relisten=as_relisten)
+        return release
+
+    async def _publish_release(self, release: Release, as_relisten: bool = False):
         """Publish release to WordPress."""
         try:
-            # This will be implemented in wordpress publishing module
             release.status = LifecycleStatus.PUBLISHING
             await self.db.save_release(release)
-            await self.db.log_audit_event("release_publishing", {
+
+            # Publish via publisher
+            post = await self.publisher.publish_release(release, as_relisten=as_relisten)
+
+            release.status = LifecycleStatus.PUBLISHED
+            release.published_at = datetime.now()
+            await self.db.save_release(release)
+
+            if self.discord_bot:
+                await self.discord_bot.send_publish_notification(release, post)
+
+            await self.db.log_audit_event("release_published", {
                 "spotify_id": release.spotify_id,
-                "release_title": release.title
+                "release_title": release.title,
+                "wordpress_post_id": post["id"]
             })
-            logger.info(f"Publishing {release.title} to WordPress")
+            logger.info(f"Published {release.title} to WordPress post {post['id']}")
+
         except Exception as e:
-            logger.error(f"Error publishing release: {e}")
+            logger.error(f"Error publishing release {release.title}: {e}")
+            release.status = LifecycleStatus.ACTIVE  # Reset status on failure
+            await self.db.save_release(release)
             raise
 
     async def _handle_idle(self):
@@ -315,4 +388,9 @@ class Tracker:
         """Update current listening cache."""
         # Store for /current command access
         await self.db.save_service_state("current_playback_state", str(state))
-        pass
+
+        if self.discord_bot:
+            try:
+                await self.discord_bot.update_presence(state)
+            except Exception as e:
+                logger.debug(f"Unable to update Discord presence: {e}")

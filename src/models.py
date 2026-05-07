@@ -23,6 +23,18 @@ class LifecycleStatus(Enum):
     IGNORED_SINGLE = "ignored_single"
     TRASHED_POST = "trashed_post"
 
+class PromptType(Enum):
+    PROMPT_75_PERCENT = "75_percent"
+    PROMPT_RELISTEN = "relisten"
+    PROMPT_UNDO = "undo"
+
+class PromptState(Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+    USED = "used"
+    EXPIRED = "expired"
+
 @dataclass
 class Artist:
     spotify_id: str

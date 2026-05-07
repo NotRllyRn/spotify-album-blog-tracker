@@ -31,9 +31,13 @@ class Service:
         self.publisher = Publisher(self.config)
         self.tracker = Tracker(self.config, self.db, self.publisher)
         self.discord_bot = DiscordBot(self.config, self.db, self.tracker)
+        self.tracker.set_discord_bot(self.discord_bot)
 
     async def start(self):
         logger.info("Starting Spotify WordPress Album Tracker...")
+
+        # Ensure Spotify authorization
+        await self.tracker.spotify.ensure_authorized()
 
         # Initialize database
         await self.db.initialize()
@@ -41,11 +45,12 @@ class Service:
         # Refresh WordPress post cache for duplicate detection
         await self.publisher.refresh_post_cache()
 
+        # Start Discord bot and wait until ready before tracking begins
+        discord_task = asyncio.create_task(self.discord_bot.start())
+        await self.discord_bot.wait_until_ready()
+
         # Start tracker
         tracker_task = asyncio.create_task(self.tracker.run())
-
-        # Start Discord bot
-        discord_task = asyncio.create_task(self.discord_bot.start())
 
         # Wait for both (they run indefinitely)
         await asyncio.gather(tracker_task, discord_task)
