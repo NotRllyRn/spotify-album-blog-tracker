@@ -282,7 +282,7 @@ class DiscordBot:
 
         try:
             parsed_link = urlparse(raw_link)
-            public_base = urlparse(self.config.wordpress_url.rstrip("/"))
+            public_base = urlparse(self.config.wordpress_public_url.rstrip("/"))
 
             if not parsed_link.path:
                 return raw_link
@@ -293,24 +293,25 @@ class DiscordBot:
 
     async def update_presence(self, state) -> None:
         """Update the bot presence to reflect current listening state."""
-        if not self.bot.is_ready() or state is None or not state.item:
-            try:
-                await self.bot.change_presence(activity=None)
-            except Exception:
-                pass
+        if not self.bot.is_ready():
             return
 
-        item = state.item
-        track_name = item.get("name", "Unknown")
-        artists = [a.get("name") for a in item.get("artists", []) if a.get("name")]
-        artist_text = ", ".join(artists[:2]) if artists else "Unknown"
-        activity = discord.Activity(
-            type=discord.ActivityType.listening,
-            name=f"{track_name} by {artist_text}"
-        )
+        status = discord.Status.do_not_disturb
+        activity = None
+
+        if state is not None and state.item:
+            item = state.item
+            track_name = item.get("name", "Unknown")
+            artists = [a.get("name") for a in item.get("artists", []) if a.get("name")]
+            artist_text = ", ".join(artists[:2]) if artists else "Unknown"
+            activity = discord.Activity(
+                type=discord.ActivityType.listening,
+                name=f"{track_name} by {artist_text}"
+            )
+            status = discord.Status.online if state.is_playing else discord.Status.idle
 
         try:
-            await self.bot.change_presence(activity=activity)
+            await self.bot.change_presence(status=status, activity=activity)
         except Exception:
             pass
 

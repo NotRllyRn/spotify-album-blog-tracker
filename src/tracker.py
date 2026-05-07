@@ -377,11 +377,21 @@ class Tracker:
     async def _handle_idle(self):
         """Handle idle state."""
         logger.debug("No active playback")
+        if self.discord_bot:
+            try:
+                await self.discord_bot.update_presence(None)
+            except Exception as e:
+                logger.debug(f"Unable to update Discord presence for idle state: {e}")
         await asyncio.sleep(self.idle_interval)
 
     async def _handle_non_qualifying(self, state: PlaybackState):
         """Handle non-qualifying playback."""
         logger.debug("Non-qualifying playback state")
+        if self.discord_bot:
+            try:
+                await self.discord_bot.update_presence(state)
+            except Exception as e:
+                logger.debug(f"Unable to update Discord presence for paused/non-qualifying state: {e}")
         await asyncio.sleep(self.paused_interval)
 
     async def _update_current_listening(self, state: PlaybackState):

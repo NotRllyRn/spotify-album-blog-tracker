@@ -6,6 +6,7 @@ logs/
 .env
 .env.local
 .env.*.local
+.spotify_tokens
 
 # Dependency directories
 node_modules/
