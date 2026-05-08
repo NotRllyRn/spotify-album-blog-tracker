@@ -121,6 +121,9 @@ class Tracker:
 
         if state.context.get("type") != "album":
             return False
+        
+        if state.context.get("uri") != state.item.get("album").get("uri"):
+            return False
 
         if state.shuffle_state:
             return False
