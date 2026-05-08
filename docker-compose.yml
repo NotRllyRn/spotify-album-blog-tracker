@@ -6,7 +6,6 @@ services:
       - .env
     volumes:
       - ./logs:/app/logs
-      - ./.spotify_tokens:/app/.spotify_tokens
       - ./data:/app/data
     restart: unless-stopped
     stdin_open: true
