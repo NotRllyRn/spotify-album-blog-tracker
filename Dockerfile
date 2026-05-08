@@ -17,6 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY . .
 
+# remove the default album_tracker.db file if it exists
+RUN rm -f ./album_tracker.db
+
 # Create logs directory
 RUN mkdir -p logs
 
