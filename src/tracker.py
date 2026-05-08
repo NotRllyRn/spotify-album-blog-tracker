@@ -77,7 +77,7 @@ class Tracker:
         track = self._match_track_to_release(release, state.item)
 
         if track and not track.listened:
-            await self._mark_track_listened(track, "playback")
+            await self._mark_track_listened(release, track, "playback")
             await self._recompute_release_progress(release)
 
             # Check for prompts
@@ -204,14 +204,14 @@ class Tracker:
                 return track
         return None
 
-    async def _mark_track_listened(self, track: Track, source: str):
+    async def _mark_track_listened(self, release: Release, track: Track, source: str):
         """Mark a track as listened."""
+        now = datetime.now()
         track.listened = True
-        track.listened_at = datetime.now()
+        track.listened_at = now
         track.listened_source = source
-
-        # Update in DB - we'll save the whole release
-        # For efficiency, could update just the track, but keeping simple
+        release.last_listened_at = now
+        await self.db.update_last_listened(release.spotify_id, now)
 
     async def _recompute_release_progress(self, release: Release):
         """Recompute release progress."""

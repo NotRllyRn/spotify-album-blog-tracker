@@ -105,6 +105,7 @@ class Database:
             release.wordpress_media_id,
             release.duplicate_state,
             release.duplicate_post_id,
+            release.last_listened_at.isoformat() if release.last_listened_at else None,
         )
 
         cursor = await self.connection.execute("""
@@ -112,8 +113,8 @@ class Database:
             (spotify_id, title, normalized_title, release_type, raw_spotify_type,
              cover_url, release_date, total_tracks, total_duration_ms, progress, status,
              first_seen, last_seen, completed_at, published_at, wordpress_post_id,
-             wordpress_media_id, duplicate_state, duplicate_post_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             wordpress_media_id, duplicate_state, duplicate_post_id, last_listened_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
 
         release_id = cursor.lastrowid
@@ -126,6 +127,14 @@ class Database:
 
         await self.connection.commit()
         return release_id
+
+    async def update_last_listened(self, spotify_id: str, ts: datetime):
+        """Bump last_listened_at for a release without rewriting joined tables."""
+        await self.connection.execute(
+            "UPDATE release_lifecycle SET last_listened_at = ? WHERE spotify_id = ?",
+            (ts.isoformat(), spotify_id),
+        )
+        await self.connection.commit()
 
     async def delete_release(self, spotify_id: str) -> bool:
         """Delete a release and its associated data by Spotify ID."""
@@ -148,7 +157,7 @@ class Database:
         cursor = await self.connection.execute("""
             SELECT * FROM release_lifecycle
             WHERE status IN ('active', 'awaiting_75_decision', 'awaiting_relisten_decision', 'publishing')
-            ORDER BY last_seen DESC
+            ORDER BY COALESCE(last_listened_at, last_seen) DESC
         """)
         rows = await cursor.fetchall()
 
@@ -240,6 +249,7 @@ class Database:
             wordpress_media_id=row[17],
             duplicate_state=row[18],
             duplicate_post_id=row[19],
+            last_listened_at=datetime.fromisoformat(row[20]) if len(row) > 20 and row[20] else None,
         )
 
     # WordPress operations

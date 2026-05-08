@@ -3,6 +3,7 @@ Discord bot for control plane.
 """
 
 import asyncio
+import math
 import discord
 from discord import app_commands
 import logging
@@ -13,7 +14,7 @@ from urllib.parse import urlparse, urlunparse
 from config import Config
 from database import Database
 from tracker import Tracker
-from models import Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus
+from models import Release, Track, PromptType, PromptState, DiscordPrompt, LifecycleStatus
 
 logger = logging.getLogger(__name__)
 
@@ -82,37 +83,87 @@ class UndoPromptView(PromptView):
     async def keep_post(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.discord_bot.handle_prompt_action(interaction, "keep_post")
 
-class InProgressSelectView(PromptView):
-    def __init__(self, discord_bot: "DiscordBot", releases: List[Release]):
-        super().__init__(discord_bot)
-        options = []
-        for release in releases:
-            artist_names = ", ".join([a.name for a in release.artists][:2]) or "Unknown"
-            progress_percent = int(release.progress * 100)
-            label = f"{release.title[:90]}"
-            description = f"{release.release_type.value}, {progress_percent}%, {artist_names}"
-            options.append(discord.SelectOption(label=label, value=release.spotify_id, description=description[:100]))
+class InProgressView(PromptView):
+    PAGE_SIZE = 9  # list items below the featured slot
 
-        select = discord.ui.Select(
-            placeholder="Select a release to manage",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="inprogress_select"
+    def __init__(self, discord_bot: "DiscordBot", releases: List[Release], page: int = 0):
+        super().__init__(discord_bot)
+        self.releases = releases
+        self.featured = releases[0] if releases else None
+        self.rest = releases[1:] if releases else []
+        self.total_pages = max(1, math.ceil(len(self.rest) / self.PAGE_SIZE)) if self.rest else 1
+        self.page = max(0, min(page, self.total_pages - 1))
+        self._build_components()
+
+    def _visible_rest(self) -> List[Release]:
+        start = self.page * self.PAGE_SIZE
+        return self.rest[start:start + self.PAGE_SIZE]
+
+    def _build_components(self):
+        self.clear_items()
+
+        if self.total_pages > 1:
+            prev_btn = discord.ui.Button(
+                label="◀ Previous",
+                style=discord.ButtonStyle.secondary,
+                custom_id="inprogress_prev",
+                disabled=(self.page == 0),
+            )
+            prev_btn.callback = self._on_prev
+            self.add_item(prev_btn)
+
+            next_btn = discord.ui.Button(
+                label="Next ▶",
+                style=discord.ButtonStyle.secondary,
+                custom_id="inprogress_next",
+                disabled=(self.page >= self.total_pages - 1),
+            )
+            next_btn.callback = self._on_next
+            self.add_item(next_btn)
+
+        visible = ([self.featured] if self.featured else []) + self._visible_rest()
+        if visible:
+            options = []
+            for r in visible:
+                artist_names = ", ".join(a.name for a in r.artists[:2]) or "Unknown"
+                description = f"{r.release_type.value}, {int(r.progress * 100)}%, {artist_names}"
+                options.append(discord.SelectOption(
+                    label=r.title[:90],
+                    value=r.spotify_id,
+                    description=description[:100],
+                ))
+            select = discord.ui.Select(
+                placeholder="Select a release to manage",
+                min_values=1,
+                max_values=1,
+                options=options[:25],
+                custom_id="inprogress_select",
+            )
+            select.callback = self._on_select
+            self.add_item(select)
+
+    async def _on_prev(self, interaction: discord.Interaction):
+        self.page -= 1
+        self._build_components()
+        await interaction.response.edit_message(
+            embed=self.discord_bot._build_inprogress_embed(self.releases, self.page),
+            view=self,
         )
 
-        async def select_callback(interaction: discord.Interaction):
-            if select.values:
-                await self.discord_bot._handle_inprogress_selection(interaction, select.values[0])
-            else:
-                await interaction.response.send_message(
-                    "⚠️ No release selected.",
-                    ephemeral=True
-                )
+    async def _on_next(self, interaction: discord.Interaction):
+        self.page += 1
+        self._build_components()
+        await interaction.response.edit_message(
+            embed=self.discord_bot._build_inprogress_embed(self.releases, self.page),
+            view=self,
+        )
 
-        select.callback = select_callback
-        select.options = select.options[:25]
-        self.add_item(select)
+    async def _on_select(self, interaction: discord.Interaction):
+        select = next((c for c in self.children if isinstance(c, discord.ui.Select)), None)
+        if select and select.values:
+            await self.discord_bot._handle_inprogress_selection(interaction, select.values[0])
+        else:
+            await interaction.response.send_message("⚠️ No release selected.", ephemeral=True)
 
 class ReleaseActionView(PromptView):
     def __init__(self, discord_bot: "DiscordBot", release_id: str):
@@ -708,7 +759,6 @@ class DiscordBot:
 
     async def _handle_inprogress(self, interaction: discord.Interaction):
         """Handle /inprogress command."""
-        # Check authorization
         if not self._check_authorized(interaction.user.id):
             await interaction.response.send_message(
                 "❌ You are not authorized to use this command.",
@@ -719,44 +769,80 @@ class DiscordBot:
         await interaction.response.defer()
 
         try:
-            # Get active releases
             releases = await self.db.get_active_releases()
-
             if not releases:
                 await interaction.followup.send("No active releases.", ephemeral=True)
                 return
 
-            # Create embed with releases
-            embed = discord.Embed(
-                title=f"Active Releases ({len(releases)})",
-                color=0x1DB954
-            )
-
-            for release in releases[:10]:  # Limit to 10
-                artist_names = [a.name for a in release.artists]
-                progress_percent = int(release.progress * 100)
-                countable = sum(1 for t in release.tracks if t.is_countable)
-                listened = sum(1 for t in release.tracks if t.is_countable and t.listened)
-
-                status_emoji = "▶" if release.status.value == "active" else "⏸"
-                embed.add_field(
-                    name=f"{status_emoji} {release.title[:50]}",
-                    value=(
-                        f"Artists: {', '.join(artist_names[:2])}\n"
-                        f"Type: {release.release_type.value} | Progress: {listened}/{countable} ({progress_percent}%)\n"
-                        f"Status: {release.status.value}"
-                    ),
-                    inline=False
-                )
-
-            await interaction.followup.send(embed=embed, view=InProgressSelectView(self, releases), ephemeral=True)
-
+            view = InProgressView(self, releases, page=0)
+            embed = self._build_inprogress_embed(releases, page=0)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
         except Exception as e:
             logger.error(f"Error in /inprogress: {e}")
             await interaction.followup.send(
                 f"❌ Error fetching releases: {str(e)[:100]}",
                 ephemeral=True
             )
+
+    def _next_unlistened_track(self, release: Release) -> Optional[Track]:
+        return next(
+            (t for t in release.tracks if t.is_countable and not t.listened),
+            None,
+        )
+
+    def _format_release_block(self, r: Release, featured: bool) -> str:
+        artists = ", ".join(a.name for a in r.artists[:2]) or "Unknown"
+        pct = int(r.progress * 100)
+        countable = sum(1 for t in r.tracks if t.is_countable)
+        listened = sum(1 for t in r.tracks if t.is_countable and t.listened)
+        nxt = self._next_unlistened_track(r)
+        next_line = (
+            f"Next: {nxt.disc_number}.{nxt.track_number:02d} {nxt.title[:60]}"
+            if nxt else "Next: — (all tracks listened)"
+        )
+        if featured:
+            return (
+                f"**{r.title[:80]}**\n"
+                f"{artists}\n"
+                f"{r.release_type.value} • {listened}/{countable} ({pct}%) • {r.status.value}\n"
+                f"{next_line}"
+            )
+        return (
+            f"{artists} • {r.release_type.value} • {listened}/{countable} ({pct}%)\n"
+            f"{next_line}"
+        )
+
+    def _build_inprogress_embed(self, releases: List[Release], page: int) -> discord.Embed:
+        page_size = InProgressView.PAGE_SIZE
+        rest = releases[1:] if releases else []
+        total_pages = max(1, math.ceil(len(rest) / page_size)) if rest else 1
+        page = max(0, min(page, total_pages - 1))
+        visible = rest[page * page_size:(page + 1) * page_size]
+
+        embed = discord.Embed(
+            title=f"🎧 Active Releases — {len(releases)} albums",
+            color=0x1DB954,
+        )
+        if total_pages > 1:
+            embed.set_footer(text=f"Page {page + 1}/{total_pages}")
+
+        if releases:
+            featured = releases[0]
+            embed.add_field(
+                name="⭐ Most recently listened",
+                value=self._format_release_block(featured, featured=True),
+                inline=False,
+            )
+            if visible:
+                embed.add_field(name="─" * 20, value="​", inline=False)
+
+        for r in visible:
+            embed.add_field(
+                name=f"▶ {r.title[:80]}",
+                value=self._format_release_block(r, featured=False),
+                inline=False,
+            )
+        return embed
 
     async def _handle_current(self, interaction: discord.Interaction):
         """Handle /current command."""
