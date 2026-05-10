@@ -117,6 +117,12 @@ class Tracker:
 
         if state.item.get("type") != "track":
             return False
+        
+        if state.item.get("album") is None:
+            return False
+        
+        if state.item["album"].get("album_type") != "album":
+            return False
 
         if state.item.get("is_local", False):
             return False
@@ -127,7 +133,7 @@ class Tracker:
         if state.context.get("type") != "album":
             return False
         
-        if state.context.get("uri") != state.item.get("album").get("uri"):
+        if state.context.get("uri") != state.item["album"].get("uri"):
             return False
 
         if state.shuffle_state:
