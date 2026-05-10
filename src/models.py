@@ -77,7 +77,6 @@ class Release:
     wordpress_media_id: Optional[int] = None
     duplicate_state: Optional[str] = None
     duplicate_post_id: Optional[int] = None
-    last_listened_at: Optional[datetime] = None
 
 @dataclass
 class PlaybackState:
