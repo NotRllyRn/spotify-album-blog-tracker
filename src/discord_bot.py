@@ -34,6 +34,10 @@ class CurrentPostContext:
     duplicate_post: Optional[WordPressPost]
     is_actively_tracked: bool
 
+    @property
+    def will_publish_as_relisten(self) -> bool:
+        return self.duplicate_post is not None
+
 def _clip_discord_text(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
@@ -87,7 +91,48 @@ class RelistenPromptView(PromptView):
     async def ignore_relisten(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.discord_bot.handle_prompt_action(interaction, "ignore_relisten")
 
-class UndoPromptView(PromptView):
+class PostContentModal(discord.ui.Modal):
+    def __init__(
+        self,
+        discord_bot: "DiscordBot",
+        discord_message_id: str,
+        release_id: Optional[str],
+        wordpress_post_id: Optional[int],
+    ):
+        super().__init__(title="Add post content", timeout=300)
+        self.discord_bot = discord_bot
+        self.discord_message_id = discord_message_id
+        self.release_id = release_id
+        self.wordpress_post_id = wordpress_post_id
+        self.body_input = discord.ui.TextInput(
+            label="Post content",
+            style=discord.TextStyle.paragraph,
+            placeholder="Write the content to add to the WordPress post.",
+            required=True,
+            max_length=4000,
+            custom_id="post_content_body",
+        )
+        self.add_item(self.body_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.discord_bot._handle_post_content_submit(
+            interaction=interaction,
+            discord_message_id=self.discord_message_id,
+            release_id=self.release_id,
+            fallback_wordpress_post_id=self.wordpress_post_id,
+            raw_content=str(self.body_input.value),
+        )
+
+
+class PublishedPostActionView(PromptView):
+    @discord.ui.button(
+        label="Add content",
+        style=discord.ButtonStyle.primary,
+        custom_id="prompt_add_content"
+    )
+    async def add_content(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.discord_bot.handle_prompt_action(interaction, "add_content")
+
     @discord.ui.button(
         label="Undo post",
         style=discord.ButtonStyle.danger,
@@ -103,6 +148,10 @@ class UndoPromptView(PromptView):
     )
     async def keep_post(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.discord_bot.handle_prompt_action(interaction, "keep_post")
+
+
+UndoPromptView = PublishedPostActionView
+
 
 class InProgressView(PromptView):
     def __init__(self, discord_bot: "DiscordBot", page_data: InProgressPage):
@@ -314,7 +363,7 @@ class DiscordBot:
     def _register_views(self):
         self.bot.add_view(SeventyFivePromptView(self))
         self.bot.add_view(RelistenPromptView(self))
-        self.bot.add_view(UndoPromptView(self))
+        self.bot.add_view(PublishedPostActionView(self))
 
     async def start(self):
         """Start the Discord bot."""
@@ -446,7 +495,7 @@ class DiscordBot:
 
         view = None
         if release.wordpress_post_id:
-            view = UndoPromptView(self)
+            view = PublishedPostActionView(self)
 
         message = await self._send_dm(
             "The release has been published to WordPress.",
@@ -468,28 +517,33 @@ class DiscordBot:
         return message
 
     async def handle_prompt_action(self, interaction: discord.Interaction, action: str):
-        await interaction.response.defer(ephemeral=True)
+        if action != "add_content":
+            await interaction.response.defer(ephemeral=True)
 
         prompt = await self.db.get_discord_prompt(str(interaction.message.id))
         if prompt is None:
-            await interaction.followup.send(
+            await self._send_prompt_action_response(
+                interaction,
                 "⚠️ This prompt is no longer available.",
-                ephemeral=True
             )
             return
 
         if prompt.state != PromptState.PENDING.value:
-            await interaction.followup.send(
+            await self._send_prompt_action_response(
+                interaction,
                 "⚠️ This prompt has already been handled.",
-                ephemeral=True
             )
             return
 
-        release = await self.db.get_release(prompt.release_id)
-        if release is None:
-            await interaction.followup.send(
+        release = await self.db.get_release(prompt.release_id) if prompt.release_id else None
+        can_add_content_without_release = (
+            prompt.prompt_type == PromptType.PROMPT_UNDO.value
+            and action == "add_content"
+        )
+        if release is None and not can_add_content_without_release:
+            await self._send_prompt_action_response(
+                interaction,
                 "⚠️ Unable to find the release associated with this prompt.",
-                ephemeral=True
             )
             return
 
@@ -509,7 +563,9 @@ class DiscordBot:
                 else:
                     await self._unknown_prompt_action(interaction)
             elif prompt.prompt_type == PromptType.PROMPT_UNDO.value:
-                if action == "undo_post":
+                if action == "add_content":
+                    await self._handle_add_content(interaction, release, prompt)
+                elif action == "undo_post":
                     await self._handle_undo_post(interaction, release, prompt)
                 elif action == "keep_post":
                     await self._handle_keep_post(interaction, release, prompt)
@@ -519,16 +575,34 @@ class DiscordBot:
                 await self._unknown_prompt_action(interaction)
         except Exception as e:
             logger.error(f"Error handling prompt action {action}: {e}")
-            await interaction.followup.send(
+            await self._send_prompt_action_response(
+                interaction,
                 f"❌ Error handling prompt action: {str(e)[:100]}",
-                ephemeral=True
             )
 
+    async def _send_prompt_action_response(self, interaction: discord.Interaction, content: str):
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+
     async def _unknown_prompt_action(self, interaction: discord.Interaction):
-        await interaction.followup.send(
+        await self._send_prompt_action_response(
+            interaction,
             "⚠️ Unknown action for this prompt.",
-            ephemeral=True
         )
+
+    def _resolve_wordpress_post_id(
+        self,
+        release: Optional[Release],
+        prompt: Optional[DiscordPrompt],
+        fallback_wordpress_post_id: Optional[int] = None,
+    ) -> Optional[int]:
+        if prompt and prompt.wordpress_post_id:
+            return prompt.wordpress_post_id
+        if release and release.wordpress_post_id:
+            return release.wordpress_post_id
+        return fallback_wordpress_post_id
 
     async def _handle_75_publish(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
         await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.ACCEPTED.value)
@@ -577,16 +651,94 @@ class DiscordBot:
             ephemeral=True
         )
 
+    async def _handle_add_content(
+        self,
+        interaction: discord.Interaction,
+        release: Optional[Release],
+        prompt: DiscordPrompt,
+    ):
+        post_id = self._resolve_wordpress_post_id(release, prompt)
+        if not post_id:
+            await self._send_prompt_action_response(
+                interaction,
+                "⚠️ Unable to add content because the WordPress post ID is missing.",
+            )
+            return
+
+        await interaction.response.send_modal(
+            PostContentModal(
+                discord_bot=self,
+                discord_message_id=prompt.discord_message_id,
+                release_id=prompt.release_id,
+                wordpress_post_id=post_id,
+            )
+        )
+
+    async def _handle_post_content_submit(
+        self,
+        interaction: discord.Interaction,
+        discord_message_id: str,
+        release_id: Optional[str],
+        fallback_wordpress_post_id: Optional[int],
+        raw_content: str,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        prompt = await self.db.get_discord_prompt(discord_message_id)
+        if prompt is None:
+            await interaction.followup.send(
+                "⚠️ This prompt is no longer available.",
+                ephemeral=True
+            )
+            return
+
+        if prompt.state != PromptState.PENDING.value:
+            await interaction.followup.send(
+                "⚠️ This prompt has already been handled.",
+                ephemeral=True
+            )
+            return
+
+        release_lookup_id = prompt.release_id or release_id
+        release = await self.db.get_release(release_lookup_id) if release_lookup_id else None
+        post_id = self._resolve_wordpress_post_id(
+            release,
+            prompt,
+            fallback_wordpress_post_id=fallback_wordpress_post_id,
+        )
+        if not post_id:
+            await interaction.followup.send(
+                "⚠️ Unable to add content because the WordPress post ID is missing.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            await self.tracker.publisher.update_post_content(post_id, raw_content)
+        except Exception as e:
+            logger.error(f"Error updating post content for post {post_id}: {e}", exc_info=True)
+            await interaction.followup.send(
+                f"❌ Error updating WordPress post: {str(e)[:100]}",
+                ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(
+            "✅ WordPress post content has been updated.",
+            ephemeral=True
+        )
+
     async def _handle_undo_post(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
         await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.ACCEPTED.value)
-        if not release.wordpress_post_id:
+        post_id = self._resolve_wordpress_post_id(release, prompt)
+        if not post_id:
             await interaction.followup.send(
                 "⚠️ Unable to undo because the WordPress post ID is missing.",
                 ephemeral=True
             )
             return
 
-        success = await self.tracker.publisher.trash_post(release.wordpress_post_id)
+        success = await self.tracker.publisher.trash_post(post_id)
         if success:
             release.status = LifecycleStatus.TRASHED_POST
             await self.db.save_release(release)

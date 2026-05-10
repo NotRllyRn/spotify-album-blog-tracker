@@ -4,9 +4,11 @@ WordPress publishing service.
 
 import httpx
 import logging
+import re
 from typing import Dict, Any, Optional
 from pathlib import Path
 import tempfile
+from html import escape
 
 from config import Config
 from database import Database
@@ -17,6 +19,26 @@ logger = logging.getLogger(__name__)
 
 POST_CACHE_TOTAL_KEY = "wordpress_post_cache.x_wp_total"
 POST_CACHE_FIRST_PAGE_HASH_KEY = "wordpress_post_cache.first_page_hash"
+
+
+def format_discord_content_for_wordpress(raw_content: str) -> str:
+    """Convert Discord modal text into simple WordPress paragraph HTML."""
+    normalized = raw_content.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n[ \t]*\n+", normalized)
+        if paragraph.strip()
+    ]
+
+    formatted_paragraphs = []
+    for paragraph in paragraphs:
+        escaped_paragraph = escape(paragraph).replace("\n", "<br />")
+        formatted_paragraphs.append(f"<p>{escaped_paragraph}</p>")
+
+    return "\n\n".join(formatted_paragraphs)
 
 
 class Publisher:
@@ -91,6 +113,13 @@ class Publisher:
         except Exception as e:
             logger.error(f"Error trashing post {post_id}: {e}")
             return False
+
+    async def update_post_content(self, post_id: int, raw_content: str) -> Dict[str, Any]:
+        """Replace a WordPress post body with formatted Discord-submitted content."""
+        formatted_content = format_discord_content_for_wordpress(raw_content)
+        post = await self.wordpress.update_post(post_id, {"content": formatted_content})
+        logger.info(f"Updated WordPress post content: post_id={post_id}")
+        return post
 
     async def _ensure_categories(self):
         """Ensure required categories exist."""

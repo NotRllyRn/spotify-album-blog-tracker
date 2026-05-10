@@ -20,7 +20,18 @@ except ModuleNotFoundError:
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from utils import normalize_text, normalize_artist_name, normalize_artist_list, compute_release_type
-from models import Track, Artist, Release, ReleaseType, LifecycleStatus, PlaybackState, WordPressPost
+from models import (
+    Track,
+    Artist,
+    Release,
+    ReleaseType,
+    LifecycleStatus,
+    PlaybackState,
+    WordPressPost,
+    DiscordPrompt,
+    PromptState,
+    PromptType,
+)
 from inprogress import build_inprogress_page, INPROGRESS_PAGE_SIZE, get_next_unlistened_track
 
 try:
@@ -29,17 +40,19 @@ except ModuleNotFoundError:
     Tracker = None
 
 try:
-    from discord_bot import DiscordBot, CurrentPlaybackActionView, CurrentPostContext
+    from discord_bot import DiscordBot, CurrentPlaybackActionView, CurrentPostContext, PublishedPostActionView
 except ModuleNotFoundError:
     DiscordBot = None
     CurrentPlaybackActionView = None
     CurrentPostContext = None
+    PublishedPostActionView = None
 
 try:
     from publisher import (
         Publisher,
         POST_CACHE_FIRST_PAGE_HASH_KEY,
         POST_CACHE_TOTAL_KEY,
+        format_discord_content_for_wordpress,
     )
     from wordpress_client import WordPressClient, WordPressPostsResult
 except ModuleNotFoundError:
@@ -48,6 +61,7 @@ except ModuleNotFoundError:
     WordPressPostsResult = None
     POST_CACHE_FIRST_PAGE_HASH_KEY = None
     POST_CACHE_TOTAL_KEY = None
+    format_discord_content_for_wordpress = None
 
 
 def make_release_for_test(spotify_id, title, last_seen, tracks=None):
@@ -412,12 +426,13 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
             link="https://example.com/album-5"
         )
 
-    def make_interaction(self, response_done=False):
+    def make_interaction(self, response_done=False, message_id="message_1"):
         response = type(
             "FakeResponse",
             (),
             {
                 "send_message": AsyncMock(),
+                "send_modal": AsyncMock(),
                 "defer": AsyncMock(),
                 "is_done": Mock(return_value=response_done)
             }
@@ -430,7 +445,11 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         return type(
             "FakeInteraction",
             (),
-            {"response": response, "followup": followup}
+            {
+                "response": response,
+                "followup": followup,
+                "message": type("FakeMessage", (), {"id": message_id})(),
+            }
         )()
 
     def test_inprogress_format_includes_next_track(self):
@@ -487,6 +506,130 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         labels = [child.label for child in CurrentPlaybackActionView(self.bot, None).children]
 
         self.assertIn("Post current content", labels)
+
+    def test_published_post_action_view_includes_add_content(self):
+        labels = [child.label for child in PublishedPostActionView(self.bot).children]
+
+        self.assertEqual(labels, ["Add content", "Undo post", "Keep post"])
+
+    async def test_add_content_action_opens_modal_without_completing_prompt(self):
+        release = make_release_for_test("album_modal", "Album Modal", datetime(2024, 1, 1, 12, 0, 0))
+        release.wordpress_post_id = 654
+        prompt = DiscordPrompt(
+            id=1,
+            prompt_type=PromptType.PROMPT_UNDO.value,
+            release_id=release.spotify_id,
+            wordpress_post_id=321,
+            discord_message_id="message_1",
+            state=PromptState.PENDING.value,
+        )
+        db = type("FakeDatabase", (), {})()
+        db.get_discord_prompt = AsyncMock(return_value=prompt)
+        db.get_release = AsyncMock(return_value=release)
+        db.update_discord_prompt_state = AsyncMock()
+        self.bot.db = db
+        interaction = self.make_interaction(message_id="message_1")
+
+        await self.bot.handle_prompt_action(interaction, "add_content")
+
+        interaction.response.defer.assert_not_awaited()
+        interaction.response.send_modal.assert_awaited_once()
+        modal = interaction.response.send_modal.await_args.args[0]
+        self.assertEqual(modal.discord_message_id, "message_1")
+        self.assertEqual(modal.wordpress_post_id, 321)
+        db.update_discord_prompt_state.assert_not_awaited()
+
+    async def test_add_content_action_rejects_handled_prompt_without_modal(self):
+        prompt = DiscordPrompt(
+            id=1,
+            prompt_type=PromptType.PROMPT_UNDO.value,
+            release_id="album_done",
+            wordpress_post_id=321,
+            discord_message_id="message_1",
+            state=PromptState.ACCEPTED.value,
+        )
+        db = type("FakeDatabase", (), {})()
+        db.get_discord_prompt = AsyncMock(return_value=prompt)
+        db.get_release = AsyncMock()
+        self.bot.db = db
+        interaction = self.make_interaction(message_id="message_1")
+
+        await self.bot.handle_prompt_action(interaction, "add_content")
+
+        interaction.response.defer.assert_not_awaited()
+        interaction.response.send_modal.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once_with(
+            "⚠️ This prompt has already been handled.",
+            ephemeral=True
+        )
+
+    async def test_post_content_submit_updates_wordpress_and_leaves_prompt_pending(self):
+        release = make_release_for_test("album_content", "Album Content", datetime(2024, 1, 1, 12, 0, 0))
+        release.wordpress_post_id = 654
+        prompt = DiscordPrompt(
+            id=1,
+            prompt_type=PromptType.PROMPT_UNDO.value,
+            release_id=release.spotify_id,
+            wordpress_post_id=321,
+            discord_message_id="message_1",
+            state=PromptState.PENDING.value,
+        )
+        db = type("FakeDatabase", (), {})()
+        db.get_discord_prompt = AsyncMock(return_value=prompt)
+        db.get_release = AsyncMock(return_value=release)
+        db.update_discord_prompt_state = AsyncMock()
+        publisher = type("FakePublisher", (), {})()
+        publisher.update_post_content = AsyncMock(return_value={"id": 321})
+        self.bot.db = db
+        self.bot.tracker = type("FakeTracker", (), {"publisher": publisher})()
+        interaction = self.make_interaction()
+
+        await self.bot._handle_post_content_submit(
+            interaction=interaction,
+            discord_message_id="message_1",
+            release_id=release.spotify_id,
+            fallback_wordpress_post_id=999,
+            raw_content="First paragraph",
+        )
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        publisher.update_post_content.assert_awaited_once_with(321, "First paragraph")
+        db.update_discord_prompt_state.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once_with(
+            "✅ WordPress post content has been updated.",
+            ephemeral=True
+        )
+
+    async def test_post_content_submit_reports_update_errors_without_completing_prompt(self):
+        prompt = DiscordPrompt(
+            id=1,
+            prompt_type=PromptType.PROMPT_UNDO.value,
+            release_id="album_content",
+            wordpress_post_id=321,
+            discord_message_id="message_1",
+            state=PromptState.PENDING.value,
+        )
+        db = type("FakeDatabase", (), {})()
+        db.get_discord_prompt = AsyncMock(return_value=prompt)
+        db.get_release = AsyncMock(return_value=None)
+        db.update_discord_prompt_state = AsyncMock()
+        publisher = type("FakePublisher", (), {})()
+        publisher.update_post_content = AsyncMock(side_effect=RuntimeError("WordPress failed"))
+        self.bot.db = db
+        self.bot.tracker = type("FakeTracker", (), {"publisher": publisher})()
+        interaction = self.make_interaction()
+
+        await self.bot._handle_post_content_submit(
+            interaction=interaction,
+            discord_message_id="message_1",
+            release_id="album_content",
+            fallback_wordpress_post_id=None,
+            raw_content="First paragraph",
+        )
+
+        publisher.update_post_content.assert_awaited_once_with(321, "First paragraph")
+        db.update_discord_prompt_state.assert_not_awaited()
+        self.assertIn("❌ Error updating WordPress post:", interaction.followup.send.await_args.args[0])
 
     def test_current_preview_uses_early_wording_for_tracked_release(self):
         state = self.make_playback_state()
@@ -1221,6 +1364,38 @@ class TestPublisherPostCacheRefresh(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.saved_posts[0].artists, ["Artist Name"])
         self.assertEqual(db.saved_state[POST_CACHE_TOTAL_KEY], "1")
         self.assertEqual(db.saved_state[POST_CACHE_FIRST_PAGE_HASH_KEY], "hash-1")
+
+    def test_discord_content_formatter_builds_safe_wordpress_paragraphs(self):
+        formatted = format_discord_content_for_wordpress(
+            " First & second\nsame paragraph\n\n<script>blocked</script> "
+        )
+
+        self.assertEqual(
+            formatted,
+            "<p>First &amp; second<br />same paragraph</p>\n\n"
+            "<p>&lt;script&gt;blocked&lt;/script&gt;</p>"
+        )
+
+    async def test_update_post_content_replaces_body_with_formatted_content(self):
+        class FakeWordPress:
+            def __init__(self):
+                self.updated = None
+
+            async def update_post(self, post_id, data):
+                self.updated = (post_id, data)
+                return {"id": post_id, **data}
+
+        wordpress = FakeWordPress()
+        publisher = Publisher.__new__(Publisher)
+        publisher.wordpress = wordpress
+
+        post = await publisher.update_post_content(77, "Line one\n\nLine two")
+
+        self.assertEqual(post["id"], 77)
+        self.assertEqual(
+            wordpress.updated,
+            (77, {"content": "<p>Line one</p>\n\n<p>Line two</p>"})
+        )
 
     async def test_publish_release_keeps_success_when_forced_cache_refresh_fails(self):
         class FakeWordPress:
