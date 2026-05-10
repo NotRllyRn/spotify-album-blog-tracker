@@ -5,7 +5,7 @@ Pure helpers for /inprogress pagination.
 from dataclasses import dataclass
 from typing import List, Optional
 
-from models import Release
+from models import Release, Track
 
 
 INPROGRESS_PAGE_SIZE = 9
@@ -44,3 +44,11 @@ def build_inprogress_page(
         total_pages=total_pages,
         total_releases=len(ordered)
     )
+
+
+def get_next_unlistened_track(release: Release) -> Optional[Track]:
+    """Return the next unlistened countable track in stored album order."""
+    for track in release.tracks:
+        if track.is_countable and not track.listened:
+            return track
+    return None

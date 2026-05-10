@@ -14,7 +14,7 @@ from config import Config
 from database import Database
 from tracker import Tracker
 from models import Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus
-from inprogress import INPROGRESS_PAGE_SIZE, InProgressPage, build_inprogress_page
+from inprogress import INPROGRESS_PAGE_SIZE, InProgressPage, build_inprogress_page, get_next_unlistened_track
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +225,7 @@ class CurrentPlaybackActionView(PromptView):
         self.playback_state = playback_state
 
     @discord.ui.button(
-        label="Post current content",
+        label="Post early",
         style=discord.ButtonStyle.success,
         custom_id="current_post_content"
     )
@@ -680,8 +680,7 @@ class DiscordBot:
 
     def _build_release_summary_embed(self, release: Release, title: str = "Release Manager") -> discord.Embed:
         artist_names = ", ".join([a.name for a in release.artists][:5]) or "Unknown"
-        countable = sum(1 for t in release.tracks if t.is_countable)
-        listened = sum(1 for t in release.tracks if t.is_countable and t.listened)
+        listened, countable, progress_percent = self._get_release_progress_parts(release)
 
         embed = discord.Embed(
             title=title,
@@ -689,7 +688,7 @@ class DiscordBot:
             color=0x1DB954
         )
         embed.add_field(name="Release type", value=release.release_type.value, inline=True)
-        embed.add_field(name="Progress", value=f"{listened}/{countable} ({int(release.progress * 100)}%)", inline=True)
+        embed.add_field(name="Progress", value=f"{listened}/{countable} ({progress_percent}%)", inline=True)
         embed.add_field(name="Status", value=release.status.value, inline=True)
         embed.add_field(name="Spotify ID", value=release.spotify_id, inline=False)
         embed.set_thumbnail(url=release.cover_url)
@@ -713,8 +712,8 @@ class DiscordBot:
         artists = [a["name"] for a in item.get("artists", [])]
 
         embed = discord.Embed(
-            title="Post current playback",
-            description=f"This would publish the current listening target to WordPress.",
+            title="Post current playback early",
+            description="This would publish the current listening target early to WordPress.",
             color=0x1DB954
         )
         embed.add_field(name="Track", value=item.get("name", "Unknown"), inline=False)
@@ -725,6 +724,60 @@ class DiscordBot:
         embed.add_field(name="Album type", value=album.get("album_type", "Unknown"), inline=True)
         if album.get("images"):
             embed.set_thumbnail(url=album.get("images")[0].get("url", ""))
+        return embed
+
+    def _build_current_embed(self, state, tracked_release: Optional[Release] = None) -> discord.Embed:
+        item = state.item
+        album = item.get("album", {})
+        artists = [a["name"] for a in item.get("artists", [])]
+
+        embed = discord.Embed(
+            title="Current Playback",
+            color=0x1DB954
+        )
+        if album.get("images"):
+            embed.set_thumbnail(url=album.get("images")[0].get("url", ""))
+
+        embed.add_field(
+            name="Track",
+            value=item.get("name", "Unknown"),
+            inline=False
+        )
+        embed.add_field(
+            name="Album",
+            value=album.get("name", "Unknown"),
+            inline=False
+        )
+        embed.add_field(
+            name="Artists",
+            value=", ".join(artists[:5]) or "Unknown",
+            inline=False
+        )
+        embed.add_field(
+            name="Status",
+            value="▶ Playing" if state.is_playing else "⏸ Paused",
+            inline=True
+        )
+        embed.add_field(
+            name="Shuffle",
+            value="On" if state.shuffle_state else "Off",
+            inline=True
+        )
+
+        qualifies = self.tracker._qualifies_for_tracking(state)
+        embed.add_field(
+            name="Counts for Tracking",
+            value="✅ Yes" if qualifies else "❌ No",
+            inline=True
+        )
+        if tracked_release is not None:
+            listened, countable, progress_percent = self._get_release_progress_parts(tracked_release)
+            embed.add_field(
+                name="Progress",
+                value=f"{listened}/{countable} ({progress_percent}%)",
+                inline=True
+            )
+
         return embed
 
     async def _handle_current_post_confirm(self, interaction: discord.Interaction, playback_state):
@@ -799,18 +852,24 @@ class DiscordBot:
 
     def _format_inprogress_release(self, release: Release, include_last_seen: bool) -> str:
         artist_names = [artist.name for artist in release.artists]
-        progress_percent = int(release.progress * 100)
-        countable = sum(1 for track in release.tracks if track.is_countable)
-        listened = sum(1 for track in release.tracks if track.is_countable and track.listened)
+        listened, countable, progress_percent = self._get_release_progress_parts(release)
+        next_track = get_next_unlistened_track(release)
 
         lines = [
             f"Artists: {', '.join(artist_names[:2]) or 'Unknown'}",
             f"Type: {release.release_type.value} | Progress: {listened}/{countable} ({progress_percent}%)",
-            f"Status: {release.status.value}"
+            f"Status: {release.status.value}",
+            f"Next: {next_track.title if next_track else 'None'}"
         ]
         if include_last_seen:
             lines.append(f"Last tracked: <t:{int(release.last_seen.timestamp())}:R>")
         return "\n".join(lines)
+
+    def _get_release_progress_parts(self, release: Release) -> tuple[int, int, int]:
+        listened = sum(1 for track in release.tracks if track.is_countable and track.listened)
+        countable = sum(1 for track in release.tracks if track.is_countable)
+        progress_percent = int(release.progress * 100)
+        return listened, countable, progress_percent
 
     async def _handle_inprogress_page(self, interaction: discord.Interaction, page: int):
         try:
@@ -906,48 +965,12 @@ class DiscordBot:
             item = state.item
             album = item.get("album", {})
             artists = [a["name"] for a in item.get("artists", [])]
+            tracked_release = None
+            album_id = album.get("id")
+            if album_id:
+                tracked_release = await self.db.get_release(album_id)
 
-            # Create embed
-            embed = discord.Embed(
-                title="Current Playback",
-                color=0x1DB954
-            )
-            if album.get("images"):
-                embed.set_thumbnail(url=album.get("images")[0].get("url", ""))
-
-            embed.add_field(
-                name="Track",
-                value=item.get("name", "Unknown"),
-                inline=False
-            )
-            embed.add_field(
-                name="Album",
-                value=album.get("name", "Unknown"),
-                inline=False
-            )
-            embed.add_field(
-                name="Artists",
-                value=", ".join(artists[:5]) or "Unknown",
-                inline=False
-            )
-            embed.add_field(
-                name="Status",
-                value="▶ Playing" if state.is_playing else "⏸ Paused",
-                inline=True
-            )
-            embed.add_field(
-                name="Shuffle",
-                value="On" if state.shuffle_state else "Off",
-                inline=True
-            )
-
-            # Check if qualifies
-            qualifies = self.tracker._qualifies_for_tracking(state)
-            embed.add_field(
-                name="Counts for Tracking",
-                value="✅ Yes" if qualifies else "❌ No",
-                inline=True
-            )
+            embed = self._build_current_embed(state, tracked_release)
 
             view = CurrentPlaybackActionView(self, state)
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)

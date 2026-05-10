@@ -12,13 +12,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from utils import normalize_text, normalize_artist_name, normalize_artist_list, compute_release_type
-from models import Track, Artist, Release, ReleaseType, LifecycleStatus
-from inprogress import build_inprogress_page, INPROGRESS_PAGE_SIZE
+from models import Track, Artist, Release, ReleaseType, LifecycleStatus, PlaybackState
+from inprogress import build_inprogress_page, INPROGRESS_PAGE_SIZE, get_next_unlistened_track
 
 try:
     from tracker import Tracker
 except ModuleNotFoundError:
     Tracker = None
+
+try:
+    from discord_bot import DiscordBot, CurrentPlaybackActionView
+except ModuleNotFoundError:
+    DiscordBot = None
+    CurrentPlaybackActionView = None
 
 
 def make_release_for_test(spotify_id, title, last_seen, tracks=None):
@@ -278,6 +284,153 @@ class TestInProgressPagination(unittest.TestCase):
 
         self.assertEqual(before_first.page, 0)
         self.assertEqual(after_last.page, 1)
+
+
+class TestNextTrackSelection(unittest.TestCase):
+    """Test next-track selection for /inprogress."""
+
+    def test_returns_first_unlistened_countable_track(self):
+        release = make_release_for_test(
+            "album_1",
+            "Album 1",
+            datetime(2024, 1, 1, 12, 0, 0),
+            tracks=[
+                Track("t1", "Intro", "intro", 60000, 1, 1, False, False),
+                Track("t2", "Track 1", "track 1", 180000, 1, 2, True, True),
+                Track("t3", "Track 2", "track 2", 180000, 1, 3, True, False),
+                Track("t4", "Track 3", "track 3", 180000, 1, 4, True, False),
+            ]
+        )
+
+        next_track = get_next_unlistened_track(release)
+
+        self.assertIsNotNone(next_track)
+        self.assertEqual(next_track.title, "Track 2")
+
+    def test_skips_non_countable_and_listened_tracks(self):
+        release = make_release_for_test(
+            "album_2",
+            "Album 2",
+            datetime(2024, 1, 1, 12, 0, 0),
+            tracks=[
+                Track("t1", "Intro", "intro", 60000, 1, 1, False, False),
+                Track("t2", "Track 1", "track 1", 180000, 1, 2, True, True),
+                Track("t3", "Track 2", "track 2", 180000, 1, 3, False, False),
+                Track("t4", "Track 3", "track 3", 180000, 1, 4, True, False),
+            ]
+        )
+
+        next_track = get_next_unlistened_track(release)
+
+        self.assertIsNotNone(next_track)
+        self.assertEqual(next_track.title, "Track 3")
+
+    def test_returns_none_when_all_countable_tracks_are_listened(self):
+        release = make_release_for_test(
+            "album_3",
+            "Album 3",
+            datetime(2024, 1, 1, 12, 0, 0),
+            tracks=[
+                Track("t1", "Track 1", "track 1", 180000, 1, 1, True, True),
+                Track("t2", "Track 2", "track 2", 180000, 1, 2, True, True),
+            ]
+        )
+
+        self.assertIsNone(get_next_unlistened_track(release))
+
+
+@unittest.skipIf(DiscordBot is None, "discord bot dependencies are not installed")
+class TestDiscordBotEmbeds(unittest.TestCase):
+    """Test embed formatting for Discord bot views."""
+
+    def setUp(self):
+        self.bot = DiscordBot.__new__(DiscordBot)
+        self.bot.tracker = type(
+            "FakeTracker",
+            (),
+            {"_qualifies_for_tracking": lambda self, state: True}
+        )()
+
+    def test_inprogress_format_includes_next_track(self):
+        release = make_release_for_test(
+            "album_4",
+            "Album 4",
+            datetime(2024, 1, 1, 12, 0, 0),
+            tracks=[
+                Track("t1", "Track 1", "track 1", 180000, 1, 1, True, True),
+                Track("t2", "Track 2", "track 2", 180000, 1, 2, True, False),
+            ]
+        )
+        release.progress = 0.5
+
+        formatted = self.bot._format_inprogress_release(release, include_last_seen=False)
+
+        self.assertIn("Next: Track 2", formatted)
+
+    def test_current_embed_includes_progress_for_tracked_release(self):
+        state = PlaybackState(
+            is_playing=True,
+            shuffle_state=False,
+            repeat_state="off",
+            context={"type": "album"},
+            item={
+                "name": "Track 2",
+                "artists": [{"name": "Artist"}],
+                "album": {
+                    "id": "album_5",
+                    "name": "Album 5",
+                    "images": [],
+                    "album_type": "album"
+                }
+            },
+            progress_ms=0,
+            timestamp=0
+        )
+        release = make_release_for_test(
+            "album_5",
+            "Album 5",
+            datetime(2024, 1, 1, 12, 0, 0),
+            tracks=[
+                Track("t1", "Track 1", "track 1", 180000, 1, 1, True, True),
+                Track("t2", "Track 2", "track 2", 180000, 1, 2, True, False),
+            ]
+        )
+        release.progress = 0.5
+
+        embed = self.bot._build_current_embed(state, release)
+        field_map = {field.name: field.value for field in embed.fields}
+
+        self.assertEqual(field_map["Progress"], "1/2 (50%)")
+
+    def test_current_embed_omits_progress_when_untracked(self):
+        state = PlaybackState(
+            is_playing=True,
+            shuffle_state=False,
+            repeat_state="off",
+            context={"type": "album"},
+            item={
+                "name": "Track 2",
+                "artists": [{"name": "Artist"}],
+                "album": {
+                    "id": "album_6",
+                    "name": "Album 6",
+                    "images": [],
+                    "album_type": "album"
+                }
+            },
+            progress_ms=0,
+            timestamp=0
+        )
+
+        embed = self.bot._build_current_embed(state)
+        field_names = [field.name for field in embed.fields]
+
+        self.assertNotIn("Progress", field_names)
+
+    def test_current_playback_action_label_is_post_early(self):
+        labels = [child.label for child in CurrentPlaybackActionView(self.bot, None).children]
+
+        self.assertIn("Post early", labels)
 
 
 @unittest.skipIf(Tracker is None, "tracker dependencies are not installed")
