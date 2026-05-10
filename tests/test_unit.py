@@ -2,12 +2,19 @@
 Unit tests for core logic: classification, normalization, progress, duplicate matching.
 """
 
+import hashlib
+import json
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import sys
 from pathlib import Path
+
+try:
+    import httpx
+except ModuleNotFoundError:
+    httpx = None
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -27,6 +34,20 @@ except ModuleNotFoundError:
     DiscordBot = None
     CurrentPlaybackActionView = None
     CurrentPostContext = None
+
+try:
+    from publisher import (
+        Publisher,
+        POST_CACHE_FIRST_PAGE_HASH_KEY,
+        POST_CACHE_TOTAL_KEY,
+    )
+    from wordpress_client import WordPressClient, WordPressPostsResult
+except ModuleNotFoundError:
+    Publisher = None
+    WordPressClient = None
+    WordPressPostsResult = None
+    POST_CACHE_FIRST_PAGE_HASH_KEY = None
+    POST_CACHE_TOTAL_KEY = None
 
 
 def make_release_for_test(spotify_id, title, last_seen, tracks=None):
@@ -391,6 +412,27 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
             link="https://example.com/album-5"
         )
 
+    def make_interaction(self, response_done=False):
+        response = type(
+            "FakeResponse",
+            (),
+            {
+                "send_message": AsyncMock(),
+                "defer": AsyncMock(),
+                "is_done": Mock(return_value=response_done)
+            }
+        )()
+        followup = type(
+            "FakeFollowup",
+            (),
+            {"send": AsyncMock()}
+        )()
+        return type(
+            "FakeInteraction",
+            (),
+            {"response": response, "followup": followup}
+        )()
+
     def test_inprogress_format_includes_next_track(self):
         release = make_release_for_test(
             "album_4",
@@ -490,9 +532,11 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("Relisten", field_names)
 
-    async def test_current_confirm_publishes_as_relisten_when_duplicate_exists(self):
+    async def test_current_confirm_publishes_as_relisten_from_stored_duplicate_state(self):
         state = self.make_playback_state()
         release = make_release_for_test("album_5", "Album 5", datetime(2024, 1, 1, 12, 0, 0))
+        release.duplicate_state = "found"
+        release.duplicate_post_id = 123
 
         class FakeDatabase:
             async def get_release(self, album_id):
@@ -502,9 +546,9 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.published = None
 
-            async def _check_duplicate(self, release_to_check):
+            async def _get_cached_wordpress_post(self, post_id):
                 return WordPressPost(
-                    id=123,
+                    id=post_id,
                     title="Album 5",
                     normalized_title="album 5",
                     artists=["Artist"],
@@ -512,26 +556,29 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
                     link="https://example.com/album-5"
                 )
 
+            async def _check_duplicate(self, release_to_check):
+                raise AssertionError("_check_duplicate should not be called for tracked releases with stored state")
+
             async def _get_or_create_release(self, album_id):
                 return release
 
             async def publish_release_now(self, release_to_publish, as_relisten=False):
                 self.published = (release_to_publish, as_relisten)
-
-        class FakeInteraction:
-            response = type(
-                "FakeResponse",
-                (),
-                {"send_message": AsyncMock()}
-            )()
+                return "published"
 
         tracker = FakeTracker()
         self.bot.db = FakeDatabase()
         self.bot.tracker = tracker
+        interaction = self.make_interaction()
 
-        await self.bot._handle_current_post_confirm(FakeInteraction(), state)
+        await self.bot._handle_current_post_confirm(interaction, state)
 
         self.assertEqual(tracker.published, (release, True))
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.followup.send.assert_awaited_once_with(
+            "✅ Current content has been posted to WordPress. A notification has been sent.",
+            ephemeral=True
+        )
 
     async def test_inprogress_publish_uses_stored_duplicate_state_for_relisten(self):
         release = make_release_for_test("album_7", "Album 7", datetime(2024, 1, 1, 12, 0, 0))
@@ -547,21 +594,44 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
             async def publish_release_now(self, release_to_publish, as_relisten=False):
                 self.published = (release_to_publish, as_relisten)
-
-        class FakeInteraction:
-            response = type(
-                "FakeResponse",
-                (),
-                {"send_message": AsyncMock()}
-            )()
+                return "published"
 
         tracker = FakeTracker()
         self.bot.db = FakeDatabase()
         self.bot.tracker = tracker
+        interaction = self.make_interaction()
 
-        await self.bot._handle_publish_release(FakeInteraction(), release.spotify_id)
+        await self.bot._handle_publish_release(interaction, release.spotify_id)
 
         self.assertEqual(tracker.published, (release, True))
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.followup.send.assert_awaited_once_with(
+            "✅ Release published successfully. A notification has been sent.",
+            ephemeral=True
+        )
+
+    async def test_inprogress_publish_reports_already_publishing(self):
+        release = make_release_for_test("album_9", "Album 9", datetime(2024, 1, 1, 12, 0, 0))
+
+        class FakeDatabase:
+            async def get_release(self, release_id):
+                return release
+
+        class FakeTracker:
+            async def publish_release_now(self, release_to_publish, as_relisten=False):
+                return "already_publishing"
+
+        self.bot.db = FakeDatabase()
+        self.bot.tracker = FakeTracker()
+        interaction = self.make_interaction()
+
+        await self.bot._handle_publish_release(interaction, release.spotify_id)
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.followup.send.assert_awaited_once_with(
+            "⏳ This release is already being published.",
+            ephemeral=True
+        )
 
     async def test_context_resolver_builds_unsaved_release_for_untracked_duplicate_check(self):
         state = self.make_playback_state("album_8")
@@ -594,6 +664,43 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(context.is_actively_tracked)
         self.assertTrue(tracker.built)
         self.assertTrue(tracker.checked)
+        self.assertEqual(release.duplicate_state, "none")
+        self.assertIsNone(release.duplicate_post_id)
+
+    async def test_context_resolver_uses_stored_duplicate_state_for_tracked_release(self):
+        state = self.make_playback_state("album_10")
+        release = make_release_for_test("album_10", "Album 10", datetime(2024, 1, 1, 12, 0, 0))
+        duplicate_post = WordPressPost(
+            id=456,
+            title="Album 10",
+            normalized_title="album 10",
+            artists=["Artist"],
+            normalized_artists=["artist"],
+            link="https://example.com/album-10"
+        )
+        release.duplicate_state = "found"
+        release.duplicate_post_id = duplicate_post.id
+
+        class FakeDatabase:
+            async def get_release(self, album_id):
+                return release
+
+        class FakeTracker:
+            async def _get_cached_wordpress_post(self, post_id):
+                return duplicate_post if post_id == duplicate_post.id else None
+
+            async def _check_duplicate(self, release_to_check):
+                raise AssertionError("_check_duplicate should not run for tracked releases with stored state")
+
+        self.bot.db = FakeDatabase()
+        self.bot.tracker = FakeTracker()
+
+        context = await self.bot._resolve_current_post_context(state, check_duplicate=True)
+
+        self.assertIs(context.tracked_release, release)
+        self.assertIs(context.release_for_post, release)
+        self.assertIs(context.duplicate_post, duplicate_post)
+        self.assertTrue(context.will_publish_as_relisten)
 
 
 @unittest.skipIf(Tracker is None, "tracker dependencies are not installed")
@@ -668,6 +775,380 @@ class TestTrackerLastSeen(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.touched[0], "album_1")
         self.assertGreater(db.touched[1], old_seen)
         self.assertEqual(release.last_seen, db.touched[1])
+
+
+@unittest.skipIf(Tracker is None, "tracker dependencies are not installed")
+class TestTrackerPublishNow(unittest.IsolatedAsyncioTestCase):
+    """Test tracker publish-now idempotency behavior."""
+
+    def make_tracker(self, db):
+        tracker = Tracker.__new__(Tracker)
+        tracker.db = db
+        tracker.publisher = None
+        tracker.discord_bot = None
+        tracker._publish_release = AsyncMock()
+        return tracker
+
+    async def test_publish_release_now_returns_already_published(self):
+        release = make_release_for_test("album_pub", "Album Pub", datetime(2024, 1, 1, 12, 0, 0))
+        release.status = LifecycleStatus.PUBLISHED
+        release.wordpress_post_id = 123
+
+        class FakeDatabase:
+            async def get_release(self, spotify_id):
+                return release
+
+            async def save_release(self, release_to_save):
+                raise AssertionError("save_release should not be called for already published releases")
+
+        tracker = self.make_tracker(FakeDatabase())
+
+        outcome = await tracker.publish_release_now(release)
+
+        self.assertEqual(outcome, "already_published")
+        tracker._publish_release.assert_not_awaited()
+
+    async def test_publish_release_now_returns_already_publishing(self):
+        release = make_release_for_test("album_ing", "Album Ing", datetime(2024, 1, 1, 12, 0, 0))
+        release.status = LifecycleStatus.PUBLISHING
+
+        class FakeDatabase:
+            async def get_release(self, spotify_id):
+                return release
+
+            async def save_release(self, release_to_save):
+                raise AssertionError("save_release should not be called for already publishing releases")
+
+        tracker = self.make_tracker(FakeDatabase())
+
+        outcome = await tracker.publish_release_now(release)
+
+        self.assertEqual(outcome, "already_publishing")
+        tracker._publish_release.assert_not_awaited()
+
+    async def test_publish_release_now_saves_and_publishes_active_release(self):
+        release = make_release_for_test("album_active", "Album Active", datetime(2024, 1, 1, 12, 0, 0))
+        saved_statuses = []
+
+        class FakeDatabase:
+            async def get_release(self, spotify_id):
+                return release
+
+            async def save_release(self, release_to_save):
+                saved_statuses.append(release_to_save.status)
+
+        tracker = self.make_tracker(FakeDatabase())
+
+        outcome = await tracker.publish_release_now(release, as_relisten=True)
+
+        self.assertEqual(outcome, "published")
+        self.assertEqual(saved_statuses, [LifecycleStatus.PUBLISHING])
+        tracker._publish_release.assert_awaited_once_with(release, as_relisten=True)
+
+
+@unittest.skipIf(Tracker is None, "tracker dependencies are not installed")
+class TestTrackerDuplicateStateInitialization(unittest.IsolatedAsyncioTestCase):
+    """Test duplicate state initialization and legacy fallback behavior."""
+
+    def make_tracker(self, db):
+        tracker = Tracker.__new__(Tracker)
+        tracker.db = db
+        tracker.discord_bot = None
+        tracker.publisher = None
+        return tracker
+
+    def make_duplicate_post(self, post_id=321, title="Album Dup"):
+        return WordPressPost(
+            id=post_id,
+            title=title,
+            normalized_title=normalize_text(title),
+            artists=["Artist"],
+            normalized_artists=["artist"],
+            link=f"https://example.com/{post_id}"
+        )
+
+    async def test_get_or_create_release_sets_duplicate_state_found_before_first_save(self):
+        release = make_release_for_test("album_dup", "Album Dup", datetime(2024, 1, 1, 12, 0, 0))
+        duplicate_post = self.make_duplicate_post()
+        saved_duplicate_data = []
+        audit_events = []
+
+        class FakeDatabase:
+            async def get_release(self, spotify_id):
+                return None
+
+            async def save_release(self, release_to_save):
+                saved_duplicate_data.append(
+                    (release_to_save.duplicate_state, release_to_save.duplicate_post_id)
+                )
+
+            async def log_audit_event(self, event_type, payload):
+                audit_events.append((event_type, payload))
+
+        tracker = self.make_tracker(FakeDatabase())
+        tracker._build_release_from_spotify = AsyncMock(return_value=release)
+        tracker._check_duplicate = AsyncMock(return_value=duplicate_post)
+
+        created = await tracker._get_or_create_release("album_dup")
+
+        self.assertIs(created, release)
+        self.assertEqual(release.duplicate_state, "found")
+        self.assertEqual(release.duplicate_post_id, duplicate_post.id)
+        self.assertEqual(saved_duplicate_data, [("found", duplicate_post.id)])
+        self.assertEqual(audit_events, [("release_created", {"spotify_id": "album_dup"})])
+
+    async def test_get_or_create_release_sets_duplicate_state_none_when_no_duplicate_exists(self):
+        release = make_release_for_test("album_new", "Album New", datetime(2024, 1, 1, 12, 0, 0))
+        saved_duplicate_data = []
+
+        class FakeDatabase:
+            async def get_release(self, spotify_id):
+                return None
+
+            async def save_release(self, release_to_save):
+                saved_duplicate_data.append(
+                    (release_to_save.duplicate_state, release_to_save.duplicate_post_id)
+                )
+
+            async def log_audit_event(self, event_type, payload):
+                return None
+
+        tracker = self.make_tracker(FakeDatabase())
+        tracker._build_release_from_spotify = AsyncMock(return_value=release)
+        tracker._check_duplicate = AsyncMock(return_value=None)
+
+        created = await tracker._get_or_create_release("album_new")
+
+        self.assertIs(created, release)
+        self.assertEqual(release.duplicate_state, "none")
+        self.assertIsNone(release.duplicate_post_id)
+        self.assertEqual(saved_duplicate_data, [("none", None)])
+
+    async def test_handle_completion_uses_stored_duplicate_state_without_rechecking(self):
+        release = make_release_for_test("album_known", "Album Known", datetime(2024, 1, 1, 12, 0, 0))
+        release.status = LifecycleStatus.PUBLISHING
+        release.duplicate_state = "found"
+        release.duplicate_post_id = 321
+        saved_states = []
+
+        class FakeDatabase:
+            async def save_release(self, release_to_save):
+                saved_states.append((release_to_save.status, release_to_save.duplicate_state))
+
+        tracker = self.make_tracker(FakeDatabase())
+        tracker._check_duplicate = AsyncMock(side_effect=AssertionError("Should not re-check duplicates"))
+        tracker._has_relisten_prompt = AsyncMock(return_value=False)
+        tracker._send_relisten_prompt = AsyncMock()
+
+        await tracker._handle_completion(release)
+
+        self.assertEqual(release.status, LifecycleStatus.AWAITING_RELISION_DECISION)
+        self.assertEqual(release.duplicate_state, "found")
+        tracker._check_duplicate.assert_not_awaited()
+        tracker._send_relisten_prompt.assert_awaited_once_with(release)
+        self.assertEqual(saved_states[-1], (LifecycleStatus.AWAITING_RELISION_DECISION, "found"))
+
+    async def test_handle_completion_backfills_legacy_duplicate_state_before_publish(self):
+        release = make_release_for_test("album_legacy", "Album Legacy", datetime(2024, 1, 1, 12, 0, 0))
+        release.status = LifecycleStatus.PUBLISHING
+        saved_states = []
+
+        class FakeDatabase:
+            async def save_release(self, release_to_save):
+                saved_states.append((release_to_save.status, release_to_save.duplicate_state))
+
+        tracker = self.make_tracker(FakeDatabase())
+        tracker._check_duplicate = AsyncMock(return_value=None)
+        tracker._publish_release = AsyncMock()
+
+        await tracker._handle_completion(release)
+
+        self.assertEqual(release.duplicate_state, "none")
+        self.assertIsNone(release.duplicate_post_id)
+        tracker._check_duplicate.assert_awaited_once_with(release)
+        tracker._publish_release.assert_awaited_once_with(release)
+        self.assertEqual(saved_states[-1][1], "none")
+
+
+@unittest.skipIf(WordPressClient is None or httpx is None, "wordpress client dependencies are not installed")
+class TestWordPressPostFetch(unittest.IsolatedAsyncioTestCase):
+    """Test WordPress post pagination and first-page validation."""
+
+    class FakeHTTPClient:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.requests = []
+
+        async def get(self, url, params=None):
+            self.requests.append((url, params))
+            if not self.responses:
+                raise AssertionError("Unexpected WordPress request")
+            return self.responses.pop(0)
+
+    def make_response(self, posts, total="1", total_pages="1"):
+        body = json.dumps(posts).encode()
+        headers = {
+            "X-WP-Total": total,
+            "X-WP-TotalPages": total_pages,
+        }
+        return httpx.Response(
+            200,
+            content=body,
+            headers=headers,
+            request=httpx.Request("GET", "https://example.com/wp-json/wp/v2/posts"),
+        )
+
+    def make_client(self, responses):
+        fake_http = self.FakeHTTPClient(responses)
+        client = WordPressClient.__new__(WordPressClient)
+        client.api_url = "https://example.com/wp-json/wp/v2"
+        client.client = fake_http
+        return client, fake_http
+
+    async def test_matching_first_page_validation_skips_pagination(self):
+        response = self.make_response([{"id": 1}], total="7")
+        first_page_hash = hashlib.sha256(response.content).hexdigest()
+        client, fake_http = self.make_client([response])
+
+        result = await client.get_posts(
+            validate_first_page=True,
+            previous_x_wp_total="7",
+            previous_first_page_hash=first_page_hash,
+            status="publish",
+            _fields="id,title,tags,link",
+        )
+
+        self.assertTrue(result.cache_unchanged)
+        self.assertEqual(result.posts, [])
+        self.assertEqual(len(fake_http.requests), 1)
+
+    async def test_changed_first_page_hash_reuses_page_one_and_paginates(self):
+        previous_response = self.make_response([{"id": 2}], total="7", total_pages="2")
+        page_one = self.make_response(
+            [{"id": 1}],
+            total="7",
+            total_pages="2",
+        )
+        page_two = self.make_response([{"id": 3}], total="7", total_pages="2")
+        client, fake_http = self.make_client([page_one, page_two])
+
+        result = await client.get_posts(
+            validate_first_page=True,
+            previous_x_wp_total="7",
+            previous_first_page_hash=hashlib.sha256(previous_response.content).hexdigest(),
+            status="publish",
+            _fields="id,title,tags,link",
+        )
+
+        self.assertFalse(result.cache_unchanged)
+        self.assertEqual([post["id"] for post in result.posts], [1, 3])
+        self.assertEqual([request[1]["page"] for request in fake_http.requests], [1, 2])
+
+
+@unittest.skipIf(Publisher is None, "publisher dependencies are not installed")
+class TestPublisherPostCacheRefresh(unittest.IsolatedAsyncioTestCase):
+    """Test publisher-level WordPress post cache refresh behavior."""
+
+    class FakeDatabase:
+        def __init__(self):
+            self.state = {
+                POST_CACHE_TOTAL_KEY: "1",
+                POST_CACHE_FIRST_PAGE_HASH_KEY: "abc",
+            }
+            self.saved_posts = None
+            self.saved_state = {}
+
+        async def get_service_state(self, key):
+            return self.state.get(key)
+
+        async def save_wordpress_posts(self, posts):
+            self.saved_posts = posts
+
+        async def save_service_state(self, key, value):
+            self.saved_state[key] = value
+
+    async def test_refresh_post_cache_returns_early_when_wordpress_posts_unchanged(self):
+        class FakeWordPress:
+            async def get_posts(self, **kwargs):
+                return WordPressPostsResult(
+                    posts=[],
+                    cache_unchanged=True,
+                    message="WordPress post cache is current.",
+                    x_wp_total="1",
+                    first_page_hash="abc",
+                )
+
+            async def get_tags(self):
+                raise AssertionError("Tags should not be fetched when post cache is unchanged")
+
+        db = self.FakeDatabase()
+        publisher = Publisher.__new__(Publisher)
+        publisher.db = db
+        publisher.wordpress = FakeWordPress()
+
+        message = await publisher.refresh_post_cache()
+
+        self.assertEqual(message, "WordPress post cache is current.")
+        self.assertIsNone(db.saved_posts)
+        self.assertEqual(db.saved_state, {})
+
+    async def test_forced_refresh_rebuilds_cache_and_saves_validation_state(self):
+        class FakeWordPress:
+            def __init__(self):
+                self.get_posts_kwargs = None
+
+            async def get_posts(self, **kwargs):
+                self.get_posts_kwargs = kwargs
+                return WordPressPostsResult(
+                    posts=[{
+                        "id": 11,
+                        "title": {"rendered": "Album Title"},
+                        "tags": [22],
+                        "link": "https://example.com/album-title",
+                    }],
+                    cache_unchanged=False,
+                    message="Fetched 1 WordPress posts.",
+                    x_wp_total="1",
+                    first_page_hash="hash-1",
+                )
+
+            async def get_tags(self):
+                return [{"id": 22, "name": "Artist Name"}]
+
+        db = self.FakeDatabase()
+        wordpress = FakeWordPress()
+        publisher = Publisher.__new__(Publisher)
+        publisher.db = db
+        publisher.wordpress = wordpress
+
+        message = await publisher.refresh_post_cache(force=True)
+
+        self.assertEqual(message, "Updated post cache: 1 posts")
+        self.assertFalse(wordpress.get_posts_kwargs["validate_first_page"])
+        self.assertEqual(db.saved_posts[0].title, "Album Title")
+        self.assertEqual(db.saved_posts[0].artists, ["Artist Name"])
+        self.assertEqual(db.saved_state[POST_CACHE_TOTAL_KEY], "1")
+        self.assertEqual(db.saved_state[POST_CACHE_FIRST_PAGE_HASH_KEY], "hash-1")
+
+    async def test_publish_release_keeps_success_when_forced_cache_refresh_fails(self):
+        class FakeWordPress:
+            async def create_post(self, data):
+                return {"id": 99, "title": {"rendered": data["title"]}}
+
+        release = make_release_for_test("album_publish", "Album Publish", datetime(2024, 1, 1, 12, 0, 0))
+        publisher = Publisher.__new__(Publisher)
+        publisher.category_cache = {"Album": 1}
+        publisher.wordpress = FakeWordPress()
+        publisher._ensure_categories = AsyncMock()
+        publisher._upload_artwork = AsyncMock(return_value=None)
+        publisher._resolve_tags = AsyncMock(return_value=[2])
+        publisher.refresh_post_cache = AsyncMock(side_effect=RuntimeError("refresh failed"))
+
+        post = await publisher.publish_release(release)
+
+        self.assertEqual(post["id"], 99)
+        self.assertEqual(release.wordpress_post_id, 99)
+        publisher.refresh_post_cache.assert_awaited_once_with(force=True)
 
 
 class TestDuplicateDetection(unittest.TestCase):

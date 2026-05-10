@@ -28,7 +28,7 @@ class Service:
     def __init__(self):
         self.config = Config()
         self.db = Database(self.config)
-        self.publisher = Publisher(self.config)
+        self.publisher = Publisher(self.config, self.db)
         self.tracker = Tracker(self.config, self.db, self.publisher)
         self.discord_bot = DiscordBot(self.config, self.db, self.tracker)
         self.tracker.set_discord_bot(self.discord_bot)

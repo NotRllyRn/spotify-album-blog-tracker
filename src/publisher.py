@@ -9,16 +9,22 @@ from pathlib import Path
 import tempfile
 
 from config import Config
+from database import Database
 from wordpress_client import WordPressClient
 from models import Release
 
 logger = logging.getLogger(__name__)
 
+POST_CACHE_TOTAL_KEY = "wordpress_post_cache.x_wp_total"
+POST_CACHE_FIRST_PAGE_HASH_KEY = "wordpress_post_cache.first_page_hash"
+
+
 class Publisher:
     """Handles publishing releases to WordPress."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, db: Database):
         self.config = config
+        self.db = db
         self.wordpress = WordPressClient(config)
         self.category_cache: Dict[str, int] = {}
         self.tag_cache: Dict[str, int] = {}
@@ -63,6 +69,11 @@ class Publisher:
             release.wordpress_post_id = post["id"]
             release.wordpress_media_id = media_id
             release.published_at = None  # Will be set by tracker
+
+            try:
+                await self.refresh_post_cache(force=True)
+            except Exception as e:
+                logger.error(f"Post cache refresh failed after publish: {e}")
 
             return post
 
@@ -154,11 +165,24 @@ class Publisher:
             logger.error(f"Error uploading artwork: {e}")
             return None
 
-    async def refresh_post_cache(self):
+    async def refresh_post_cache(self, force: bool = False) -> Optional[str]:
         """Refresh WordPress post cache for duplicate detection."""
         try:
             logger.info("Refreshing WordPress post cache...")
-            posts = await self.wordpress.get_posts(status="publish", _fields="id,title,tags,link")
+            previous_x_wp_total = None if force else await self.db.get_service_state(POST_CACHE_TOTAL_KEY)
+            previous_first_page_hash = None if force else await self.db.get_service_state(POST_CACHE_FIRST_PAGE_HASH_KEY)
+
+            posts_result = await self.wordpress.get_posts(
+                validate_first_page=not force,
+                previous_x_wp_total=previous_x_wp_total,
+                previous_first_page_hash=previous_first_page_hash,
+                status="publish",
+                _fields="id,title,tags,link",
+            )
+
+            if posts_result.cache_unchanged:
+                logger.info(posts_result.message)
+                return posts_result.message
 
             # Get all tags
             tags = await self.wordpress.get_tags()
@@ -169,28 +193,36 @@ class Publisher:
             from utils import normalize_text, normalize_artist_list
 
             cache = []
-            for post in posts:
+            for post in posts_result.posts:
                 # Get tag names from tag IDs
                 post_tags = [tag_map.get(t, "") for t in post.get("tags", [])]
 
                 cache_item = WordPressPost(
                     id=post["id"],
-                    title=post["title"],
-                    normalized_title=normalize_text(post["title"]),
+                    title=post["title"]["rendered"],
+                    normalized_title=normalize_text(post["title"]["rendered"]),
                     artists=post_tags,
                     normalized_artists=normalize_artist_list(post_tags),
                     link=post.get("link", "")
                 )
                 cache.append(cache_item)
 
-            # Save to database
-            from database import Database
-            db = Database(self.config)
-            await db.initialize()
-            await db.save_wordpress_posts(cache)
-            await db.close()
+            await self.db.save_wordpress_posts(cache)
+            await self._save_post_cache_validation_state(posts_result)
 
-            logger.info(f"Updated post cache: {len(cache)} posts")
+            message = f"Updated post cache: {len(cache)} posts"
+            logger.info(message)
+            return message
 
         except Exception as e:
             logger.error(f"Error refreshing post cache: {e}")
+            return None
+
+    async def _save_post_cache_validation_state(self, posts_result):
+        """Persist page-1 metadata after a successful full post-cache refresh."""
+        if not posts_result.x_wp_total:
+            logger.info("Skipping WordPress post cache validation state save; response headers were incomplete.")
+            return
+
+        await self.db.save_service_state(POST_CACHE_TOTAL_KEY, posts_result.x_wp_total)
+        await self.db.save_service_state(POST_CACHE_FIRST_PAGE_HASH_KEY, posts_result.first_page_hash)

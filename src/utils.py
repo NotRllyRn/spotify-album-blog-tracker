@@ -5,6 +5,9 @@ Utility functions.
 import unicodedata
 import re
 from typing import List
+from logging import getLogger
+
+logger = getLogger(__name__)
 
 def normalize_text(text: str) -> str:
     """Normalize text for comparison."""

@@ -260,6 +260,7 @@ class Database:
         """)
         rows = await cursor.fetchall()
         import json
+        
         return [WordPressPost(
             id=row[0],
             title=row[1],
@@ -283,6 +284,7 @@ class Database:
                 json.dumps(post.artists), json.dumps(post.normalized_artists),
                 post.link
             ))
+
         await self.connection.commit()
 
     # Discord operations
@@ -327,6 +329,8 @@ class Database:
             WHERE release_id = ? AND prompt_type = ?
             LIMIT 1
         """, (release_id, prompt_type))
+        logger.info(f"Checking for existing Discord prompt for release_id={release_id}, prompt_type={prompt_type}")
+        logger.info(f"Discord prompt: {await cursor.fetchone()}")
         return await cursor.fetchone() is not None
 
     async def get_discord_prompt_by_release_and_type(self, release_id: str, prompt_type: str) -> Optional[DiscordPrompt]:

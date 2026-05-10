@@ -23,3 +23,6 @@ wp-content/backups/
 Thumbs.db
 .idea/
 .vscode/
+
+*.db
+*.db-*

@@ -34,10 +34,6 @@ class CurrentPostContext:
     duplicate_post: Optional[WordPressPost]
     is_actively_tracked: bool
 
-    @property
-    def will_publish_as_relisten(self) -> bool:
-        return self.duplicate_post is not None
-
 def _clip_discord_text(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
@@ -431,8 +427,9 @@ class DiscordBot:
 
     async def send_publish_notification(self, release: Release, post: dict) -> Optional[discord.Message]:
         """Send notification after a release is published."""
+        # Check for duplicate state to include in the notification if applicable. Changing the title to "republished" if it's a relisten post. and including those relisten details in the embed.
         embed = discord.Embed(
-            title="Release published",
+            title=f"Release {'republished' if release.duplicate_state == 'found' else 'published'} to WordPress",
             description=f"{release.title} by {', '.join([a.name for a in release.artists])}",
             color=0x1DB954
         )
@@ -442,6 +439,10 @@ class DiscordBot:
         embed.add_field(name="Release type", value=release.release_type.value, inline=True)
         embed.add_field(name="Progress", value=f"{int(release.progress * 100)}%", inline=True)
         embed.set_thumbnail(url=release.cover_url)
+
+        # Include duplicate information if applicable
+        if release.duplicate_state == "found":
+            embed.add_field(name="⚠️ Duplicate Found", value=f"Post ID: {release.duplicate_post_id}", inline=False)
 
         view = None
         if release.wordpress_post_id:
@@ -531,10 +532,16 @@ class DiscordBot:
 
     async def _handle_75_publish(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
         await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.ACCEPTED.value)
-        await self.tracker.publish_release_now(release)
-        await interaction.followup.send(
-            "✅ Published early. A notification has been sent.",
-            ephemeral=True
+        await self._publish_release_with_feedback(
+            interaction,
+            release,
+            success_message="✅ Published early. A notification has been sent.",
+            already_published_message=(
+                f"✅ This release is already published as post {release.wordpress_post_id}."
+                if release.wordpress_post_id
+                else "✅ This release is already published."
+            ),
+            already_publishing_message="⏳ This release is already being published."
         )
 
     async def _handle_75_wait(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
@@ -548,10 +555,17 @@ class DiscordBot:
 
     async def _handle_relisten_publish(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
         await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.ACCEPTED.value)
-        await self.tracker.publish_release_now(release, as_relisten=True)
-        await interaction.followup.send(
-            "✅ Published as Relisten. A notification has been sent.",
-            ephemeral=True
+        await self._publish_release_with_feedback(
+            interaction,
+            release,
+            success_message="✅ Published as Relisten. A notification has been sent.",
+            already_published_message=(
+                f"✅ This release is already published as post {release.wordpress_post_id}."
+                if release.wordpress_post_id
+                else "✅ This release is already published."
+            ),
+            already_publishing_message="⏳ This release is already being published.",
+            as_relisten=True
         )
 
     async def _handle_relisten_ignore(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
@@ -614,17 +628,17 @@ class DiscordBot:
             )
             return
 
-        if release.status == LifecycleStatus.PUBLISHED and release.wordpress_post_id:
-            await interaction.response.send_message(
-                f"✅ This release is already published as post {release.wordpress_post_id}.",
-                ephemeral=True
-            )
-            return
-
-        await self.tracker.publish_release_now(release, as_relisten=release.duplicate_state == "found")
-        await interaction.response.send_message(
-            "✅ Release published successfully. A notification has been sent.",
-            ephemeral=True
+        await self._publish_release_with_feedback(
+            interaction,
+            release,
+            success_message="✅ Release published successfully. A notification has been sent.",
+            already_published_message=(
+                f"✅ This release is already published as post {release.wordpress_post_id}."
+                if release.wordpress_post_id
+                else "✅ This release is already published."
+            ),
+            already_publishing_message="⏳ This release is already being published.",
+            as_relisten=release.duplicate_state == "found"
         )
 
     async def _handle_remove_release_prompt(self, interaction: discord.Interaction, release_id: str):
@@ -710,6 +724,8 @@ class DiscordBot:
             description=f"{release.title} by {artist_names}",
             color=0x1DB954
         )
+        if release.duplicate_state == "found":
+            embed.add_field(name="⚠️ Duplicate Found", value=f"Post ID: {release.duplicate_post_id}", inline=False)
         embed.add_field(name="Release type", value=release.release_type.value, inline=True)
         embed.add_field(name="Progress", value=f"{listened}/{countable} ({progress_percent}%)", inline=True)
         embed.add_field(name="Status", value=release.status.value, inline=True)
@@ -763,7 +779,7 @@ class DiscordBot:
         if context.duplicate_post is not None:
             duplicate_title = _clip_discord_text(context.duplicate_post.title, 120)
             embed.add_field(
-                name="Relisten",
+                name="Relisten ⚠️",
                 value=(
                     "Existing WordPress post found: "
                     f"{duplicate_title} (post {context.duplicate_post.id}). "
@@ -849,7 +865,21 @@ class DiscordBot:
 
         duplicate_post = None
         if check_duplicate and release_for_post is not None:
-            duplicate_post = await self.tracker._check_duplicate(release_for_post)
+            if tracked_release is not None:
+                if tracked_release.duplicate_state == "found":
+                    duplicate_post = await self.tracker._get_cached_wordpress_post(
+                        tracked_release.duplicate_post_id
+                    )
+                elif tracked_release.duplicate_state is None:
+                    duplicate_post = await self.tracker._initialize_duplicate_state(tracked_release)
+            else:
+                duplicate_post = await self.tracker._check_duplicate(release_for_post)
+                if duplicate_post:
+                    release_for_post.duplicate_state = "found"
+                    release_for_post.duplicate_post_id = duplicate_post.id
+                else:
+                    release_for_post.duplicate_state = "none"
+                    release_for_post.duplicate_post_id = None
 
         return CurrentPostContext(
             tracked_release=tracked_release,
@@ -880,18 +910,49 @@ class DiscordBot:
 
         context = await self._resolve_current_post_context(playback_state, check_duplicate=True)
         release = await self.tracker._get_or_create_release(album_id)
-        if release.status == LifecycleStatus.PUBLISHED and release.wordpress_post_id:
-            await interaction.response.send_message(
-                f"✅ This content has already been published as post {release.wordpress_post_id}.",
+        logger.info(f"Publishing current playback for album {album_id} with context: {context}")
+        await self._publish_release_with_feedback(
+            interaction,
+            release,
+            success_message="✅ Current content has been posted to WordPress. A notification has been sent.",
+            already_published_message=(
+                f"✅ This content has already been published as post {release.wordpress_post_id}."
+                if release.wordpress_post_id
+                else "✅ This content has already been published."
+            ),
+            already_publishing_message="⏳ This content is already being published.",
+            as_relisten=context.duplicate_post is not None
+        )
+
+    async def _publish_release_with_feedback(
+        self,
+        interaction: discord.Interaction,
+        release: Release,
+        success_message: str,
+        already_published_message: str,
+        already_publishing_message: str,
+        as_relisten: bool = False
+    ):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        try:
+            outcome = await self.tracker.publish_release_now(release, as_relisten=as_relisten)
+            if outcome == "already_published":
+                await interaction.followup.send(already_published_message, ephemeral=True)
+                return
+
+            if outcome == "already_publishing":
+                await interaction.followup.send(already_publishing_message, ephemeral=True)
+                return
+
+            await interaction.followup.send(success_message, ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error publishing release {release.spotify_id}: {e}", exc_info=True)
+            await interaction.followup.send(
+                f"❌ Error publishing release: {str(e)[:100]}",
                 ephemeral=True
             )
-            return
-
-        await self.tracker.publish_release_now(release, as_relisten=context.will_publish_as_relisten)
-        await interaction.response.send_message(
-            "✅ Current content has been posted to WordPress. A notification has been sent.",
-            ephemeral=True
-        )
 
     def _build_inprogress_embed(self, page_data: InProgressPage) -> discord.Embed:
         featured = page_data.featured

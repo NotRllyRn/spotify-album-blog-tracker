@@ -84,7 +84,7 @@ class Tracker:
             await self._recompute_release_progress(release)
 
             # Check for prompts
-            if release.progress >= 0.75 and not await self._has_75_prompt(release):
+            if release.progress >= 0.75 and release.duplicate_state != "found" and not await self._has_75_prompt(release):
                 await self._send_75_prompt(release)
 
             if release.progress >= 1.0:
@@ -148,6 +148,7 @@ class Tracker:
             return release
 
         release = await self._build_release_from_spotify(album_id)
+        await self._initialize_duplicate_state(release)
         await self.db.save_release(release)
         await self.db.log_audit_event("release_created", {"spotify_id": album_id})
 
@@ -293,23 +294,32 @@ class Tracker:
 
         release.completed_at = datetime.now()
 
-        # Check for duplicates
         if release.duplicate_state is None:
-            duplicate_post = await self._check_duplicate(release)
-            if duplicate_post:
-                release.duplicate_state = "found"
-                release.duplicate_post_id = duplicate_post.id
+            await self._initialize_duplicate_state(release)
+
+        if release.duplicate_state == "found":
+            if not await self._has_relisten_prompt(release):
                 release.status = LifecycleStatus.AWAITING_RELISION_DECISION
-                if not await self._has_relisten_prompt(release):
-                    await self._send_relisten_prompt(release)
-            else:
-                release.duplicate_state = "none"
-                await self._publish_release(release)
-        elif release.duplicate_state == "found" and not await self._has_relisten_prompt(release):
-            release.status = LifecycleStatus.AWAITING_RELISION_DECISION
-            await self._send_relisten_prompt(release)
+                await self._send_relisten_prompt(release)
+        elif release.duplicate_state == "none":
+            await self._publish_release(release)
 
         await self.db.save_release(release)
+
+    async def _initialize_duplicate_state(self, release: Release) -> Optional[Any]:
+        """Set duplicate state once for a release and return the matched post, if any."""
+        if release.duplicate_state is not None:
+            return await self._get_cached_wordpress_post(release.duplicate_post_id)
+
+        duplicate_post = await self._check_duplicate(release)
+        if duplicate_post:
+            release.duplicate_state = "found"
+            release.duplicate_post_id = duplicate_post.id
+            return duplicate_post
+
+        release.duplicate_state = "none"
+        release.duplicate_post_id = None
+        return None
 
     async def _check_duplicate(self, release: Release) -> Optional[Any]:
         """Check if release is duplicate using normalized title and artist set."""
@@ -322,7 +332,6 @@ class Tracker:
         release_norm_title = release.normalized_title
         release_artists_set = set(normalize_artist_list([a.name for a in release.artists]))
         
-        # Check each post
         for post in posts:
             if post.normalized_title == release_norm_title:
                 post_artists_set = set(post.normalized_artists)
@@ -330,6 +339,18 @@ class Tracker:
                     logger.info(f"Duplicate found: {post.title} (ID: {post.id})")
                     return post
         
+        return None
+
+    async def _get_cached_wordpress_post(self, post_id: Optional[int]) -> Optional[Any]:
+        """Get a cached WordPress post by ID."""
+        if post_id is None:
+            return None
+
+        posts = await self.db.get_wordpress_posts()
+        for post in posts:
+            if post.id == post_id:
+                return post
+
         return None
 
     async def _send_relisten_prompt(self, release: Release):
@@ -354,15 +375,21 @@ class Tracker:
 
         logger.info(f"Relisten prompt sent for {release.title}")
 
-    async def publish_release_now(self, release: Release, as_relisten: bool = False):
+    async def publish_release_now(self, release: Release, as_relisten: bool = False) -> str:
         """Publish a release immediately from a Discord prompt action."""
-        if release.status == LifecycleStatus.PUBLISHED:
-            return release
+        latest_release = await self.db.get_release(release.spotify_id)
+        release_to_publish = latest_release or release
 
-        release.status = LifecycleStatus.PUBLISHING
-        await self.db.save_release(release)
-        await self._publish_release(release, as_relisten=as_relisten)
-        return release
+        if release_to_publish.status == LifecycleStatus.PUBLISHED:
+            return "already_published"
+
+        if release_to_publish.status == LifecycleStatus.PUBLISHING:
+            return "already_publishing"
+
+        release_to_publish.status = LifecycleStatus.PUBLISHING
+        await self.db.save_release(release_to_publish)
+        await self._publish_release(release_to_publish, as_relisten=as_relisten)
+        return "published"
 
     async def _publish_release(self, release: Release, as_relisten: bool = False):
         """Publish release to WordPress."""

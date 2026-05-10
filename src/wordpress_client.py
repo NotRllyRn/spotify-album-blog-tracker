@@ -4,6 +4,8 @@ Async WordPress REST API client.
 
 import httpx
 import logging
+import hashlib
+from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import base64
@@ -11,6 +13,16 @@ import base64
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WordPressPostsResult:
+    posts: List[Dict[str, Any]]
+    cache_unchanged: bool
+    message: str
+    x_wp_total: Optional[str]
+    first_page_hash: str
+
 
 class WordPressClient:
     def __init__(self, config: Config):
@@ -38,23 +50,92 @@ class WordPressClient:
         """Close HTTP client."""
         await self.client.aclose()
 
-    async def get_posts(self, **params) -> List[Dict[str, Any]]:
-        """Get posts with pagination."""
+    async def get_posts(
+        self,
+        validate_first_page: bool = False,
+        previous_x_wp_total: Optional[str] = None,
+        previous_first_page_hash: Optional[str] = None,
+        **params
+    ) -> WordPressPostsResult:
+        """Get posts with pagination, optionally short-circuiting on page-1 metadata."""
         url = f"{self.api_url}/posts"
         all_posts = []
 
-        while url:
-            response = await self.client.get(url, params=params)
+        request_params = {**params, "per_page": params.get("per_page", 100), "page": 1}
+        response = await self.client.get(url, params=request_params)
+        response.raise_for_status()
+
+        first_page_data = response.json()
+        x_wp_total = response.headers.get("X-WP-Total")
+        first_page_hash = hashlib.sha256(response.content).hexdigest()
+
+        if self._first_page_cache_matches(
+            validate_first_page,
+            x_wp_total,
+            first_page_hash,
+            previous_x_wp_total,
+            previous_first_page_hash,
+        ):
+            return WordPressPostsResult(
+                posts=[],
+                cache_unchanged=True,
+                message=(
+                    "WordPress post cache is current; X-WP-Total and "
+                    "first-page hash both matched."
+                ),
+                x_wp_total=x_wp_total,
+                first_page_hash=first_page_hash,
+            )
+
+        all_posts.extend(first_page_data)
+
+        try:
+            total_pages = int(response.headers.get("X-WP-TotalPages", "1"))
+        except ValueError:
+            total_pages = 1
+
+        for page in range(2, total_pages + 1):
+            request_params = {**params, "per_page": params.get("per_page", 100), "page": page}
+            response = await self.client.get(url, params=request_params)
             response.raise_for_status()
             data = response.json()
-
             all_posts.extend(data)
 
-            # Check for next page
-            next_url = response.headers.get("X-WP-Next")
-            url = next_url
+        return WordPressPostsResult(
+            posts=all_posts,
+            cache_unchanged=False,
+            message=f"Fetched {len(all_posts)} WordPress posts.",
+            x_wp_total=x_wp_total,
+            first_page_hash=first_page_hash,
+        )
 
-        return all_posts
+    def _first_page_cache_matches(
+        self,
+        validate_first_page: bool,
+        x_wp_total: Optional[str],
+        first_page_hash: str,
+        previous_x_wp_total: Optional[str],
+        previous_first_page_hash: Optional[str],
+    ) -> bool:
+        """Return whether page-1 metadata proves the cached post list is current."""
+        if not validate_first_page:
+            return False
+
+        if not all([
+            x_wp_total,
+            first_page_hash,
+            previous_x_wp_total,
+            previous_first_page_hash,
+        ]):
+            return False
+
+        if not x_wp_total.isdigit():
+            return False
+
+        return (
+            x_wp_total == previous_x_wp_total
+            and first_page_hash == previous_first_page_hash
+        )
 
     async def create_post(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new post."""
