@@ -3,7 +3,7 @@ Unit tests for core logic: classification, normalization, progress, duplicate ma
 """
 
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import sys
 from pathlib import Path
@@ -13,6 +13,45 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from utils import normalize_text, normalize_artist_name, normalize_artist_list, compute_release_type
 from models import Track, Artist, Release, ReleaseType, LifecycleStatus
+from inprogress import build_inprogress_page, INPROGRESS_PAGE_SIZE
+
+try:
+    from tracker import Tracker
+except ModuleNotFoundError:
+    Tracker = None
+
+
+def make_release_for_test(spotify_id, title, last_seen, tracks=None):
+    """Helper to create a release for tests."""
+    tracks = tracks if tracks is not None else [
+        Track(
+            spotify_id=f"{spotify_id}_track",
+            title="Test Track",
+            normalized_title="test track",
+            duration_ms=300000,
+            disc_number=1,
+            track_number=1,
+            is_countable=True,
+            listened=False
+        )
+    ]
+    return Release(
+        spotify_id=spotify_id,
+        title=title,
+        normalized_title=normalize_text(title),
+        artists=[Artist(spotify_id="artist1", name="Artist", normalized_name="artist")],
+        release_type=ReleaseType.ALBUM,
+        raw_spotify_type="album",
+        cover_url="http://example.com/cover.jpg",
+        release_date="2024-01-01",
+        total_tracks=len([t for t in tracks if t.is_countable]),
+        total_duration_ms=sum(t.duration_ms for t in tracks if t.is_countable),
+        tracks=tracks,
+        progress=0.0,
+        status=LifecycleStatus.ACTIVE,
+        first_seen=last_seen,
+        last_seen=last_seen
+    )
 
 
 class TestNormalization(unittest.TestCase):
@@ -184,6 +223,134 @@ class TestProgressTracking(unittest.TestCase):
         progress = self.compute_progress(release)
         # Should be 5/5 = 100%, not 5/10 = 50%
         self.assertEqual(progress, 1.0)
+
+
+class TestInProgressPagination(unittest.TestCase):
+    """Test /inprogress pinned-feature pagination."""
+
+    def make_releases(self, count):
+        base = datetime(2024, 1, 1, 12, 0, 0)
+        return [
+            make_release_for_test(
+                spotify_id=f"album_{index}",
+                title=f"Album {index}",
+                last_seen=base + timedelta(minutes=index)
+            )
+            for index in range(count)
+        ]
+
+    def test_one_release_is_featured_on_single_page(self):
+        releases = self.make_releases(1)
+        page = build_inprogress_page(releases, 0)
+
+        self.assertEqual(page.featured.spotify_id, "album_0")
+        self.assertEqual(page.items, [])
+        self.assertEqual(page.page, 0)
+        self.assertEqual(page.total_pages, 1)
+        self.assertEqual(page.total_releases, 1)
+
+    def test_ten_releases_fit_featured_plus_nine(self):
+        releases = self.make_releases(10)
+        page = build_inprogress_page(releases, 0)
+
+        self.assertEqual(page.featured.spotify_id, "album_9")
+        self.assertEqual(len(page.items), INPROGRESS_PAGE_SIZE)
+        self.assertEqual(page.total_pages, 1)
+        self.assertNotIn(page.featured.spotify_id, [release.spotify_id for release in page.items])
+
+    def test_eleven_releases_create_second_page(self):
+        releases = self.make_releases(11)
+        first_page = build_inprogress_page(releases, 0)
+        second_page = build_inprogress_page(releases, 1)
+
+        self.assertEqual(first_page.featured.spotify_id, "album_10")
+        self.assertEqual(len(first_page.items), INPROGRESS_PAGE_SIZE)
+        self.assertEqual(second_page.featured.spotify_id, "album_10")
+        self.assertEqual(len(second_page.items), 1)
+        self.assertEqual(second_page.items[0].spotify_id, "album_0")
+        self.assertEqual(second_page.total_pages, 2)
+
+    def test_page_indexes_are_clamped(self):
+        releases = self.make_releases(11)
+
+        before_first = build_inprogress_page(releases, -5)
+        after_last = build_inprogress_page(releases, 99)
+
+        self.assertEqual(before_first.page, 0)
+        self.assertEqual(after_last.page, 1)
+
+
+@unittest.skipIf(Tracker is None, "tracker dependencies are not installed")
+class TestTrackerLastSeen(unittest.IsolatedAsyncioTestCase):
+    """Test tracker last_seen refresh behavior."""
+
+    async def test_replaying_listened_track_touches_release_last_seen(self):
+        old_seen = datetime(2024, 1, 1, 12, 0, 0)
+        track = Track(
+            spotify_id="track_1",
+            title="Track 1",
+            normalized_title="track 1",
+            duration_ms=300000,
+            disc_number=1,
+            track_number=1,
+            is_countable=True,
+            listened=True,
+            listened_at=old_seen,
+            listened_source="playback"
+        )
+        release = make_release_for_test("album_1", "Album 1", old_seen, tracks=[track])
+
+        class FakeSpotify:
+            async def get_playback_state(self):
+                return {
+                    "is_playing": True,
+                    "shuffle_state": False,
+                    "repeat_state": "off",
+                    "context": {
+                        "type": "album",
+                        "uri": "spotify:album:album_1"
+                    },
+                    "item": {
+                        "id": "track_1",
+                        "type": "track",
+                        "is_local": False,
+                        "album": {
+                            "id": "album_1",
+                            "uri": "spotify:album:album_1"
+                        }
+                    },
+                    "progress_ms": 1000,
+                    "timestamp": 0
+                }
+
+        class FakeDatabase:
+            def __init__(self):
+                self.touched = None
+
+            async def touch_release_last_seen(self, spotify_id, seen_at):
+                self.touched = (spotify_id, seen_at)
+
+            async def save_service_state(self, key, value):
+                return None
+
+        async def get_or_create_release(album_id):
+            self.assertEqual(album_id, "album_1")
+            return release
+
+        db = FakeDatabase()
+        tracker = Tracker.__new__(Tracker)
+        tracker.spotify = FakeSpotify()
+        tracker.db = db
+        tracker.discord_bot = None
+        tracker.active_interval = 0
+        tracker._get_or_create_release = get_or_create_release
+
+        await tracker._poll_once()
+
+        self.assertIsNotNone(db.touched)
+        self.assertEqual(db.touched[0], "album_1")
+        self.assertGreater(db.touched[1], old_seen)
+        self.assertEqual(release.last_seen, db.touched[1])
 
 
 class TestDuplicateDetection(unittest.TestCase):

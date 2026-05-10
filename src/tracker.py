@@ -73,6 +73,9 @@ class Tracker:
             await self._handle_non_qualifying(state)
             return
 
+        seen_at = datetime.now()
+        release.last_seen = seen_at
+
         # Match and mark track
         track = self._match_track_to_release(release, state.item)
 
@@ -86,6 +89,8 @@ class Tracker:
 
             if release.progress >= 1.0:
                 await self._handle_completion(release)
+        else:
+            await self.db.touch_release_last_seen(release.spotify_id, seen_at)
 
         await self._update_current_listening(state)
         await asyncio.sleep(self.active_interval)

@@ -143,6 +143,15 @@ class Database:
         await self.connection.commit()
         return True
 
+    async def touch_release_last_seen(self, spotify_id: str, seen_at: datetime):
+        """Update the last-seen timestamp for a tracked release."""
+        await self.connection.execute("""
+            UPDATE release_lifecycle
+            SET last_seen = ?
+            WHERE spotify_id = ?
+        """, (seen_at.isoformat(), spotify_id))
+        await self.connection.commit()
+
     async def get_active_releases(self) -> List[Release]:
         """Get all active releases."""
         cursor = await self.connection.execute("""
