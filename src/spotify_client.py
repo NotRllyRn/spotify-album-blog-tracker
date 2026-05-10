@@ -59,8 +59,8 @@ class SpotifyClient:
             'scope': 'user-read-playback-state user-read-recently-played'
         })
 
-        print("Opening browser for Spotify authorization...")
-        print(f"If browser doesn't open, visit: {auth_url}")
+        logger.info("Opening browser for Spotify authorization...")
+        logger.info("If browser doesn't open, visit: %s", auth_url)
         webbrowser.open(auth_url)
 
         # Start local server to receive callback
@@ -73,8 +73,11 @@ class SpotifyClient:
         """Wait for OAuth callback and extract authorization code."""
         # For now, prompt user to paste the code
         # TODO: Implement proper callback server
-        print("\nAfter authorizing, copy the 'code' parameter from the redirect URL and paste it here:")
-        code = input("Authorization code: ").strip()
+        logger.info("Waiting for Spotify authorization code from user.")
+        code = input(
+            "\nAfter authorizing, copy the 'code' parameter from the redirect URL and paste it here.\n"
+            "Authorization code: "
+        ).strip()
         return code
 
     async def _exchange_code_for_tokens(self, code: str, code_verifier: str):

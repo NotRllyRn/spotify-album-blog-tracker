@@ -4,11 +4,19 @@ Run database migrations.
 """
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).parent.parent
+
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from logging_config import configure_logging
+
+configure_logging(PROJECT_ROOT)
+logger = logging.getLogger(__name__)
 
 from config import Config
 from database import Database
@@ -19,9 +27,9 @@ async def main():
 
     try:
         await db.initialize()
-        print("Migrations completed successfully.")
+        logger.info("Migrations completed successfully.")
     except Exception as e:
-        print(f"Migration error: {e}")
+        logger.error("Migration error: %s", e, exc_info=True)
         sys.exit(1)
     finally:
         await db.close()

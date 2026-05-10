@@ -26,3 +26,6 @@ Thumbs.db
 
 *.db
 *.db-*
+
+__pycache__/
+*.pyc

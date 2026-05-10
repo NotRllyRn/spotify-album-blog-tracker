@@ -4,6 +4,8 @@ Unit tests for core logic: classification, normalization, progress, duplicate ma
 
 import hashlib
 import json
+import logging
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock
@@ -20,6 +22,7 @@ except ModuleNotFoundError:
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from utils import normalize_text, normalize_artist_name, normalize_artist_list, compute_release_type
+from logging_config import LOG_FILE_NAME, _ALBUM_TRACKER_HANDLER_ATTR, configure_logging
 from models import (
     Track,
     Artist,
@@ -95,6 +98,41 @@ def make_release_for_test(spotify_id, title, last_seen, tracks=None):
         first_seen=last_seen,
         last_seen=last_seen
     )
+
+
+class TestLoggingConfiguration(unittest.TestCase):
+    """Test application file logging setup."""
+
+    def tearDown(self):
+        root_logger = logging.getLogger()
+        for handler in list(root_logger.handlers):
+            if getattr(handler, _ALBUM_TRACKER_HANDLER_ATTR, False):
+                root_logger.removeHandler(handler)
+                handler.close()
+
+    def test_configure_logging_creates_log_file_and_writes_records(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = configure_logging(Path(temp_dir), level="INFO")
+
+            logging.getLogger("album_tracker_test").info("file logging works")
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+
+            self.assertEqual(log_file, Path(temp_dir) / "logs" / LOG_FILE_NAME)
+            self.assertTrue(log_file.exists())
+            self.assertIn("file logging works", log_file.read_text(encoding="utf-8"))
+
+    def test_configure_logging_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            configure_logging(Path(temp_dir), level="INFO")
+            configure_logging(Path(temp_dir), level="INFO")
+
+            logging.getLogger("album_tracker_test").info("one copy only")
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+
+            log_file = Path(temp_dir) / "logs" / LOG_FILE_NAME
+            self.assertEqual(log_file.read_text(encoding="utf-8").count("one copy only"), 1)
 
 
 class TestNormalization(unittest.TestCase):

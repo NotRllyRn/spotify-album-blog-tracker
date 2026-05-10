@@ -9,20 +9,21 @@ import signal
 import sys
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).parent
+
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from logging_config import configure_logging
+
+configure_logging(PROJECT_ROOT)
+logger = logging.getLogger(__name__)
 
 from config import Config
 from database import Database
 from tracker import Tracker
 from discord_bot import DiscordBot
 from publisher import Publisher
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 class Service:
     def __init__(self):
@@ -63,21 +64,24 @@ class Service:
         await self.db.close()
 
 async def main():
-    service = Service()
+    service = None
 
     def signal_handler(signum, frame):
         logger.info(f"Received signal {signum}, shutting down...")
-        asyncio.create_task(service.stop())
+        if service is not None:
+            asyncio.create_task(service.stop())
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
+        service = Service()
         await service.start()
     except Exception as e:
         logger.error(f"Service error: {e}", exc_info=True)
-        await service.stop()
+        if service is not None:
+            await service.stop()
         sys.exit(1)
 
 if __name__ == "__main__":

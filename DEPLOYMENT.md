@@ -241,8 +241,8 @@ Logs are stored in:
 
 Enable debug logging in `config.py`:
 
-```python
-logging.basicConfig(level=logging.DEBUG)
+```env
+LOG_LEVEL=DEBUG
 ```
 
 ## Upgrading
@@ -310,4 +310,3 @@ For issues, check:
 2. Application logs in `logs/`
 3. Database audit events
 4. Discord command responses for error details
-

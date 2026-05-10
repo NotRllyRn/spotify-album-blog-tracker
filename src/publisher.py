@@ -151,7 +151,6 @@ class Publisher:
         existing_tag_map = {tag["name"]: tag["id"] for tag in existing_tags}
 
         for artist_name in artist_names:
-            print(artist_name)
             if artist_name in self.tag_cache:
                 tag_ids.append(self.tag_cache[artist_name])
             elif artist_name in existing_tag_map:
