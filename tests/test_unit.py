@@ -1045,6 +1045,98 @@ class TestWordPressPostFetch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([request[1]["page"] for request in fake_http.requests], [1, 2])
 
 
+@unittest.skipIf(WordPressClient is None or httpx is None, "wordpress client dependencies are not installed")
+class TestWordPressTagFetch(unittest.IsolatedAsyncioTestCase):
+    """Test WordPress tag pagination and in-memory first-page validation."""
+
+    class FakeHTTPClient:
+        def __init__(self, get_responses=None, post_responses=None):
+            self.get_responses = list(get_responses or [])
+            self.post_responses = list(post_responses or [])
+            self.get_requests = []
+            self.post_requests = []
+
+        async def get(self, url, params=None):
+            self.get_requests.append((url, params))
+            if not self.get_responses:
+                raise AssertionError("Unexpected WordPress GET request")
+            return self.get_responses.pop(0)
+
+        async def post(self, url, json=None):
+            self.post_requests.append((url, json))
+            if not self.post_responses:
+                raise AssertionError("Unexpected WordPress POST request")
+            return self.post_responses.pop(0)
+
+    def make_response(self, tags, total="1", total_pages="1"):
+        body = json.dumps(tags).encode()
+        headers = {
+            "X-WP-Total": total,
+            "X-WP-TotalPages": total_pages,
+        }
+        return httpx.Response(
+            200,
+            content=body,
+            headers=headers,
+            request=httpx.Request("GET", "https://example.com/wp-json/wp/v2/tags"),
+        )
+
+    def make_post_response(self, tag):
+        return httpx.Response(
+            201,
+            json=tag,
+            request=httpx.Request("POST", "https://example.com/wp-json/wp/v2/tags"),
+        )
+
+    def make_client(self, fake_http):
+        client = WordPressClient.__new__(WordPressClient)
+        client.api_url = "https://example.com/wp-json/wp/v2"
+        client.client = fake_http
+        return client
+
+    async def test_get_tags_populates_cache_then_returns_cached_full_list(self):
+        page_one = self.make_response([{"id": 1, "name": "Artist One"}], total="2", total_pages="2")
+        page_two = self.make_response([{"id": 2, "name": "Artist Two"}], total="2", total_pages="2")
+        matching_page_one = self.make_response([{"id": 1, "name": "Artist One"}], total="2", total_pages="2")
+        fake_http = self.FakeHTTPClient([page_one, page_two, matching_page_one])
+        client = self.make_client(fake_http)
+
+        first_result = await client.get_tags()
+        second_result = await client.get_tags()
+
+        self.assertEqual([tag["id"] for tag in first_result], [1, 2])
+        self.assertEqual([tag["id"] for tag in second_result], [1, 2])
+        self.assertEqual([request[1]["page"] for request in fake_http.get_requests], [1, 2, 1])
+
+    async def test_get_tags_refreshes_cache_when_first_page_hash_changes(self):
+        page_one = self.make_response([{"id": 1, "name": "Artist One"}], total="1", total_pages="1")
+        changed_page_one = self.make_response([{"id": 3, "name": "Artist Three"}], total="1", total_pages="1")
+        fake_http = self.FakeHTTPClient([page_one, changed_page_one])
+        client = self.make_client(fake_http)
+
+        first_result = await client.get_tags()
+        second_result = await client.get_tags()
+
+        self.assertEqual([tag["id"] for tag in first_result], [1])
+        self.assertEqual([tag["id"] for tag in second_result], [3])
+        self.assertEqual([request[1]["page"] for request in fake_http.get_requests], [1, 1])
+
+    async def test_create_tag_reconciles_existing_in_memory_tag_cache(self):
+        new_tag = {"id": 2, "name": "Artist Two"}
+        fake_http = self.FakeHTTPClient(post_responses=[self.make_post_response(new_tag)])
+        client = self.make_client(fake_http)
+        client._cached_tags = [{"id": 1, "name": "Artist One"}]
+        client._cached_tags_x_wp_total = "1"
+        client._cached_tags_first_page_hash = "cached-hash"
+
+        result = await client.create_tag("Artist Two")
+
+        self.assertEqual(result, new_tag)
+        self.assertEqual([tag["id"] for tag in client._cached_tags], [1, 2])
+        self.assertIsNone(client._cached_tags_x_wp_total)
+        self.assertIsNone(client._cached_tags_first_page_hash)
+
+
 @unittest.skipIf(Publisher is None, "publisher dependencies are not installed")
 class TestPublisherPostCacheRefresh(unittest.IsolatedAsyncioTestCase):
     """Test publisher-level WordPress post cache refresh behavior."""

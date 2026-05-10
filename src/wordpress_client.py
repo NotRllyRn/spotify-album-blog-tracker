@@ -45,6 +45,9 @@ class WordPressClient:
             },
             timeout=30.0
         )
+        self._cached_tags: Optional[List[Dict[str, Any]]] = None
+        self._cached_tags_x_wp_total: Optional[str] = None
+        self._cached_tags_first_page_hash: Optional[str] = None
 
     async def close(self):
         """Close HTTP client."""
@@ -174,14 +177,42 @@ class WordPressClient:
         return response.json()
 
     async def get_tags(self) -> List[Dict[str, Any]]:
-        """Get all tags."""
-        tags = []
-        page = 1
+        """Get all tags, reusing the in-memory cache when page-1 metadata matches."""
         per_page = 100
+        url = f"{self.api_url}/tags"
 
-        while True:
+        response = await self.client.get(
+            url,
+            params={"per_page": per_page, "page": 1}
+        )
+        response.raise_for_status()
+        first_page_tags = response.json()
+        if not isinstance(first_page_tags, list):
+            raise ValueError("Unexpected response when fetching tags")
+
+        x_wp_total = response.headers.get("X-WP-Total")
+        first_page_hash = hashlib.sha256(response.content).hexdigest()
+
+        if self._tag_cache_matches(x_wp_total, first_page_hash):
+            logger.info("Using cached WordPress tags; X-WP-Total and first-page hash matched.")
+            return list(self._cached_tags)
+
+        tags = list(first_page_tags)
+        total_pages = self._parse_total_pages(response)
+
+        if total_pages is not None:
+            pages_to_fetch = range(2, total_pages + 1)
+            stop_on_short_page = False
+        elif len(first_page_tags) < per_page:
+            pages_to_fetch = range(0)
+            stop_on_short_page = True
+        else:
+            pages_to_fetch = range(2, 10_000)
+            stop_on_short_page = True
+
+        for page in pages_to_fetch:
             response = await self.client.get(
-                f"{self.api_url}/tags",
+                url,
                 params={"per_page": per_page, "page": page}
             )
             response.raise_for_status()
@@ -191,22 +222,68 @@ class WordPressClient:
 
             tags.extend(data)
 
-            total_pages = response.headers.get("X-WP-TotalPages")
-            if total_pages is not None:
-                try:
-                    total_pages = int(total_pages)
-                except ValueError:
-                    total_pages = None
-
-            if total_pages is not None:
-                if page >= total_pages:
-                    break
-            elif len(data) < per_page:
+            if stop_on_short_page and len(data) < per_page:
                 break
 
-            page += 1
+        self._cache_tags(tags, x_wp_total, first_page_hash)
 
         return tags
+
+    def _parse_total_pages(self, response: httpx.Response) -> Optional[int]:
+        """Parse a WordPress total-pages header, falling back when it is absent or invalid."""
+        total_pages = response.headers.get("X-WP-TotalPages")
+        if total_pages is None:
+            return None
+
+        try:
+            return int(total_pages)
+        except ValueError:
+            return None
+
+    def _tag_cache_matches(self, x_wp_total: Optional[str], first_page_hash: str) -> bool:
+        cached_tags = getattr(self, "_cached_tags", None)
+        cached_x_wp_total = getattr(self, "_cached_tags_x_wp_total", None)
+        cached_first_page_hash = getattr(self, "_cached_tags_first_page_hash", None)
+
+        if cached_tags is None:
+            return False
+
+        if not all([x_wp_total, first_page_hash, cached_x_wp_total, cached_first_page_hash]):
+            return False
+
+        if not x_wp_total.isdigit():
+            return False
+
+        return (
+            x_wp_total == cached_x_wp_total
+            and first_page_hash == cached_first_page_hash
+        )
+
+    def _cache_tags(
+        self,
+        tags: List[Dict[str, Any]],
+        x_wp_total: Optional[str],
+        first_page_hash: str,
+    ):
+        self._cached_tags = list(tags)
+        self._cached_tags_x_wp_total = x_wp_total
+        self._cached_tags_first_page_hash = first_page_hash
+
+    def _reconcile_cached_tag(self, tag: Dict[str, Any]):
+        cached_tags = getattr(self, "_cached_tags", None)
+        if cached_tags is None:
+            return
+
+        tag_id = tag.get("id")
+        for index, cached_tag in enumerate(cached_tags):
+            if cached_tag.get("id") == tag_id:
+                cached_tags[index] = tag
+                break
+        else:
+            cached_tags.append(tag)
+
+        self._cached_tags_x_wp_total = None
+        self._cached_tags_first_page_hash = None
 
     async def get_tag_by_id(self, tag_id: int) -> Dict[str, Any]:
         """Get a tag by WordPress ID."""
@@ -228,7 +305,9 @@ class WordPressClient:
         response = await self.client.post(url, json={"name": name})
         try:
             response.raise_for_status()
-            return response.json()
+            tag = response.json()
+            self._reconcile_cached_tag(tag)
+            return tag
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 400:
                 try:
@@ -239,10 +318,13 @@ class WordPressClient:
                 if body.get("code") in {"term_exists", "existing_term_slug", "term_exists_invalid"}:
                     term_id = body.get("data", {}).get("term_id")
                     if term_id:
-                        return await self.get_tag_by_id(term_id)
+                        tag = await self.get_tag_by_id(term_id)
+                        self._reconcile_cached_tag(tag)
+                        return tag
 
                     existing_tag = await self.get_tag_by_name(name)
                     if existing_tag:
+                        self._reconcile_cached_tag(existing_tag)
                         return existing_tag
 
             raise

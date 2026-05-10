@@ -85,6 +85,7 @@ class Publisher:
         """Move post to trash (undo)."""
         try:
             await self.wordpress.delete_post(post_id, force=False)
+            await self.refresh_post_cache(force=True)
             logger.info(f"Post {post_id} moved to trash")
             return True
         except Exception as e:
