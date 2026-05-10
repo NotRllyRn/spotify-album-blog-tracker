@@ -147,6 +147,14 @@ class Tracker:
         if release:
             return release
 
+        release = await self._build_release_from_spotify(album_id)
+        await self.db.save_release(release)
+        await self.db.log_audit_event("release_created", {"spotify_id": album_id})
+
+        return release
+
+    async def _build_release_from_spotify(self, album_id: str) -> Release:
+        """Build a release from Spotify without saving it."""
         # Fetch from Spotify
         album_data = await self.spotify.get_album(album_id)
         tracks_data = await self.spotify.get_album_tracks(album_id)
@@ -201,9 +209,6 @@ class Tracker:
             first_seen=now,
             last_seen=now,
         )
-
-        await self.db.save_release(release)
-        await self.db.log_audit_event("release_created", {"spotify_id": album_id})
 
         return release
 

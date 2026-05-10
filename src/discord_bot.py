@@ -6,6 +6,7 @@ import asyncio
 import discord
 from discord import app_commands
 import logging
+from dataclasses import dataclass
 from typing import Optional, List
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse
@@ -13,10 +14,29 @@ from urllib.parse import urlparse, urlunparse
 from config import Config
 from database import Database
 from tracker import Tracker
-from models import Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus
+from models import Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost
 from inprogress import INPROGRESS_PAGE_SIZE, InProgressPage, build_inprogress_page, get_next_unlistened_track
 
 logger = logging.getLogger(__name__)
+
+ACTIVE_TRACKED_STATUSES = {
+    LifecycleStatus.ACTIVE,
+    LifecycleStatus.AWAITING_75_DECISION,
+    LifecycleStatus.AWAITING_RELISION_DECISION,
+    LifecycleStatus.PUBLISHING,
+}
+
+
+@dataclass(frozen=True)
+class CurrentPostContext:
+    tracked_release: Optional[Release]
+    release_for_post: Optional[Release]
+    duplicate_post: Optional[WordPressPost]
+    is_actively_tracked: bool
+
+    @property
+    def will_publish_as_relisten(self) -> bool:
+        return self.duplicate_post is not None
 
 def _clip_discord_text(value: str, limit: int) -> str:
     if len(value) <= limit:
@@ -220,12 +240,15 @@ class ConfirmRemoveView(PromptView):
         )
 
 class CurrentPlaybackActionView(PromptView):
-    def __init__(self, discord_bot: "DiscordBot", playback_state):
+    def __init__(self, discord_bot: "DiscordBot", playback_state, post_label: str = "Post current content"):
         super().__init__(discord_bot)
         self.playback_state = playback_state
+        for child in self.children:
+            if getattr(child, "custom_id", None) == "current_post_content":
+                child.label = post_label
 
     @discord.ui.button(
-        label="Post early",
+        label="Post current content",
         style=discord.ButtonStyle.success,
         custom_id="current_post_content"
     )
@@ -598,7 +621,7 @@ class DiscordBot:
             )
             return
 
-        await self.tracker.publish_release_now(release)
+        await self.tracker.publish_release_now(release, as_relisten=release.duplicate_state == "found")
         await interaction.response.send_message(
             "✅ Release published successfully. A notification has been sent.",
             ephemeral=True
@@ -702,18 +725,33 @@ class DiscordBot:
             )
             return
 
-        embed = self._build_current_preview_embed(playback_state)
+        try:
+            context = await self._resolve_current_post_context(playback_state, check_duplicate=True)
+        except ValueError:
+            await interaction.response.send_message(
+                "⚠️ Unable to determine the current album.",
+                ephemeral=True
+            )
+            return
+
+        embed = self._build_current_preview_embed(playback_state, context)
         view = ConfirmCurrentPostView(self, playback_state)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    def _build_current_preview_embed(self, state) -> discord.Embed:
+    def _build_current_preview_embed(self, state, context: CurrentPostContext) -> discord.Embed:
         item = state.item
         album = item.get("album", {})
         artists = [a["name"] for a in item.get("artists", [])]
+        if context.is_actively_tracked:
+            title = "Post current playback early"
+            description = "This would publish the current listening target early to WordPress."
+        else:
+            title = "Post current playback"
+            description = "This would publish the current listening target to WordPress."
 
         embed = discord.Embed(
-            title="Post current playback early",
-            description="This would publish the current listening target early to WordPress.",
+            title=title,
+            description=description,
             color=0x1DB954
         )
         embed.add_field(name="Track", value=item.get("name", "Unknown"), inline=False)
@@ -722,11 +760,22 @@ class DiscordBot:
         embed.add_field(name="Status", value="▶ Playing" if state.is_playing else "⏸ Paused", inline=True)
         embed.add_field(name="Shuffle", value="On" if state.shuffle_state else "Off", inline=True)
         embed.add_field(name="Album type", value=album.get("album_type", "Unknown"), inline=True)
+        if context.duplicate_post is not None:
+            duplicate_title = _clip_discord_text(context.duplicate_post.title, 120)
+            embed.add_field(
+                name="Relisten",
+                value=(
+                    "Existing WordPress post found: "
+                    f"{duplicate_title} (post {context.duplicate_post.id}). "
+                    "Confirming will publish this as a Relisten."
+                ),
+                inline=False
+            )
         if album.get("images"):
             embed.set_thumbnail(url=album.get("images")[0].get("url", ""))
         return embed
 
-    def _build_current_embed(self, state, tracked_release: Optional[Release] = None) -> discord.Embed:
+    def _build_current_embed(self, state, context: Optional[CurrentPostContext] = None) -> discord.Embed:
         item = state.item
         album = item.get("album", {})
         artists = [a["name"] for a in item.get("artists", [])]
@@ -770,8 +819,8 @@ class DiscordBot:
             value="✅ Yes" if qualifies else "❌ No",
             inline=True
         )
-        if tracked_release is not None:
-            listened, countable, progress_percent = self._get_release_progress_parts(tracked_release)
+        if context is not None and context.is_actively_tracked and context.tracked_release is not None:
+            listened, countable, progress_percent = self._get_release_progress_parts(context.tracked_release)
             embed.add_field(
                 name="Progress",
                 value=f"{listened}/{countable} ({progress_percent}%)",
@@ -779,6 +828,38 @@ class DiscordBot:
             )
 
         return embed
+
+    async def _resolve_current_post_context(
+        self,
+        state: PlaybackState,
+        check_duplicate: bool = False
+    ) -> CurrentPostContext:
+        if not state.item:
+            raise ValueError("Missing playback item")
+
+        album = state.item.get("album", {})
+        album_id = album.get("id")
+        if not album_id:
+            raise ValueError("Missing album ID")
+
+        tracked_release = await self.db.get_release(album_id)
+        release_for_post = tracked_release
+        if release_for_post is None and check_duplicate:
+            release_for_post = await self.tracker._build_release_from_spotify(album_id)
+
+        duplicate_post = None
+        if check_duplicate and release_for_post is not None:
+            duplicate_post = await self.tracker._check_duplicate(release_for_post)
+
+        return CurrentPostContext(
+            tracked_release=tracked_release,
+            release_for_post=release_for_post,
+            duplicate_post=duplicate_post,
+            is_actively_tracked=(
+                tracked_release is not None
+                and tracked_release.status in ACTIVE_TRACKED_STATUSES
+            )
+        )
 
     async def _handle_current_post_confirm(self, interaction: discord.Interaction, playback_state):
         if not playback_state or not playback_state.item:
@@ -797,6 +878,7 @@ class DiscordBot:
             )
             return
 
+        context = await self._resolve_current_post_context(playback_state, check_duplicate=True)
         release = await self.tracker._get_or_create_release(album_id)
         if release.status == LifecycleStatus.PUBLISHED and release.wordpress_post_id:
             await interaction.response.send_message(
@@ -805,7 +887,7 @@ class DiscordBot:
             )
             return
 
-        await self.tracker.publish_release_now(release)
+        await self.tracker.publish_release_now(release, as_relisten=context.will_publish_as_relisten)
         await interaction.response.send_message(
             "✅ Current content has been posted to WordPress. A notification has been sent.",
             ephemeral=True
@@ -961,18 +1043,11 @@ class DiscordBot:
                 )
                 return
 
-            # Get album info
-            item = state.item
-            album = item.get("album", {})
-            artists = [a["name"] for a in item.get("artists", [])]
-            tracked_release = None
-            album_id = album.get("id")
-            if album_id:
-                tracked_release = await self.db.get_release(album_id)
+            context = await self._resolve_current_post_context(state)
+            embed = self._build_current_embed(state, context)
 
-            embed = self._build_current_embed(state, tracked_release)
-
-            view = CurrentPlaybackActionView(self, state)
+            post_label = "Post early" if context.is_actively_tracked else "Post current content"
+            view = CurrentPlaybackActionView(self, state, post_label=post_label)
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
         except Exception as e:

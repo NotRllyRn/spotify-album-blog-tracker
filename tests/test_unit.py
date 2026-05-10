@@ -4,6 +4,7 @@ Unit tests for core logic: classification, normalization, progress, duplicate ma
 
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock
 
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from utils import normalize_text, normalize_artist_name, normalize_artist_list, compute_release_type
-from models import Track, Artist, Release, ReleaseType, LifecycleStatus, PlaybackState
+from models import Track, Artist, Release, ReleaseType, LifecycleStatus, PlaybackState, WordPressPost
 from inprogress import build_inprogress_page, INPROGRESS_PAGE_SIZE, get_next_unlistened_track
 
 try:
@@ -21,10 +22,11 @@ except ModuleNotFoundError:
     Tracker = None
 
 try:
-    from discord_bot import DiscordBot, CurrentPlaybackActionView
+    from discord_bot import DiscordBot, CurrentPlaybackActionView, CurrentPostContext
 except ModuleNotFoundError:
     DiscordBot = None
     CurrentPlaybackActionView = None
+    CurrentPostContext = None
 
 
 def make_release_for_test(spotify_id, title, last_seen, tracks=None):
@@ -340,7 +342,7 @@ class TestNextTrackSelection(unittest.TestCase):
 
 
 @unittest.skipIf(DiscordBot is None, "discord bot dependencies are not installed")
-class TestDiscordBotEmbeds(unittest.TestCase):
+class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
     """Test embed formatting for Discord bot views."""
 
     def setUp(self):
@@ -350,6 +352,44 @@ class TestDiscordBotEmbeds(unittest.TestCase):
             (),
             {"_qualifies_for_tracking": lambda self, state: True}
         )()
+
+    def make_playback_state(self, album_id="album_5"):
+        return PlaybackState(
+            is_playing=True,
+            shuffle_state=False,
+            repeat_state="off",
+            context={"type": "album"},
+            item={
+                "name": "Track 2",
+                "artists": [{"name": "Artist"}],
+                "album": {
+                    "id": album_id,
+                    "name": "Album 5",
+                    "images": [],
+                    "album_type": "album"
+                }
+            },
+            progress_ms=0,
+            timestamp=0
+        )
+
+    def make_current_context(self, release, active=True, duplicate_post=None):
+        return CurrentPostContext(
+            tracked_release=release if active else None,
+            release_for_post=release,
+            duplicate_post=duplicate_post,
+            is_actively_tracked=active
+        )
+
+    def make_wordpress_post(self):
+        return WordPressPost(
+            id=123,
+            title="Album 5",
+            normalized_title="album 5",
+            artists=["Artist"],
+            normalized_artists=["artist"],
+            link="https://example.com/album-5"
+        )
 
     def test_inprogress_format_includes_next_track(self):
         release = make_release_for_test(
@@ -368,24 +408,7 @@ class TestDiscordBotEmbeds(unittest.TestCase):
         self.assertIn("Next: Track 2", formatted)
 
     def test_current_embed_includes_progress_for_tracked_release(self):
-        state = PlaybackState(
-            is_playing=True,
-            shuffle_state=False,
-            repeat_state="off",
-            context={"type": "album"},
-            item={
-                "name": "Track 2",
-                "artists": [{"name": "Artist"}],
-                "album": {
-                    "id": "album_5",
-                    "name": "Album 5",
-                    "images": [],
-                    "album_type": "album"
-                }
-            },
-            progress_ms=0,
-            timestamp=0
-        )
+        state = self.make_playback_state()
         release = make_release_for_test(
             "album_5",
             "Album 5",
@@ -397,40 +420,180 @@ class TestDiscordBotEmbeds(unittest.TestCase):
         )
         release.progress = 0.5
 
-        embed = self.bot._build_current_embed(state, release)
+        embed = self.bot._build_current_embed(state, self.make_current_context(release))
         field_map = {field.name: field.value for field in embed.fields}
 
         self.assertEqual(field_map["Progress"], "1/2 (50%)")
 
     def test_current_embed_omits_progress_when_untracked(self):
-        state = PlaybackState(
-            is_playing=True,
-            shuffle_state=False,
-            repeat_state="off",
-            context={"type": "album"},
-            item={
-                "name": "Track 2",
-                "artists": [{"name": "Artist"}],
-                "album": {
-                    "id": "album_6",
-                    "name": "Album 6",
-                    "images": [],
-                    "album_type": "album"
-                }
-            },
-            progress_ms=0,
-            timestamp=0
-        )
+        state = self.make_playback_state("album_6")
 
         embed = self.bot._build_current_embed(state)
         field_names = [field.name for field in embed.fields]
 
         self.assertNotIn("Progress", field_names)
 
-    def test_current_playback_action_label_is_post_early(self):
-        labels = [child.label for child in CurrentPlaybackActionView(self.bot, None).children]
+    def test_current_playback_action_label_can_be_post_early(self):
+        labels = [
+            child.label
+            for child in CurrentPlaybackActionView(self.bot, None, post_label="Post early").children
+        ]
 
         self.assertIn("Post early", labels)
+
+    def test_current_playback_action_label_defaults_to_post_current_content(self):
+        labels = [child.label for child in CurrentPlaybackActionView(self.bot, None).children]
+
+        self.assertIn("Post current content", labels)
+
+    def test_current_preview_uses_early_wording_for_tracked_release(self):
+        state = self.make_playback_state()
+        release = make_release_for_test("album_5", "Album 5", datetime(2024, 1, 1, 12, 0, 0))
+
+        embed = self.bot._build_current_preview_embed(state, self.make_current_context(release))
+
+        self.assertEqual(embed.title, "Post current playback early")
+        self.assertIn("early", embed.description)
+
+    def test_current_preview_uses_default_wording_for_untracked_release(self):
+        state = self.make_playback_state()
+        release = make_release_for_test("album_5", "Album 5", datetime(2024, 1, 1, 12, 0, 0))
+
+        embed = self.bot._build_current_preview_embed(
+            state,
+            self.make_current_context(release, active=False)
+        )
+
+        self.assertEqual(embed.title, "Post current playback")
+        self.assertNotIn("early", embed.description)
+
+    def test_current_preview_includes_relisten_field_for_duplicate(self):
+        state = self.make_playback_state()
+        release = make_release_for_test("album_5", "Album 5", datetime(2024, 1, 1, 12, 0, 0))
+        duplicate_post = self.make_wordpress_post()
+
+        embed = self.bot._build_current_preview_embed(
+            state,
+            self.make_current_context(release, duplicate_post=duplicate_post)
+        )
+        field_map = {field.name: field.value for field in embed.fields}
+
+        self.assertIn("Relisten", field_map)
+        self.assertIn("post 123", field_map["Relisten"])
+
+    def test_current_preview_omits_relisten_field_without_duplicate(self):
+        state = self.make_playback_state()
+        release = make_release_for_test("album_5", "Album 5", datetime(2024, 1, 1, 12, 0, 0))
+
+        embed = self.bot._build_current_preview_embed(state, self.make_current_context(release))
+        field_names = [field.name for field in embed.fields]
+
+        self.assertNotIn("Relisten", field_names)
+
+    async def test_current_confirm_publishes_as_relisten_when_duplicate_exists(self):
+        state = self.make_playback_state()
+        release = make_release_for_test("album_5", "Album 5", datetime(2024, 1, 1, 12, 0, 0))
+
+        class FakeDatabase:
+            async def get_release(self, album_id):
+                return release
+
+        class FakeTracker:
+            def __init__(self):
+                self.published = None
+
+            async def _check_duplicate(self, release_to_check):
+                return WordPressPost(
+                    id=123,
+                    title="Album 5",
+                    normalized_title="album 5",
+                    artists=["Artist"],
+                    normalized_artists=["artist"],
+                    link="https://example.com/album-5"
+                )
+
+            async def _get_or_create_release(self, album_id):
+                return release
+
+            async def publish_release_now(self, release_to_publish, as_relisten=False):
+                self.published = (release_to_publish, as_relisten)
+
+        class FakeInteraction:
+            response = type(
+                "FakeResponse",
+                (),
+                {"send_message": AsyncMock()}
+            )()
+
+        tracker = FakeTracker()
+        self.bot.db = FakeDatabase()
+        self.bot.tracker = tracker
+
+        await self.bot._handle_current_post_confirm(FakeInteraction(), state)
+
+        self.assertEqual(tracker.published, (release, True))
+
+    async def test_inprogress_publish_uses_stored_duplicate_state_for_relisten(self):
+        release = make_release_for_test("album_7", "Album 7", datetime(2024, 1, 1, 12, 0, 0))
+        release.duplicate_state = "found"
+
+        class FakeDatabase:
+            async def get_release(self, release_id):
+                return release
+
+        class FakeTracker:
+            def __init__(self):
+                self.published = None
+
+            async def publish_release_now(self, release_to_publish, as_relisten=False):
+                self.published = (release_to_publish, as_relisten)
+
+        class FakeInteraction:
+            response = type(
+                "FakeResponse",
+                (),
+                {"send_message": AsyncMock()}
+            )()
+
+        tracker = FakeTracker()
+        self.bot.db = FakeDatabase()
+        self.bot.tracker = tracker
+
+        await self.bot._handle_publish_release(FakeInteraction(), release.spotify_id)
+
+        self.assertEqual(tracker.published, (release, True))
+
+    async def test_context_resolver_builds_unsaved_release_for_untracked_duplicate_check(self):
+        state = self.make_playback_state("album_8")
+        release = make_release_for_test("album_8", "Album 8", datetime(2024, 1, 1, 12, 0, 0))
+
+        class FakeDatabase:
+            async def get_release(self, album_id):
+                return None
+
+        class FakeTracker:
+            def __init__(self):
+                self.built = False
+                self.checked = False
+
+            async def _build_release_from_spotify(self, album_id):
+                self.built = True
+                return release
+
+            async def _check_duplicate(self, release_to_check):
+                self.checked = True
+                return None
+
+        tracker = FakeTracker()
+        self.bot.db = FakeDatabase()
+        self.bot.tracker = tracker
+
+        context = await self.bot._resolve_current_post_context(state, check_duplicate=True)
+
+        self.assertIs(context.release_for_post, release)
+        self.assertFalse(context.is_actively_tracked)
+        self.assertTrue(tracker.built)
+        self.assertTrue(tracker.checked)
 
 
 @unittest.skipIf(Tracker is None, "tracker dependencies are not installed")
@@ -469,6 +632,7 @@ class TestTrackerLastSeen(unittest.IsolatedAsyncioTestCase):
                         "is_local": False,
                         "album": {
                             "id": "album_1",
+                            "album_type": "album",
                             "uri": "spotify:album:album_1"
                         }
                     },
