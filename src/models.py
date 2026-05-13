@@ -18,10 +18,7 @@ class LifecycleStatus(Enum):
     AWAITING_75_DECISION = "awaiting_75_decision"
     AWAITING_RELISTEN_DECISION = "awaiting_relisten_decision"  # Legacy value; no new code should enter it.
     PUBLISHING = "publishing"
-    PUBLISHED = "published"
-    DELETED = "deleted"
-    IGNORED_SINGLE = "ignored_single"
-    TRASHED_POST = "trashed_post"
+    PUBLISHED_RECENTLY = "published_recently"
 
 class PromptType(Enum):
     PROMPT_75_PERCENT = "75_percent"

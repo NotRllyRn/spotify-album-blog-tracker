@@ -255,16 +255,17 @@ ACTIVE
   │
   └─ 100% progress
      ├─ Duplicate NOT found
-     │  └─ PUBLISHING → PUBLISHED (WordPress create)
+     │  └─ PUBLISHING → PUBLISHED_RECENTLY (WordPress create; retained 24h)
      │
      └─ Duplicate FOUND
         └─ AWAITING_RELISTEN_DECISION
            └─ User: Post as Relisten / Ignore
 
 Other paths:
-- IGNORED_SINGLE: Auto-skip Singles (manual publish only)
-- TRASHED_POST: Post moved to trash via Undo
-- DELETED: Progress manually deleted via /inprogress
+- Singles are skipped before persistence for automatic tracking.
+- Undo moves the WordPress post to trash, then removes the release from the tracking database.
+- Manual removal via /inprogress deletes the release from the tracking database.
+- PUBLISHED_RECENTLY rows are automatically deleted after 24 hours.
 ```
 
 ## Next Steps
@@ -274,4 +275,3 @@ Other paths:
 3. **Deployment**: Test Docker and systemd configurations
 4. **WordPress Helper Plugin** (v2): Optional custom REST endpoint for improved duplicate detection
 5. **Performance Tuning**: Monitor rate limits and adjust polling intervals if needed
-

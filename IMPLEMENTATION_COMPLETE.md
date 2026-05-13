@@ -79,11 +79,11 @@
 
 **State Machine:**
 ```
-ACTIVE → 75% → AWAITING_75_DECISION → Publish Early / Wait → PUBLISHING → PUBLISHED
+ACTIVE → 75% → AWAITING_75_DECISION → Publish Early / Wait → PUBLISHING → PUBLISHED_RECENTLY
       ↓
       100% → Duplicate Check
            ├─ Found → AWAITING_RELISTEN_DECISION → Post as Relisten / Ignore
-           └─ Not Found → PUBLISHING → PUBLISHED
+           └─ Not Found → PUBLISHING → PUBLISHED_RECENTLY
 ```
 
 **Adaptive Polling:**

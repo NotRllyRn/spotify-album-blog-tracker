@@ -756,10 +756,9 @@ class DiscordBot:
 
         success = await self.tracker.publisher.trash_post(post_id)
         if success:
-            release.status = LifecycleStatus.TRASHED_POST
-            await self.db.save_release(release)
+            await self.db.delete_release(release.spotify_id)
             await interaction.followup.send(
-                "✅ The post has been moved to trash.",
+                "✅ The post has been moved to trash and removed from the tracking database.",
                 ephemeral=True
             )
         else:

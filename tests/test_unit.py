@@ -675,6 +675,36 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         db.update_discord_prompt_state.assert_not_awaited()
         self.assertIn("❌ Error updating WordPress post:", interaction.followup.send.await_args.args[0])
 
+    async def test_undo_post_trashes_wordpress_post_and_deletes_release(self):
+        release = make_release_for_test("album_undo", "Album Undo", datetime(2024, 1, 1, 12, 0, 0))
+        release.wordpress_post_id = 654
+        prompt = DiscordPrompt(
+            id=1,
+            prompt_type=PromptType.PROMPT_UNDO.value,
+            release_id=release.spotify_id,
+            wordpress_post_id=321,
+            discord_message_id="message_1",
+            state=PromptState.PENDING.value,
+        )
+        db = type("FakeDatabase", (), {})()
+        db.update_discord_prompt_state = AsyncMock()
+        db.delete_release = AsyncMock(return_value=True)
+        publisher = type("FakePublisher", (), {})()
+        publisher.trash_post = AsyncMock(return_value=True)
+        self.bot.db = db
+        self.bot.tracker = type("FakeTracker", (), {"publisher": publisher})()
+        interaction = self.make_interaction()
+
+        await self.bot._handle_undo_post(interaction, release, prompt)
+
+        db.update_discord_prompt_state.assert_awaited_once_with("message_1", PromptState.ACCEPTED.value)
+        publisher.trash_post.assert_awaited_once_with(321)
+        db.delete_release.assert_awaited_once_with(release.spotify_id)
+        interaction.followup.send.assert_awaited_once_with(
+            "✅ The post has been moved to trash and removed from the tracking database.",
+            ephemeral=True
+        )
+
     def test_current_preview_uses_early_wording_for_tracked_release(self):
         state = self.make_playback_state()
         release = make_release_for_test("album_5", "Album 5", datetime(2024, 1, 1, 12, 0, 0))
@@ -977,7 +1007,7 @@ class TestTrackerPublishNow(unittest.IsolatedAsyncioTestCase):
 
     async def test_publish_release_now_returns_already_published(self):
         release = make_release_for_test("album_pub", "Album Pub", datetime(2024, 1, 1, 12, 0, 0))
-        release.status = LifecycleStatus.PUBLISHED
+        release.status = LifecycleStatus.PUBLISHED_RECENTLY
         release.wordpress_post_id = 123
 
         class FakeDatabase:
@@ -1030,6 +1060,116 @@ class TestTrackerPublishNow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "published")
         self.assertEqual(saved_statuses, [LifecycleStatus.PUBLISHING])
         tracker._publish_release.assert_awaited_once_with(release, as_relisten=True)
+
+    async def test_publish_release_saves_recently_published_retention_state(self):
+        release = make_release_for_test("album_done", "Album Done", datetime(2024, 1, 1, 12, 0, 0))
+        saved_statuses = []
+        audit_events = []
+
+        class FakeDatabase:
+            async def save_release(self, release_to_save):
+                saved_statuses.append((release_to_save.status, release_to_save.published_at))
+
+            async def log_audit_event(self, event_type, payload):
+                audit_events.append((event_type, payload))
+
+        class FakePublisher:
+            async def publish_release(self, release_to_publish, as_relisten=False):
+                release_to_publish.wordpress_post_id = 456
+                return {"id": 456}
+
+        tracker = Tracker.__new__(Tracker)
+        tracker.db = FakeDatabase()
+        tracker.publisher = FakePublisher()
+        tracker.discord_bot = None
+
+        await tracker._publish_release(release)
+
+        self.assertEqual(saved_statuses[0][0], LifecycleStatus.PUBLISHING)
+        self.assertEqual(saved_statuses[1][0], LifecycleStatus.PUBLISHED_RECENTLY)
+        self.assertIsNotNone(saved_statuses[1][1])
+        self.assertEqual(audit_events[0][0], "release_published")
+
+    async def test_cleanup_published_releases_uses_24_hour_cutoff_and_audits(self):
+        now = datetime(2024, 1, 2, 12, 0, 0)
+        audit_events = []
+
+        class FakeDatabase:
+            def __init__(self):
+                self.cutoff = None
+
+            async def delete_published_releases_older_than(self, cutoff):
+                self.cutoff = cutoff
+                return 2
+
+            async def log_audit_event(self, event_type, payload):
+                audit_events.append((event_type, payload))
+
+        db = FakeDatabase()
+        tracker = Tracker.__new__(Tracker)
+        tracker.db = db
+
+        deleted_count = await tracker._cleanup_published_releases(now)
+
+        self.assertEqual(deleted_count, 2)
+        self.assertEqual(db.cutoff, now - timedelta(hours=24))
+        self.assertEqual(audit_events[0][0], "published_release_cleanup")
+        self.assertEqual(audit_events[0][1]["deleted_count"], 2)
+
+    async def test_cleanup_published_releases_skips_until_interval_elapsed(self):
+        now = datetime(2024, 1, 2, 12, 0, 0)
+
+        class FakeDatabase:
+            async def delete_published_releases_older_than(self, cutoff):
+                raise AssertionError("cleanup should not run before the interval elapses")
+
+        tracker = Tracker.__new__(Tracker)
+        tracker.db = FakeDatabase()
+        tracker._last_published_cleanup_at = now - timedelta(minutes=1)
+
+        await tracker._cleanup_published_releases_if_due(now)
+
+    async def test_expired_recently_published_release_is_deleted_before_reuse(self):
+        now = datetime(2024, 1, 2, 12, 0, 0)
+        release = make_release_for_test("album_expired", "Album Expired", datetime(2024, 1, 1, 11, 0, 0))
+        release.status = LifecycleStatus.PUBLISHED_RECENTLY
+        release.published_at = now - timedelta(hours=24, minutes=1)
+        audit_events = []
+
+        class FakeDatabase:
+            async def delete_release(self, spotify_id):
+                self.deleted_spotify_id = spotify_id
+                return True
+
+            async def log_audit_event(self, event_type, payload):
+                audit_events.append((event_type, payload))
+
+        db = FakeDatabase()
+        tracker = Tracker.__new__(Tracker)
+        tracker.db = db
+
+        deleted = await tracker._delete_published_release_if_expired(release, now)
+
+        self.assertTrue(deleted)
+        self.assertEqual(db.deleted_spotify_id, release.spotify_id)
+        self.assertEqual(audit_events[0][0], "published_release_cleanup")
+
+    async def test_recently_published_release_is_kept_during_retention_window(self):
+        now = datetime(2024, 1, 2, 12, 0, 0)
+        release = make_release_for_test("album_recent", "Album Recent", datetime(2024, 1, 2, 11, 0, 0))
+        release.status = LifecycleStatus.PUBLISHED_RECENTLY
+        release.published_at = now - timedelta(hours=23, minutes=59)
+
+        class FakeDatabase:
+            async def delete_release(self, spotify_id):
+                raise AssertionError("release should stay during the retention window")
+
+        tracker = Tracker.__new__(Tracker)
+        tracker.db = FakeDatabase()
+
+        deleted = await tracker._delete_published_release_if_expired(release, now)
+
+        self.assertFalse(deleted)
 
 
 @unittest.skipIf(Tracker is None, "tracker dependencies are not installed")

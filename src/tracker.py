@@ -17,6 +17,8 @@ from utils import normalize_text, normalize_artist_list, compute_release_type
 logger = logging.getLogger(__name__)
 
 RELISTEN_APPROVAL_TTL = timedelta(hours=24)
+PUBLISHED_RELEASE_RETENTION = timedelta(hours=24)
+PUBLISHED_RELEASE_CLEANUP_INTERVAL = timedelta(minutes=5)
 
 class Tracker:
     def __init__(self, config: Config, db: Database, publisher=None, discord_bot=None):
@@ -32,6 +34,7 @@ class Tracker:
         self.paused_interval = 8
         self.idle_interval = 15
         self.backoff_interval = 60
+        self._last_published_cleanup_at: Optional[datetime] = None
 
     def set_discord_bot(self, discord_bot):
         self.discord_bot = discord_bot
@@ -43,6 +46,7 @@ class Tracker:
 
         while self.running:
             try:
+                await self._cleanup_published_releases_if_due()
                 await self._poll_once()
             except Exception as e:
                 logger.error(f"Poll error: {e}", exc_info=True)
@@ -69,7 +73,11 @@ class Tracker:
             return
 
         album_id = state.item["album"]["id"]
+        seen_at = datetime.now()
         release = await self.db.get_release(album_id)
+        if await self._delete_published_release_if_expired(release, seen_at):
+            release = None
+
         if release is None:
             candidate = await self._build_release_from_spotify(album_id)
 
@@ -84,7 +92,6 @@ class Tracker:
                 await asyncio.sleep(self.active_interval)
                 return
 
-        seen_at = datetime.now()
         release.last_seen = seen_at
 
         # Match and mark track
@@ -318,12 +325,7 @@ class Tracker:
 
     async def _handle_completion(self, release: Release):
         """Handle release completion."""
-        if release.status in (
-            LifecycleStatus.PUBLISHED,
-            LifecycleStatus.TRASHED_POST,
-            LifecycleStatus.IGNORED_SINGLE,
-            LifecycleStatus.DELETED
-        ):
+        if release.status == LifecycleStatus.PUBLISHED_RECENTLY:
             return
 
         release.completed_at = datetime.now()
@@ -458,7 +460,7 @@ class Tracker:
         if as_relisten and not release_to_publish.duplicate_post_id:
             release_to_publish.duplicate_post_id = release.duplicate_post_id
 
-        if release_to_publish.status == LifecycleStatus.PUBLISHED:
+        if release_to_publish.status == LifecycleStatus.PUBLISHED_RECENTLY:
             return "already_published"
 
         if release_to_publish.status == LifecycleStatus.PUBLISHING:
@@ -484,7 +486,7 @@ class Tracker:
             # Publish via publisher
             post = await self.publisher.publish_release(release, as_relisten=as_relisten)
 
-            release.status = LifecycleStatus.PUBLISHED
+            release.status = LifecycleStatus.PUBLISHED_RECENTLY
             release.published_at = datetime.now()
             await self.db.save_release(release)
 
@@ -503,6 +505,56 @@ class Tracker:
             release.status = LifecycleStatus.ACTIVE  # Reset status on failure
             await self.db.save_release(release)
             raise
+
+    async def _cleanup_published_releases_if_due(self, now: Optional[datetime] = None):
+        """Run post-publish retention cleanup at a bounded interval."""
+        checked_at = now or datetime.now()
+        last_cleanup = getattr(self, "_last_published_cleanup_at", None)
+        if (
+            last_cleanup is not None
+            and checked_at - last_cleanup < PUBLISHED_RELEASE_CLEANUP_INTERVAL
+        ):
+            return
+
+        await self._cleanup_published_releases(checked_at)
+        self._last_published_cleanup_at = checked_at
+
+    async def _cleanup_published_releases(self, now: Optional[datetime] = None) -> int:
+        """Delete releases retained only for the post-publish grace window."""
+        checked_at = now or datetime.now()
+        cutoff = checked_at - PUBLISHED_RELEASE_RETENTION
+        deleted_count = await self.db.delete_published_releases_older_than(cutoff)
+        if deleted_count:
+            await self.db.log_audit_event("published_release_cleanup", {
+                "deleted_count": deleted_count,
+                "cutoff": cutoff.isoformat(),
+            })
+            logger.info(f"Cleaned up {deleted_count} published release(s) older than {cutoff.isoformat()}")
+        return deleted_count
+
+    async def _delete_published_release_if_expired(
+        self,
+        release: Optional[Release],
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Drop an expired retained release before treating it as current tracking state."""
+        if release is None or release.status != LifecycleStatus.PUBLISHED_RECENTLY:
+            return False
+
+        checked_at = now or datetime.now()
+        cutoff = checked_at - PUBLISHED_RELEASE_RETENTION
+        if release.published_at is None or release.published_at > cutoff:
+            return False
+
+        deleted = await self.db.delete_release(release.spotify_id)
+        if deleted:
+            await self.db.log_audit_event("published_release_cleanup", {
+                "deleted_count": 1,
+                "spotify_id": release.spotify_id,
+                "cutoff": cutoff.isoformat(),
+            })
+            logger.info(f"Cleaned up expired published release {release.spotify_id}")
+        return True
 
     async def _handle_idle(self):
         """Handle idle state."""

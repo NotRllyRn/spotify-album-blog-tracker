@@ -144,6 +144,31 @@ class Database:
         await self.connection.commit()
         return True
 
+    async def delete_published_releases_older_than(self, cutoff: datetime) -> int:
+        """Delete recently published releases once their retention window has elapsed."""
+        cursor = await self.connection.execute("""
+            SELECT spotify_id FROM release_lifecycle
+            WHERE status = ?
+              AND published_at IS NOT NULL
+              AND published_at <= ?
+        """, (LifecycleStatus.PUBLISHED_RECENTLY.value, cutoff.isoformat()))
+        rows = await cursor.fetchall()
+        spotify_ids = [row[0] for row in rows]
+        if not spotify_ids:
+            return 0
+
+        placeholders = ", ".join("?" for _ in spotify_ids)
+        await self.connection.execute(
+            f"DELETE FROM discord_prompt WHERE release_id IN ({placeholders})",
+            spotify_ids,
+        )
+        await self.connection.execute(
+            f"DELETE FROM release_lifecycle WHERE spotify_id IN ({placeholders})",
+            spotify_ids,
+        )
+        await self.connection.commit()
+        return len(spotify_ids)
+
     async def touch_release_last_seen(self, spotify_id: str, seen_at: datetime):
         """Update the last-seen timestamp for a tracked release."""
         await self.connection.execute("""
