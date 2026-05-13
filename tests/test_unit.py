@@ -43,12 +43,13 @@ except ModuleNotFoundError:
     Tracker = None
 
 try:
-    from discord_bot import DiscordBot, CurrentPlaybackActionView, CurrentPostContext, PublishedPostActionView
+    from discord_bot import DiscordBot, CurrentPlaybackActionView, CurrentPostContext, PublishedPostActionView, RelistenApprovalPromptView
 except ModuleNotFoundError:
     DiscordBot = None
     CurrentPlaybackActionView = None
     CurrentPostContext = None
     PublishedPostActionView = None
+    RelistenApprovalPromptView = None
 
 try:
     from publisher import (
@@ -550,6 +551,11 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(labels, ["Add content", "Undo post", "Keep post"])
 
+    def test_relisten_approval_view_has_single_yes_action(self):
+        labels = [child.label for child in RelistenApprovalPromptView(self.bot).children]
+
+        self.assertEqual(labels, ["Yes, track as relisten"])
+
     async def test_add_content_action_opens_modal_without_completing_prompt(self):
         release = make_release_for_test("album_modal", "Album Modal", datetime(2024, 1, 1, 12, 0, 0))
         release.wordpress_post_id = 654
@@ -713,10 +719,10 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("Relisten", field_names)
 
-    async def test_current_confirm_publishes_as_relisten_from_stored_duplicate_state(self):
+    async def test_current_confirm_publishes_as_relisten_from_stored_relisten_state(self):
         state = self.make_playback_state()
         release = make_release_for_test("album_5", "Album 5", datetime(2024, 1, 1, 12, 0, 0))
-        release.duplicate_state = "found"
+        release.is_relisten = True
         release.duplicate_post_id = 123
 
         class FakeDatabase:
@@ -761,9 +767,9 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
             ephemeral=True
         )
 
-    async def test_inprogress_publish_uses_stored_duplicate_state_for_relisten(self):
+    async def test_inprogress_publish_uses_stored_relisten_state(self):
         release = make_release_for_test("album_7", "Album 7", datetime(2024, 1, 1, 12, 0, 0))
-        release.duplicate_state = "found"
+        release.is_relisten = True
 
         class FakeDatabase:
             async def get_release(self, release_id):
@@ -845,10 +851,9 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(context.is_actively_tracked)
         self.assertTrue(tracker.built)
         self.assertTrue(tracker.checked)
-        self.assertEqual(release.duplicate_state, "none")
         self.assertIsNone(release.duplicate_post_id)
 
-    async def test_context_resolver_uses_stored_duplicate_state_for_tracked_release(self):
+    async def test_context_resolver_uses_stored_relisten_state_for_tracked_release(self):
         state = self.make_playback_state("album_10")
         release = make_release_for_test("album_10", "Album 10", datetime(2024, 1, 1, 12, 0, 0))
         duplicate_post = WordPressPost(
@@ -859,7 +864,7 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
             normalized_artists=["artist"],
             link="https://example.com/album-10"
         )
-        release.duplicate_state = "found"
+        release.is_relisten = True
         release.duplicate_post_id = duplicate_post.id
 
         class FakeDatabase:
@@ -935,12 +940,13 @@ class TestTrackerLastSeen(unittest.IsolatedAsyncioTestCase):
             async def touch_release_last_seen(self, spotify_id, seen_at):
                 self.touched = (spotify_id, seen_at)
 
+            async def get_release(self, spotify_id):
+                if spotify_id != "album_1":
+                    raise AssertionError(f"Unexpected spotify_id: {spotify_id}")
+                return release
+
             async def save_service_state(self, key, value):
                 return None
-
-        async def get_or_create_release(album_id):
-            self.assertEqual(album_id, "album_1")
-            return release
 
         db = FakeDatabase()
         tracker = Tracker.__new__(Tracker)
@@ -948,7 +954,6 @@ class TestTrackerLastSeen(unittest.IsolatedAsyncioTestCase):
         tracker.db = db
         tracker.discord_bot = None
         tracker.active_interval = 0
-        tracker._get_or_create_release = get_or_create_release
 
         await tracker._poll_once()
 
@@ -1028,8 +1033,8 @@ class TestTrackerPublishNow(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipIf(Tracker is None, "tracker dependencies are not installed")
-class TestTrackerDuplicateStateInitialization(unittest.IsolatedAsyncioTestCase):
-    """Test duplicate state initialization and legacy fallback behavior."""
+class TestTrackerRelistenApprovalFlow(unittest.IsolatedAsyncioTestCase):
+    """Test duplicate gating and relisten approval behavior."""
 
     def make_tracker(self, db):
         tracker = Tracker.__new__(Tracker)
@@ -1048,67 +1053,108 @@ class TestTrackerDuplicateStateInitialization(unittest.IsolatedAsyncioTestCase):
             link=f"https://example.com/{post_id}"
         )
 
-    async def test_get_or_create_release_sets_duplicate_state_found_before_first_save(self):
+    async def test_duplicate_candidate_prompts_without_saving_release(self):
         release = make_release_for_test("album_dup", "Album Dup", datetime(2024, 1, 1, 12, 0, 0))
         duplicate_post = self.make_duplicate_post()
-        saved_duplicate_data = []
+        saved_prompts = []
         audit_events = []
 
         class FakeDatabase:
-            async def get_release(self, spotify_id):
+            async def get_live_discord_prompt(self, release_id, prompt_type):
                 return None
 
             async def save_release(self, release_to_save):
-                saved_duplicate_data.append(
-                    (release_to_save.duplicate_state, release_to_save.duplicate_post_id)
-                )
+                raise AssertionError("duplicate releases should not be saved before approval")
+
+            async def save_discord_prompt(self, prompt):
+                saved_prompts.append(prompt)
 
             async def log_audit_event(self, event_type, payload):
                 audit_events.append((event_type, payload))
 
+        class FakeDiscordBot:
+            async def send_relisten_tracking_prompt(self, release_to_prompt, duplicate_post_to_prompt, expires_at):
+                self.prompted = (release_to_prompt, duplicate_post_to_prompt, expires_at)
+                return type("FakeMessage", (), {"id": 999})()
+
         tracker = self.make_tracker(FakeDatabase())
-        tracker._build_release_from_spotify = AsyncMock(return_value=release)
+        tracker.discord_bot = FakeDiscordBot()
         tracker._check_duplicate = AsyncMock(return_value=duplicate_post)
 
-        created = await tracker._get_or_create_release("album_dup")
+        created = await tracker._start_tracking_or_prompt_for_relisten(release)
 
-        self.assertIs(created, release)
-        self.assertEqual(release.duplicate_state, "found")
-        self.assertEqual(release.duplicate_post_id, duplicate_post.id)
-        self.assertEqual(saved_duplicate_data, [("found", duplicate_post.id)])
-        self.assertEqual(audit_events, [("release_created", {"spotify_id": "album_dup"})])
+        self.assertIsNone(created)
+        self.assertEqual(saved_prompts[0].prompt_type, PromptType.PROMPT_RELISTEN_APPROVAL.value)
+        self.assertEqual(saved_prompts[0].release_id, release.spotify_id)
+        self.assertEqual(saved_prompts[0].wordpress_post_id, duplicate_post.id)
+        self.assertEqual(audit_events[0][0], "relisten_approval_prompt_sent")
 
-    async def test_get_or_create_release_sets_duplicate_state_none_when_no_duplicate_exists(self):
+    async def test_non_duplicate_candidate_starts_tracking_immediately(self):
         release = make_release_for_test("album_new", "Album New", datetime(2024, 1, 1, 12, 0, 0))
-        saved_duplicate_data = []
+        saved_relisten_data = []
 
         class FakeDatabase:
-            async def get_release(self, spotify_id):
-                return None
-
             async def save_release(self, release_to_save):
-                saved_duplicate_data.append(
-                    (release_to_save.duplicate_state, release_to_save.duplicate_post_id)
+                saved_relisten_data.append(
+                    (release_to_save.is_relisten, release_to_save.duplicate_post_id)
                 )
 
             async def log_audit_event(self, event_type, payload):
                 return None
 
         tracker = self.make_tracker(FakeDatabase())
-        tracker._build_release_from_spotify = AsyncMock(return_value=release)
         tracker._check_duplicate = AsyncMock(return_value=None)
 
-        created = await tracker._get_or_create_release("album_new")
+        created = await tracker._start_tracking_or_prompt_for_relisten(release)
 
         self.assertIs(created, release)
+        self.assertFalse(release.is_relisten)
         self.assertEqual(release.duplicate_state, "none")
         self.assertIsNone(release.duplicate_post_id)
-        self.assertEqual(saved_duplicate_data, [("none", None)])
+        self.assertEqual(saved_relisten_data, [(False, None)])
 
-    async def test_handle_completion_uses_stored_duplicate_state_without_rechecking(self):
+    async def test_relisten_approval_creates_tracked_relisten_release(self):
+        release = make_release_for_test("album_approved", "Album Approved", datetime(2024, 1, 1, 12, 0, 0))
+        saved_releases = []
+        updated_prompts = []
+
+        prompt = DiscordPrompt(
+            id=1,
+            prompt_type=PromptType.PROMPT_RELISTEN_APPROVAL.value,
+            release_id=release.spotify_id,
+            wordpress_post_id=321,
+            discord_message_id="message_1",
+            state=PromptState.PENDING.value,
+            context_json=json.dumps({"duplicate_post_id": 321}),
+        )
+
+        class FakeDatabase:
+            async def get_release(self, spotify_id):
+                return None
+
+            async def save_release(self, release_to_save):
+                saved_releases.append(release_to_save)
+
+            async def update_discord_prompt_state(self, message_id, state):
+                updated_prompts.append((message_id, state))
+
+            async def log_audit_event(self, event_type, payload):
+                return None
+
+        tracker = self.make_tracker(FakeDatabase())
+        tracker._build_release_from_spotify = AsyncMock(return_value=release)
+
+        outcome = await tracker.approve_relisten_tracking(prompt)
+
+        self.assertEqual(outcome, "tracking_started")
+        self.assertTrue(saved_releases[0].is_relisten)
+        self.assertEqual(saved_releases[0].duplicate_post_id, 321)
+        self.assertEqual(updated_prompts, [("message_1", PromptState.ACCEPTED.value)])
+
+    async def test_handle_completion_auto_publishes_relisten_without_prompting(self):
         release = make_release_for_test("album_known", "Album Known", datetime(2024, 1, 1, 12, 0, 0))
         release.status = LifecycleStatus.PUBLISHING
-        release.duplicate_state = "found"
+        release.is_relisten = True
         release.duplicate_post_id = 321
         saved_states = []
 
@@ -1118,37 +1164,32 @@ class TestTrackerDuplicateStateInitialization(unittest.IsolatedAsyncioTestCase):
 
         tracker = self.make_tracker(FakeDatabase())
         tracker._check_duplicate = AsyncMock(side_effect=AssertionError("Should not re-check duplicates"))
-        tracker._has_relisten_prompt = AsyncMock(return_value=False)
-        tracker._send_relisten_prompt = AsyncMock()
-
-        await tracker._handle_completion(release)
-
-        self.assertEqual(release.status, LifecycleStatus.AWAITING_RELISION_DECISION)
-        self.assertEqual(release.duplicate_state, "found")
-        tracker._check_duplicate.assert_not_awaited()
-        tracker._send_relisten_prompt.assert_awaited_once_with(release)
-        self.assertEqual(saved_states[-1], (LifecycleStatus.AWAITING_RELISION_DECISION, "found"))
-
-    async def test_handle_completion_backfills_legacy_duplicate_state_before_publish(self):
-        release = make_release_for_test("album_legacy", "Album Legacy", datetime(2024, 1, 1, 12, 0, 0))
-        release.status = LifecycleStatus.PUBLISHING
-        saved_states = []
-
-        class FakeDatabase:
-            async def save_release(self, release_to_save):
-                saved_states.append((release_to_save.status, release_to_save.duplicate_state))
-
-        tracker = self.make_tracker(FakeDatabase())
-        tracker._check_duplicate = AsyncMock(return_value=None)
+        tracker._send_relisten_approval_prompt = AsyncMock(side_effect=AssertionError("Should not prompt at completion"))
         tracker._publish_release = AsyncMock()
 
         await tracker._handle_completion(release)
 
-        self.assertEqual(release.duplicate_state, "none")
-        self.assertIsNone(release.duplicate_post_id)
-        tracker._check_duplicate.assert_awaited_once_with(release)
-        tracker._publish_release.assert_awaited_once_with(release)
-        self.assertEqual(saved_states[-1][1], "none")
+        tracker._check_duplicate.assert_not_awaited()
+        tracker._send_relisten_approval_prompt.assert_not_awaited()
+        tracker._publish_release.assert_awaited_once_with(release, as_relisten=True)
+        self.assertEqual(saved_states, [])
+
+    async def test_handle_completion_publishes_normal_release_without_duplicate_check(self):
+        release = make_release_for_test("album_legacy", "Album Legacy", datetime(2024, 1, 1, 12, 0, 0))
+        release.status = LifecycleStatus.PUBLISHING
+
+        class FakeDatabase:
+            async def save_release(self, release_to_save):
+                raise AssertionError("mocked publish handles saving")
+
+        tracker = self.make_tracker(FakeDatabase())
+        tracker._check_duplicate = AsyncMock(side_effect=AssertionError("Should not check duplicates at completion"))
+        tracker._publish_release = AsyncMock()
+
+        await tracker._handle_completion(release)
+
+        tracker._check_duplicate.assert_not_awaited()
+        tracker._publish_release.assert_awaited_once_with(release, as_relisten=False)
 
 
 @unittest.skipIf(WordPressClient is None or httpx is None, "wordpress client dependencies are not installed")

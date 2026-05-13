@@ -103,6 +103,7 @@ class Database:
             release.published_at.isoformat() if release.published_at else None,
             release.wordpress_post_id,
             release.wordpress_media_id,
+            release.is_relisten,
             release.duplicate_state,
             release.duplicate_post_id,
         )
@@ -112,8 +113,8 @@ class Database:
             (spotify_id, title, normalized_title, release_type, raw_spotify_type,
              cover_url, release_date, total_tracks, total_duration_ms, progress, status,
              first_seen, last_seen, completed_at, published_at, wordpress_post_id,
-             wordpress_media_id, duplicate_state, duplicate_post_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             wordpress_media_id, is_relisten, duplicate_state, duplicate_post_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
 
         release_id = cursor.lastrowid
@@ -156,7 +157,7 @@ class Database:
         """Get all active releases."""
         cursor = await self.connection.execute("""
             SELECT * FROM release_lifecycle
-            WHERE status IN ('active', 'awaiting_75_decision', 'awaiting_relisten_decision', 'publishing')
+            WHERE status IN ('active', 'awaiting_75_decision', 'publishing')
             ORDER BY last_seen DESC
         """)
         rows = await cursor.fetchall()
@@ -247,6 +248,7 @@ class Database:
             published_at=datetime.fromisoformat(row[15]) if row[15] else None,
             wordpress_post_id=row[16],
             wordpress_media_id=row[17],
+            is_relisten=bool(row[20]) if len(row) > 20 else row[18] == "found",
             duplicate_state=row[18],
             duplicate_post_id=row[19],
         )
@@ -290,24 +292,30 @@ class Database:
     # Discord operations
     async def save_discord_prompt(self, prompt: DiscordPrompt):
         """Save Discord prompt."""
+        created_at = prompt.created_at or datetime.now()
         data = (
             prompt.prompt_type,
             prompt.release_id,
             prompt.wordpress_post_id,
             prompt.discord_message_id,
             prompt.state,
+            created_at.isoformat(),
+            prompt.expires_at.isoformat() if prompt.expires_at else None,
+            prompt.context_json,
         )
         await self.connection.execute("""
             INSERT INTO discord_prompt
-            (prompt_type, release_id, wordpress_post_id, discord_message_id, state)
-            VALUES (?, ?, ?, ?, ?)
+            (prompt_type, release_id, wordpress_post_id, discord_message_id, state,
+             created_at, expires_at, context_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
         await self.connection.commit()
 
     async def get_discord_prompt(self, message_id: str) -> Optional[DiscordPrompt]:
         """Get Discord prompt by message ID."""
         cursor = await self.connection.execute("""
-            SELECT id, prompt_type, release_id, wordpress_post_id, discord_message_id, state
+            SELECT id, prompt_type, release_id, wordpress_post_id, discord_message_id, state,
+                   created_at, expires_at, context_json
             FROM discord_prompt WHERE discord_message_id = ?
         """, (message_id,))
         row = await cursor.fetchone()
@@ -319,7 +327,10 @@ class Database:
             release_id=row[2],
             wordpress_post_id=row[3],
             discord_message_id=row[4],
-            state=row[5]
+            state=row[5],
+            created_at=datetime.fromisoformat(row[6]) if row[6] else None,
+            expires_at=datetime.fromisoformat(row[7]) if row[7] else None,
+            context_json=row[8],
         )
 
     async def has_discord_prompt(self, release_id: str, prompt_type: str) -> bool:
@@ -329,14 +340,73 @@ class Database:
             WHERE release_id = ? AND prompt_type = ?
             LIMIT 1
         """, (release_id, prompt_type))
-        logger.info(f"Checking for existing Discord prompt for release_id={release_id}, prompt_type={prompt_type}")
-        logger.info(f"Discord prompt: {await cursor.fetchone()}")
         return await cursor.fetchone() is not None
+
+    async def expire_stale_discord_prompts(
+        self,
+        release_id: str,
+        prompt_type: str,
+        now: Optional[datetime] = None,
+    ):
+        """Mark pending prompts as expired once their expiration timestamp has passed."""
+        checked_at = now or datetime.now()
+        await self.connection.execute("""
+            UPDATE discord_prompt
+            SET state = ?
+            WHERE release_id = ?
+              AND prompt_type = ?
+              AND state = ?
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+        """, (
+            "expired",
+            release_id,
+            prompt_type,
+            "pending",
+            checked_at.isoformat(),
+        ))
+        await self.connection.commit()
+
+    async def get_live_discord_prompt(
+        self,
+        release_id: str,
+        prompt_type: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[DiscordPrompt]:
+        """Return the newest pending prompt that has not expired."""
+        checked_at = now or datetime.now()
+        await self.expire_stale_discord_prompts(release_id, prompt_type, checked_at)
+
+        cursor = await self.connection.execute("""
+            SELECT id, prompt_type, release_id, wordpress_post_id, discord_message_id, state,
+                   created_at, expires_at, context_json
+            FROM discord_prompt
+            WHERE release_id = ?
+              AND prompt_type = ?
+              AND state = ?
+              AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY id DESC LIMIT 1
+        """, (release_id, prompt_type, "pending", checked_at.isoformat()))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return DiscordPrompt(
+            id=row[0],
+            prompt_type=row[1],
+            release_id=row[2],
+            wordpress_post_id=row[3],
+            discord_message_id=row[4],
+            state=row[5],
+            created_at=datetime.fromisoformat(row[6]) if row[6] else None,
+            expires_at=datetime.fromisoformat(row[7]) if row[7] else None,
+            context_json=row[8],
+        )
 
     async def get_discord_prompt_by_release_and_type(self, release_id: str, prompt_type: str) -> Optional[DiscordPrompt]:
         """Get the latest Discord prompt for a release and prompt type."""
         cursor = await self.connection.execute("""
-            SELECT id, prompt_type, release_id, wordpress_post_id, discord_message_id, state
+            SELECT id, prompt_type, release_id, wordpress_post_id, discord_message_id, state,
+                   created_at, expires_at, context_json
             FROM discord_prompt
             WHERE release_id = ? AND prompt_type = ?
             ORDER BY id DESC LIMIT 1
@@ -350,7 +420,10 @@ class Database:
             release_id=row[2],
             wordpress_post_id=row[3],
             discord_message_id=row[4],
-            state=row[5]
+            state=row[5],
+            created_at=datetime.fromisoformat(row[6]) if row[6] else None,
+            expires_at=datetime.fromisoformat(row[7]) if row[7] else None,
+            context_json=row[8],
         )
 
     async def update_discord_prompt_state(self, message_id: str, state: str):

@@ -16,7 +16,7 @@ class ReleaseType(Enum):
 class LifecycleStatus(Enum):
     ACTIVE = "active"
     AWAITING_75_DECISION = "awaiting_75_decision"
-    AWAITING_RELISION_DECISION = "awaiting_relisten_decision"
+    AWAITING_RELISTEN_DECISION = "awaiting_relisten_decision"  # Legacy value; no new code should enter it.
     PUBLISHING = "publishing"
     PUBLISHED = "published"
     DELETED = "deleted"
@@ -25,7 +25,7 @@ class LifecycleStatus(Enum):
 
 class PromptType(Enum):
     PROMPT_75_PERCENT = "75_percent"
-    PROMPT_RELISTEN = "relisten"
+    PROMPT_RELISTEN_APPROVAL = "relisten"
     PROMPT_UNDO = "undo"
 
 class PromptState(Enum):
@@ -75,6 +75,7 @@ class Release:
     published_at: Optional[datetime] = None
     wordpress_post_id: Optional[int] = None
     wordpress_media_id: Optional[int] = None
+    is_relisten: bool = False
     duplicate_state: Optional[str] = None
     duplicate_post_id: Optional[int] = None
 
@@ -105,3 +106,6 @@ class DiscordPrompt:
     state: str
     release_id: Optional[str] = None
     wordpress_post_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    context_json: Optional[str] = None

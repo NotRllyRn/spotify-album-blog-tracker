@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 ACTIVE_TRACKED_STATUSES = {
     LifecycleStatus.ACTIVE,
     LifecycleStatus.AWAITING_75_DECISION,
-    LifecycleStatus.AWAITING_RELISION_DECISION,
     LifecycleStatus.PUBLISHING,
 }
 
@@ -36,7 +35,10 @@ class CurrentPostContext:
 
     @property
     def will_publish_as_relisten(self) -> bool:
-        return self.duplicate_post is not None
+        return (
+            self.duplicate_post is not None
+            or (self.tracked_release is not None and self.tracked_release.is_relisten)
+        )
 
 def _clip_discord_text(value: str, limit: int) -> str:
     if len(value) <= limit:
@@ -74,22 +76,14 @@ class SeventyFivePromptView(PromptView):
     async def wait_for_completion(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.discord_bot.handle_prompt_action(interaction, "wait")
 
-class RelistenPromptView(PromptView):
+class RelistenApprovalPromptView(PromptView):
     @discord.ui.button(
-        label="Post as Relisten",
+        label="Yes, track as relisten",
         style=discord.ButtonStyle.success,
-        custom_id="prompt_relisten_post"
+        custom_id="prompt_relisten_approve_tracking"
     )
-    async def post_relisten(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.discord_bot.handle_prompt_action(interaction, "post_relisten")
-
-    @discord.ui.button(
-        label="Ignore",
-        style=discord.ButtonStyle.danger,
-        custom_id="prompt_relisten_ignore"
-    )
-    async def ignore_relisten(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.discord_bot.handle_prompt_action(interaction, "ignore_relisten")
+    async def approve_tracking(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.discord_bot.handle_prompt_action(interaction, "approve_relisten_tracking")
 
 class PostContentModal(discord.ui.Modal):
     def __init__(
@@ -362,7 +356,7 @@ class DiscordBot:
 
     def _register_views(self):
         self.bot.add_view(SeventyFivePromptView(self))
-        self.bot.add_view(RelistenPromptView(self))
+        self.bot.add_view(RelistenApprovalPromptView(self))
         self.bot.add_view(PublishedPostActionView(self))
 
     async def start(self):
@@ -453,32 +447,44 @@ class DiscordBot:
             view=view
         )
 
-    async def send_relisten_prompt(self, release: Release) -> Optional[discord.Message]:
-        """Send a relisten prompt for duplicate detection."""
+    async def send_relisten_tracking_prompt(
+        self,
+        release: Release,
+        duplicate_post: WordPressPost,
+        expires_at: datetime,
+    ) -> Optional[discord.Message]:
+        """Ask whether a duplicate release should start tracking as a relisten."""
         embed = discord.Embed(
-            title="Duplicate release detected",
+            title="Track duplicate as relisten?",
             description=f"{release.title} by {', '.join([a.name for a in release.artists])}",
             color=0xE67E22
         )
         embed.add_field(
-            name="Status",
-            value="A duplicate WordPress post was detected for this release.",
+            name="Existing WordPress post",
+            value=f"{_clip_discord_text(duplicate_post.title, 160)} (post {duplicate_post.id})",
+            inline=False
+        )
+        embed.add_field(
+            name="Expires",
+            value=expires_at.strftime("%Y-%m-%d %H:%M"),
             inline=False
         )
         embed.set_thumbnail(url=release.cover_url)
 
-        view = RelistenPromptView(self)
+        view = RelistenApprovalPromptView(self)
         return await self._send_dm(
-            "This release appears to already exist on WordPress. Would you like to post it as a Relisten or ignore it?",
+            (
+                "This album already exists on WordPress. Approve it to start tracking as a Relisten. "
+                "If you do nothing, it will stay untracked and can prompt again after this expires."
+            ),
             embed=embed,
             view=view
         )
 
     async def send_publish_notification(self, release: Release, post: dict) -> Optional[discord.Message]:
         """Send notification after a release is published."""
-        # Check for duplicate state to include in the notification if applicable. Changing the title to "republished" if it's a relisten post. and including those relisten details in the embed.
         embed = discord.Embed(
-            title=f"Release {'republished' if release.duplicate_state == 'found' else 'published'} to WordPress",
+            title=f"Release {'republished' if release.is_relisten else 'published'} to WordPress",
             description=f"{release.title} by {', '.join([a.name for a in release.artists])}",
             color=0x1DB954
         )
@@ -489,9 +495,8 @@ class DiscordBot:
         embed.add_field(name="Progress", value=f"{int(release.progress * 100)}%", inline=True)
         embed.set_thumbnail(url=release.cover_url)
 
-        # Include duplicate information if applicable
-        if release.duplicate_state == "found":
-            embed.add_field(name="⚠️ Duplicate Found", value=f"Post ID: {release.duplicate_post_id}", inline=False)
+        if release.is_relisten and release.duplicate_post_id:
+            embed.add_field(name="Relisten", value=f"Original post ID: {release.duplicate_post_id}", inline=False)
 
         view = None
         if release.wordpress_post_id:
@@ -535,12 +540,26 @@ class DiscordBot:
             )
             return
 
+        if prompt.expires_at and prompt.expires_at <= datetime.now():
+            await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.EXPIRED.value)
+            await self._send_prompt_action_response(
+                interaction,
+                "⚠️ This prompt has expired and is no longer available.",
+            )
+            return
+
         release = await self.db.get_release(prompt.release_id) if prompt.release_id else None
-        can_add_content_without_release = (
-            prompt.prompt_type == PromptType.PROMPT_UNDO.value
-            and action == "add_content"
+        can_handle_without_release = (
+            (
+                prompt.prompt_type == PromptType.PROMPT_UNDO.value
+                and action == "add_content"
+            )
+            or (
+                prompt.prompt_type == PromptType.PROMPT_RELISTEN_APPROVAL.value
+                and action == "approve_relisten_tracking"
+            )
         )
-        if release is None and not can_add_content_without_release:
+        if release is None and not can_handle_without_release:
             await self._send_prompt_action_response(
                 interaction,
                 "⚠️ Unable to find the release associated with this prompt.",
@@ -555,11 +574,9 @@ class DiscordBot:
                     await self._handle_75_wait(interaction, release, prompt)
                 else:
                     await self._unknown_prompt_action(interaction)
-            elif prompt.prompt_type == PromptType.PROMPT_RELISTEN.value:
-                if action == "post_relisten":
-                    await self._handle_relisten_publish(interaction, release, prompt)
-                elif action == "ignore_relisten":
-                    await self._handle_relisten_ignore(interaction, release, prompt)
+            elif prompt.prompt_type == PromptType.PROMPT_RELISTEN_APPROVAL.value:
+                if action == "approve_relisten_tracking":
+                    await self._handle_relisten_tracking_approval(interaction, prompt)
                 else:
                     await self._unknown_prompt_action(interaction)
             elif prompt.prompt_type == PromptType.PROMPT_UNDO.value:
@@ -627,29 +644,28 @@ class DiscordBot:
             ephemeral=True
         )
 
-    async def _handle_relisten_publish(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
-        await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.ACCEPTED.value)
-        await self._publish_release_with_feedback(
-            interaction,
-            release,
-            success_message="✅ Published as Relisten. A notification has been sent.",
-            already_published_message=(
-                f"✅ This release is already published as post {release.wordpress_post_id}."
-                if release.wordpress_post_id
-                else "✅ This release is already published."
-            ),
-            already_publishing_message="⏳ This release is already being published.",
-            as_relisten=True
-        )
-
-    async def _handle_relisten_ignore(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
-        await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.DECLINED.value)
-        release.status = LifecycleStatus.IGNORED_SINGLE
-        await self.db.save_release(release)
-        await interaction.followup.send(
-            "✅ Ignored the duplicate release. It will not be published.",
-            ephemeral=True
-        )
+    async def _handle_relisten_tracking_approval(self, interaction: discord.Interaction, prompt: DiscordPrompt):
+        outcome = await self.tracker.approve_relisten_tracking(prompt)
+        if outcome == "tracking_started":
+            await interaction.followup.send(
+                "✅ Tracking started as a Relisten. It will publish automatically when complete.",
+                ephemeral=True
+            )
+        elif outcome == "expired":
+            await interaction.followup.send(
+                "⚠️ This prompt has expired. Listen again later to receive a fresh approval prompt.",
+                ephemeral=True
+            )
+        elif outcome == "not_trackable":
+            await interaction.followup.send(
+                "⚠️ This release is no longer trackable as an album.",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                "⚠️ This prompt is no longer available.",
+                ephemeral=True
+            )
 
     async def _handle_add_content(
         self,
@@ -790,7 +806,7 @@ class DiscordBot:
                 else "✅ This release is already published."
             ),
             already_publishing_message="⏳ This release is already being published.",
-            as_relisten=release.duplicate_state == "found"
+            as_relisten=release.is_relisten
         )
 
     async def _handle_remove_release_prompt(self, interaction: discord.Interaction, release_id: str):
@@ -876,8 +892,9 @@ class DiscordBot:
             description=f"{release.title} by {artist_names}",
             color=0x1DB954
         )
-        if release.duplicate_state == "found":
-            embed.add_field(name="⚠️ Duplicate Found", value=f"Post ID: {release.duplicate_post_id}", inline=False)
+        if release.is_relisten:
+            duplicate_label = f"Original post ID: {release.duplicate_post_id}" if release.duplicate_post_id else "Approved relisten"
+            embed.add_field(name="Relisten", value=duplicate_label, inline=False)
         embed.add_field(name="Release type", value=release.release_type.value, inline=True)
         embed.add_field(name="Progress", value=f"{listened}/{countable} ({progress_percent}%)", inline=True)
         embed.add_field(name="Status", value=release.status.value, inline=True)
@@ -1018,19 +1035,19 @@ class DiscordBot:
         duplicate_post = None
         if check_duplicate and release_for_post is not None:
             if tracked_release is not None:
-                if tracked_release.duplicate_state == "found":
+                if tracked_release.is_relisten or tracked_release.duplicate_state == "found":
                     duplicate_post = await self.tracker._get_cached_wordpress_post(
                         tracked_release.duplicate_post_id
                     )
-                elif tracked_release.duplicate_state is None:
-                    duplicate_post = await self.tracker._initialize_duplicate_state(tracked_release)
+                elif tracked_release.duplicate_post_id:
+                    duplicate_post = await self.tracker._get_cached_wordpress_post(
+                        tracked_release.duplicate_post_id
+                    )
             else:
                 duplicate_post = await self.tracker._check_duplicate(release_for_post)
                 if duplicate_post:
-                    release_for_post.duplicate_state = "found"
                     release_for_post.duplicate_post_id = duplicate_post.id
                 else:
-                    release_for_post.duplicate_state = "none"
                     release_for_post.duplicate_post_id = None
 
         return CurrentPostContext(
@@ -1062,6 +1079,8 @@ class DiscordBot:
 
         context = await self._resolve_current_post_context(playback_state, check_duplicate=True)
         release = await self.tracker._get_or_create_release(album_id)
+        if context.duplicate_post is not None:
+            release.duplicate_post_id = context.duplicate_post.id
         logger.info(f"Publishing current playback for album {album_id} with context: {context}")
         await self._publish_release_with_feedback(
             interaction,
@@ -1073,7 +1092,7 @@ class DiscordBot:
                 else "✅ This content has already been published."
             ),
             already_publishing_message="⏳ This content is already being published.",
-            as_relisten=context.duplicate_post is not None
+            as_relisten=context.will_publish_as_relisten
         )
 
     async def _publish_release_with_feedback(

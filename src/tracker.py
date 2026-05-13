@@ -3,8 +3,9 @@ Main tracking service.
 """
 
 import asyncio
+import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
 from config import Config
@@ -14,6 +15,8 @@ from models import PlaybackState, Release, Track, Artist, ReleaseType, Lifecycle
 from utils import normalize_text, normalize_artist_list, compute_release_type
 
 logger = logging.getLogger(__name__)
+
+RELISTEN_APPROVAL_TTL = timedelta(hours=24)
 
 class Tracker:
     def __init__(self, config: Config, db: Database, publisher=None, discord_bot=None):
@@ -65,13 +68,21 @@ class Tracker:
             await self._handle_non_qualifying(state)
             return
 
-        # Get or create release
-        release = await self._get_or_create_release(state.item["album"]["id"])
+        album_id = state.item["album"]["id"]
+        release = await self.db.get_release(album_id)
+        if release is None:
+            candidate = await self._build_release_from_spotify(album_id)
 
-        if release.release_type == ReleaseType.SINGLE:
-            # Skip singles for auto-tracking
-            await self._handle_non_qualifying(state)
-            return
+            if candidate.release_type == ReleaseType.SINGLE:
+                # Skip singles for auto-tracking
+                await self._handle_non_qualifying(state)
+                return
+
+            release = await self._start_tracking_or_prompt_for_relisten(candidate)
+            if release is None:
+                await self._update_current_listening(state)
+                await asyncio.sleep(self.active_interval)
+                return
 
         seen_at = datetime.now()
         release.last_seen = seen_at
@@ -84,7 +95,7 @@ class Tracker:
             await self._recompute_release_progress(release)
 
             # Check for prompts
-            if release.progress >= 0.75 and release.duplicate_state != "found" and not await self._has_75_prompt(release):
+            if release.progress >= 0.75 and not await self._has_75_prompt(release):
                 await self._send_75_prompt(release)
 
             if release.progress >= 1.0:
@@ -142,17 +153,46 @@ class Tracker:
         return True
 
     async def _get_or_create_release(self, album_id: str) -> Release:
-        """Get existing release or create new one."""
+        """Get an existing release or create one for explicit manual actions."""
         release = await self.db.get_release(album_id)
         if release:
             return release
 
         release = await self._build_release_from_spotify(album_id)
-        await self._initialize_duplicate_state(release)
-        await self.db.save_release(release)
-        await self.db.log_audit_event("release_created", {"spotify_id": album_id})
+        return await self._create_tracked_release(release)
 
+    async def _create_tracked_release(
+        self,
+        release: Release,
+        is_relisten: bool = False,
+        duplicate_post_id: Optional[int] = None,
+    ) -> Release:
+        """Persist a release once tracking has been allowed."""
+        release.is_relisten = is_relisten
+        release.duplicate_post_id = duplicate_post_id
+        release.duplicate_state = "found" if is_relisten else "none"
+        await self.db.save_release(release)
+        await self.db.log_audit_event("release_created", {
+            "spotify_id": release.spotify_id,
+            "is_relisten": is_relisten,
+            "duplicate_post_id": duplicate_post_id,
+        })
         return release
+
+    async def _start_tracking_or_prompt_for_relisten(self, release: Release) -> Optional[Release]:
+        """Create a release unless it needs relisten approval first."""
+        duplicate_post = await self._check_duplicate(release)
+        if duplicate_post is None:
+            return await self._create_tracked_release(release)
+
+        live_prompt = await self.db.get_live_discord_prompt(
+            release.spotify_id,
+            PromptType.PROMPT_RELISTEN_APPROVAL.value,
+        )
+        if live_prompt is None:
+            await self._send_relisten_approval_prompt(release, duplicate_post)
+
+        return None
 
     async def _build_release_from_spotify(self, album_id: str) -> Release:
         """Build a release from Spotify without saving it."""
@@ -252,12 +292,6 @@ class Tracker:
             return True
         return await self.db.has_discord_prompt(release.spotify_id, PromptType.PROMPT_75_PERCENT.value)
 
-    async def _has_relisten_prompt(self, release: Release) -> bool:
-        """Check if a relisten prompt has been sent."""
-        if release.status == LifecycleStatus.AWAITING_RELISION_DECISION:
-            return True
-        return await self.db.has_discord_prompt(release.spotify_id, PromptType.PROMPT_RELISTEN.value)
-
     async def _send_75_prompt(self, release: Release):
         """Send 75% completion prompt."""
         release.status = LifecycleStatus.AWAITING_75_DECISION
@@ -293,21 +327,10 @@ class Tracker:
             return
 
         release.completed_at = datetime.now()
-
-        if release.duplicate_state is None:
-            await self._initialize_duplicate_state(release)
-
-        if release.duplicate_state == "found":
-            if not await self._has_relisten_prompt(release):
-                release.status = LifecycleStatus.AWAITING_RELISION_DECISION
-                await self._send_relisten_prompt(release)
-        elif release.duplicate_state == "none":
-            await self._publish_release(release)
-
-        await self.db.save_release(release)
+        await self._publish_release(release, as_relisten=release.is_relisten)
 
     async def _initialize_duplicate_state(self, release: Release) -> Optional[Any]:
-        """Set duplicate state once for a release and return the matched post, if any."""
+        """Legacy helper for manual duplicate previews."""
         if release.duplicate_state is not None:
             return await self._get_cached_wordpress_post(release.duplicate_post_id)
 
@@ -353,32 +376,87 @@ class Tracker:
 
         return None
 
-    async def _send_relisten_prompt(self, release: Release):
-        """Send relisten prompt."""
-        await self.db.log_audit_event("relisten_prompt_sent", {
+    async def _send_relisten_approval_prompt(self, release: Release, duplicate_post: Any):
+        """Ask the user before a duplicate album starts automatic tracking."""
+        now = datetime.now()
+        expires_at = now + RELISTEN_APPROVAL_TTL
+        await self.db.log_audit_event("relisten_approval_prompt_sent", {
             "spotify_id": release.spotify_id,
-            "release_title": release.title
+            "release_title": release.title,
+            "duplicate_post_id": duplicate_post.id,
         })
 
         if self.discord_bot:
-            message = await self.discord_bot.send_relisten_prompt(release)
+            message = await self.discord_bot.send_relisten_tracking_prompt(
+                release,
+                duplicate_post,
+                expires_at,
+            )
             if message:
                 prompt = DiscordPrompt(
                     id=0,
-                    prompt_type=PromptType.PROMPT_RELISTEN.value,
+                    prompt_type=PromptType.PROMPT_RELISTEN_APPROVAL.value,
                     release_id=release.spotify_id,
-                    wordpress_post_id=None,
+                    wordpress_post_id=duplicate_post.id,
                     discord_message_id=str(message.id),
-                    state=PromptState.PENDING.value
+                    state=PromptState.PENDING.value,
+                    created_at=now,
+                    expires_at=expires_at,
+                    context_json=json.dumps({
+                        "duplicate_post_id": duplicate_post.id,
+                        "duplicate_post_title": duplicate_post.title,
+                    }),
                 )
                 await self.db.save_discord_prompt(prompt)
 
-        logger.info(f"Relisten prompt sent for {release.title}")
+        logger.info(f"Relisten approval prompt sent for {release.title}")
+
+    async def approve_relisten_tracking(self, prompt: DiscordPrompt) -> str:
+        """Create or update tracking after the user approves relisten tracking."""
+        if prompt.state != PromptState.PENDING.value:
+            return "unavailable"
+
+        now = datetime.now()
+        if prompt.expires_at and prompt.expires_at <= now:
+            await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.EXPIRED.value)
+            return "expired"
+
+        if not prompt.release_id:
+            return "unavailable"
+
+        context = json.loads(prompt.context_json or "{}")
+        duplicate_post_id = prompt.wordpress_post_id or context.get("duplicate_post_id")
+        release = await self.db.get_release(prompt.release_id)
+        if release is None:
+            release = await self._build_release_from_spotify(prompt.release_id)
+            if release.release_type == ReleaseType.SINGLE:
+                await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.DECLINED.value)
+                return "not_trackable"
+            await self._create_tracked_release(
+                release,
+                is_relisten=True,
+                duplicate_post_id=duplicate_post_id,
+            )
+        else:
+            release.is_relisten = True
+            release.duplicate_state = "found"
+            release.duplicate_post_id = duplicate_post_id
+            await self.db.save_release(release)
+
+        await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.ACCEPTED.value)
+        await self.db.log_audit_event("relisten_tracking_approved", {
+            "spotify_id": release.spotify_id,
+            "duplicate_post_id": duplicate_post_id,
+        })
+        return "tracking_started"
 
     async def publish_release_now(self, release: Release, as_relisten: bool = False) -> str:
         """Publish a release immediately from a Discord prompt action."""
         latest_release = await self.db.get_release(release.spotify_id)
         release_to_publish = latest_release or release
+        as_relisten = as_relisten or release_to_publish.is_relisten
+        if as_relisten and not release_to_publish.duplicate_post_id:
+            release_to_publish.duplicate_post_id = release.duplicate_post_id
 
         if release_to_publish.status == LifecycleStatus.PUBLISHED:
             return "already_published"
@@ -387,6 +465,9 @@ class Tracker:
             return "already_publishing"
 
         release_to_publish.status = LifecycleStatus.PUBLISHING
+        if as_relisten:
+            release_to_publish.is_relisten = True
+            release_to_publish.duplicate_state = "found"
         await self.db.save_release(release_to_publish)
         await self._publish_release(release_to_publish, as_relisten=as_relisten)
         return "published"
@@ -395,6 +476,9 @@ class Tracker:
         """Publish release to WordPress."""
         try:
             release.status = LifecycleStatus.PUBLISHING
+            if as_relisten:
+                release.is_relisten = True
+                release.duplicate_state = "found"
             await self.db.save_release(release)
 
             # Publish via publisher
