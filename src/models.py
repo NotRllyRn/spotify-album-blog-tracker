@@ -96,6 +96,39 @@ class WordPressPost:
     link: str
 
 @dataclass
+class SavedLibraryAlbum:
+    spotify_id: str
+    spotify_uri: str
+    spotify_url: str
+    title: str
+    normalized_title: str
+    artists: List[str]
+    normalized_artists: List[str]
+    album_type: str
+    release_type: ReleaseType
+    cover_url: str
+    added_at: datetime
+    is_posted_listened: bool = False
+    wordpress_post_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+@dataclass
+class SavedLibraryStats:
+    total: int
+    posted_listened: int
+    percent: float
+
+@dataclass
+class SavedLibrarySyncResult:
+    skipped: bool
+    total_seen: int
+    stored_total: int
+    added_or_updated: int = 0
+    removed: int = 0
+    message: str = ""
+
+@dataclass
 class DiscordPrompt:
     id: int
     prompt_type: str

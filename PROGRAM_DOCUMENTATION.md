@@ -27,8 +27,8 @@ The program is built around one recurring question: "Is the user currently liste
 
 The service ties together four systems:
 
-- Spotify: source of playback state, album metadata, track lists, and artwork URLs.
-- SQLite: local durable state for releases, tracks, WordPress post cache, prompts, audit events, and service state.
+- Spotify: source of playback state, album metadata, track lists, saved-library data, and artwork URLs.
+- SQLite: local durable state for releases, tracks, saved-library albums, WordPress post cache, prompts, audit events, and service state.
 - WordPress: destination for published album posts, categories, tags, and uploaded artwork.
 - Discord: control plane for the operator through slash commands, DMs, buttons, and modals.
 
@@ -38,6 +38,7 @@ Main components:
 - `src/config.py`: environment loading, path setup, token persistence, and config validation.
 - `src/database.py`: SQLite connection, migrations, release storage, WordPress cache, Discord prompt state, audit log, and service state.
 - `src/spotify_client.py`: async Spotify Web API client and OAuth token handling.
+- `src/saved_library.py`: saved Spotify library synchronization and listen-to-list reconciliation.
 - `src/tracker.py`: the main playback polling loop and release lifecycle logic.
 - `src/publisher.py`: high-level WordPress publishing workflow.
 - `src/wordpress_client.py`: low-level WordPress REST API client.
@@ -56,7 +57,8 @@ The fundamental idea is not "post every Spotify album immediately." The program 
 - It tracks progress per countable track, not elapsed duration.
 - It auto-skips singles for tracking.
 - It checks for existing WordPress posts and requires approval before tracking duplicates as "Relisten" posts.
-- It gives the operator Discord controls for early publishing, undoing a post, adding post content, removing tracked releases, and checking status.
+- It mirrors saved Spotify Albums and EPs into a local listen-to list for `/random` and library completion stats.
+- It gives the operator Discord controls for early publishing, undoing a post, adding post content, removing tracked releases, picking a random listen-to album, and checking status.
 
 ## Startup And Runtime Flow
 
@@ -81,8 +83,9 @@ The service constructor wires the dependency graph:
 2. `Database(config)`
 3. `Publisher(config, db)`
 4. `Tracker(config, db, publisher)`
-5. `DiscordBot(config, db, tracker)`
-6. `tracker.set_discord_bot(discord_bot)`
+5. `SavedLibraryService(db, tracker.spotify)`
+6. `DiscordBot(config, db, tracker)`
+7. `tracker.set_discord_bot(discord_bot)`
 
 This creates a circular collaboration intentionally: the tracker can send Discord prompts, and Discord actions can call tracker and publisher behavior.
 
@@ -93,11 +96,12 @@ Startup order:
 1. Log service startup.
 2. Ensure Spotify authorization with `tracker.spotify.ensure_authorized()`.
 3. Initialize SQLite and run migrations with `db.initialize()`.
-4. Refresh the WordPress post cache with `publisher.refresh_post_cache()`.
+4. Refresh the WordPress post cache and synchronize saved Spotify library albums with `_refresh_saved_library()`.
 5. Start the Discord bot task.
 6. Wait for Discord readiness with `discord_bot.wait_until_ready()`.
 7. Start the tracker task.
-8. Await both tasks forever with `asyncio.gather`.
+8. Start a 24-hour saved-library sync loop.
+9. Await all long-running tasks forever with `asyncio.gather`.
 
 The tracker does not begin polling until Discord is logged in and slash commands are synced.
 
@@ -105,10 +109,11 @@ The tracker does not begin polling until Discord is logged in and slash commands
 
 Shutdown order:
 
-1. `tracker.stop()`
-2. `discord_bot.stop()`
-3. `publisher.close()`
-4. `db.close()`
+1. Cancel the saved-library sync task if it exists.
+2. `tracker.stop()`
+3. `discord_bot.stop()`
+4. `publisher.close()`
+5. `db.close()`
 
 This closes the Spotify HTTP client through the tracker, closes the Discord client, closes the WordPress HTTP client, and closes the SQLite connection.
 
@@ -310,6 +315,28 @@ WordPressPost(
 )
 ```
 
+`SavedLibraryAlbum` stores one current Spotify saved-library Album or EP:
+
+```python
+SavedLibraryAlbum(
+    spotify_id="album-id",
+    spotify_uri="spotify:album:album-id",
+    spotify_url="https://open.spotify.com/album/album-id",
+    title="Album Title",
+    normalized_title="album title",
+    artists=["Artist Name"],
+    normalized_artists=["artist name"],
+    album_type="album",
+    release_type=ReleaseType.ALBUM,
+    cover_url="https://...",
+    added_at=datetime.now(),
+    is_posted_listened=False,
+    wordpress_post_id=None,
+)
+```
+
+`SavedLibraryStats` contains total saved-library rows, posted/listened rows, and the posted/listened percentage. `SavedLibrarySyncResult` summarizes one saved-library synchronization run.
+
 `DiscordPrompt` stores prompt state for persistent button handling:
 
 ```python
@@ -361,6 +388,13 @@ It also expires old relisten prompts and deletes active duplicate rows that were
 - `deleted`
 
 Current code keeps a published release only in `PUBLISHED_RECENTLY` for a short retention window, then purges it.
+
+`004_saved_library_albums.sql` adds:
+
+- `saved_library_album`
+- indexes for posted/listened filtering and saved date ordering
+
+This table mirrors the current Spotify saved library for items the app treats as Albums or EPs.
 
 ### Tables
 
@@ -436,6 +470,26 @@ Tracks are ordered by disc and track number when reloaded.
 
 This table caches published WordPress posts and artist tags for duplicate detection.
 
+`saved_library_album`:
+
+- `spotify_id TEXT PRIMARY KEY`
+- `spotify_uri TEXT NOT NULL`
+- `spotify_url TEXT NOT NULL`
+- `title TEXT NOT NULL`
+- `normalized_title TEXT NOT NULL`
+- `artists_json TEXT NOT NULL`
+- `normalized_artists_json TEXT NOT NULL`
+- `album_type TEXT NOT NULL`
+- `release_type TEXT NOT NULL`
+- `cover_url TEXT NOT NULL`
+- `added_at TEXT NOT NULL`
+- `is_posted_listened BOOLEAN NOT NULL DEFAULT 0`
+- `wordpress_post_id INTEGER`
+- `created_at TEXT NOT NULL`
+- `updated_at TEXT NOT NULL`
+
+This table is the listen-to list. It is kept as an exact mirror of current Spotify saved Albums and EPs, so albums removed from Spotify are deleted locally. `is_posted_listened` is the canonical completion flag and means the album has a matching published WordPress post.
+
 `discord_prompt`:
 
 - `id INTEGER PRIMARY KEY AUTOINCREMENT`
@@ -466,12 +520,20 @@ This is an append-only log of important lifecycle events.
 
 Used for lightweight key-value state, including current playback string and WordPress cache validation metadata.
 
+Saved-library sync stores validation state under:
+
+- `spotify_saved_library.total`
+- `spotify_saved_library.first_page_hash`
+- `spotify_saved_library.last_synced_at`
+
 ### Relationships And Retention
 
 - `release_artist` and `release_track` are attached to `release_lifecycle` by numeric `release_id`.
 - Deleting a release cascades to artists and tracks.
 - `Database.delete_release()` also deletes Discord prompts by Spotify release ID.
 - `Database.delete_published_releases_older_than()` deletes `PUBLISHED_RECENTLY` releases after the tracker retention window.
+- `saved_library_album` is independent from `release_lifecycle`; publish and undo flows update it by Spotify album ID when a row exists.
+- Saved-library removals are hard deletes so the table mirrors the current Spotify library, not historical library membership.
 - Discord prompt rows are not general history; many are removed with their associated release.
 - Audit events are not deleted by normal release deletion paths.
 
@@ -527,6 +589,23 @@ SELECT id, title, artists_json, link
 FROM wordpress_post_cache
 ORDER BY id DESC
 LIMIT 20;
+```
+
+Saved-library listen-to list:
+
+```sql
+SELECT title, artists_json, added_at, is_posted_listened, wordpress_post_id
+FROM saved_library_album
+ORDER BY added_at DESC
+LIMIT 20;
+```
+
+Saved-library stats:
+
+```sql
+SELECT COUNT(*) AS total,
+       SUM(CASE WHEN is_posted_listened THEN 1 ELSE 0 END) AS listened
+FROM saved_library_album;
 ```
 
 Recent audit events:
@@ -591,8 +670,10 @@ Current implementation note: `_wait_for_callback()` does not start a callback we
 Requested scopes:
 
 ```text
-user-read-playback-state user-read-recently-played
+user-read-playback-state user-read-recently-played user-library-read
 ```
+
+`user-library-read` is required for saved-library synchronization and for checking whether a published album is saved in the user's Spotify library. Existing persisted tokens created before this scope was added may need to be regenerated through the authorization flow.
 
 ### Token Refresh
 
@@ -644,6 +725,24 @@ GET /me/player/recently-played?limit={limit}
 
 This method exists and is tested by type/import paths indirectly, but the tracker loop does not currently use recently played data.
 
+`get_saved_albums_page(limit=50, offset=0, url=None)`:
+
+```http
+GET /me/albums?limit=50&offset=0
+```
+
+Returns one page of saved album items. Spotify's limit is capped at 50. When `url` is supplied, the client follows Spotify's paging `next` URL directly.
+
+`get_all_saved_albums(first_page=None)` follows the saved-album paging `next` links until no pages remain.
+
+`check_library_contains_album(album_id_or_uri)`:
+
+```http
+GET /me/library/contains?uris=spotify:album:{album_id}
+```
+
+Returns whether the album URI is saved in the user's Spotify library. The code uses the current generic library contains endpoint rather than the older album-specific contains endpoint.
+
 ### Playback State Shape Used By The Tracker
 
 The tracker depends on these fields:
@@ -671,6 +770,46 @@ The tracker depends on these fields:
     "timestamp": 1710000000000
 }
 ```
+
+## Saved Spotify Library Sync
+
+`SavedLibraryService` in `src/saved_library.py` keeps the local listen-to list in sync with Spotify saved albums.
+
+### Sync Timing
+
+Startup calls `_refresh_saved_library()`, which refreshes the WordPress post cache first and then runs `SavedLibraryService.sync()`. A background loop repeats the same refresh every 24 hours while the service is running.
+
+### Change Detection
+
+The first saved-albums request always asks Spotify for the first 50 saved albums:
+
+```http
+GET /me/albums?limit=50&offset=0
+```
+
+The sync stores two validation values in `service_state`:
+
+- `spotify_saved_library.total`: the Spotify endpoint's `total` value.
+- `spotify_saved_library.first_page_hash`: a stable SHA-256 hash of first-page album IDs plus `added_at` values.
+
+If both match the previous run, the sync stops without fetching later pages. If either value differs, the sync follows every `next` link and reconciles the full local table.
+
+### Reconciliation Rules
+
+The sync includes saved items whose Spotify `album_type` is `album` and whose computed local `ReleaseType` is `Album` or `EP`. Singles and compilations are excluded from the listen-to list.
+
+Release type is computed from the data already embedded in each saved-albums response item whenever possible. Albums with `total_tracks >= 7` are classified as `Album` immediately, and albums with 6 or fewer tracks use `album.tracks.items` from the `/me/albums` payload. The sync only calls `GET /albums/{album_id}/tracks` as a fallback when Spotify returns incomplete embedded track data for a low-track-count album.
+
+For each included album, the sync stores Spotify ID, URI, Spotify URL, title, normalized title, artists, normalized artists, raw album type, computed release type, cover URL, and the `added_at` timestamp.
+
+Existing WordPress posts are matched using the same duplicate-detection shape as the tracker:
+
+- normalized album title must match
+- normalized artist set must match exactly
+
+Matching entries are marked `is_posted_listened=True` and store `wordpress_post_id`. Non-matching entries remain eligible for `/random`.
+
+If an album disappears from the current Spotify saved-library response, its `saved_library_album` row is deleted even if it was previously posted.
 
 ## Tracker Loop And Core Logic
 
@@ -809,8 +948,11 @@ Waiting sets the prompt to `declined`, changes release status back to `ACTIVE`, 
 5. Sets status to `PUBLISHED_RECENTLY`.
 6. Sets `published_at = datetime.now()`.
 7. Saves the release.
-8. Sends a Discord publish notification.
-9. Logs `release_published`.
+8. Marks the matching `saved_library_album` row posted/listened if it exists.
+9. Sends a Discord publish notification.
+10. Checks whether the album is saved in the Spotify library.
+11. If Spotify says the album is not saved, sends a Discord warning without blocking or rolling back the publish.
+12. Logs `release_published`.
 
 If publishing fails, it logs the error, resets status to `ACTIVE`, saves the release, and re-raises.
 
@@ -1128,12 +1270,22 @@ Persistent prompt views also run `PromptView.interaction_check()`. Unauthorized 
 - If the album is actively tracked, includes progress.
 - Provides a button to post current content or publish early.
 
+`/random`:
+
+- Selects one random `saved_library_album` where `is_posted_listened=False`.
+- Uses only cached database fields; it does not call Spotify for artwork or metadata.
+- Shows title, artists, release type, saved date, Spotify ID, Spotify link, and cached cover thumbnail.
+- Returns a simple empty-state message when every saved-library Album/EP has already been posted/listened.
+
 `/service`:
 
 - Shows basic service status.
 - Shows active release count.
+- Shows saved-library Album/EP count.
+- Shows posted/listened count and percentage.
 - Shows database connected status.
 - Attempts to show `last_poll` if present in `service_state`.
+- Shows last saved-library sync time when present.
 - Lists available commands.
 
 Current note: `last_poll` is displayed but the tracker does not currently write it.
@@ -1152,7 +1304,7 @@ Relisten approval prompt: `RelistenApprovalPromptView`
 Published-post actions: `PublishedPostActionView`
 
 - `prompt_add_content`: opens the post-content modal.
-- `prompt_undo_post`: moves the WordPress post to trash and deletes the release from the tracking database.
+- `prompt_undo_post`: moves the WordPress post to trash, clears saved-library posted/listened state if present, and deletes the release from the tracking database.
 - `prompt_keep_post`: marks the prompt declined and leaves the post alone.
 
 In-progress page: `InProgressView`
@@ -1316,19 +1468,28 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 - Inputs: none.
 - Output: initialized service object.
-- Creates config, database, publisher, tracker, and Discord bot.
+- Creates config, database, publisher, tracker, saved-library service, and Discord bot.
 
 `Service.start(self)`:
 
 - Inputs: none.
 - Output: never returns during normal operation.
-- Authorizes Spotify, initializes DB, refreshes WordPress cache, starts Discord, waits for readiness, and starts tracker.
+- Authorizes Spotify, initializes DB, refreshes WordPress cache, synchronizes saved library, starts Discord, waits for readiness, starts tracker, and starts the 24-hour saved-library sync loop.
+
+`Service._refresh_saved_library(self)`:
+
+- Refreshes WordPress post cache, then synchronizes saved Spotify library rows.
+- Logs saved-library sync errors without stopping the service.
+
+`Service._run_saved_library_sync_loop(self)`:
+
+- Sleeps for 24 hours between saved-library refreshes.
 
 `Service.stop(self)`:
 
 - Inputs: none.
 - Output: none.
-- Stops tracker and Discord, closes publisher and database.
+- Cancels saved-library sync, stops tracker and Discord, closes publisher and database.
 
 `main()`:
 
@@ -1454,6 +1615,46 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 - Replaces the full WordPress post cache.
 
+`get_saved_library_album(self, spotify_id)`:
+
+- Returns one saved-library album row or `None`.
+
+`get_saved_library_album_ids(self)`:
+
+- Returns all saved-library Spotify IDs.
+
+`get_saved_library_albums_by_id(self)`:
+
+- Returns saved-library rows keyed by Spotify ID.
+
+`upsert_saved_library_album(self, album)`:
+
+- Inserts or updates one saved-library row.
+
+`delete_saved_library_albums(self, spotify_ids)`:
+
+- Deletes saved-library rows by Spotify ID and returns the deleted count.
+
+`mark_saved_library_album_posted(self, spotify_id, wordpress_post_id)`:
+
+- Marks an existing saved-library row posted/listened.
+
+`mark_saved_library_album_unposted(self, spotify_id)`:
+
+- Clears posted/listened state for an existing saved-library row.
+
+`get_random_unposted_saved_library_album(self)`:
+
+- Returns one random unposted saved-library row or `None`.
+
+`get_saved_library_stats(self)`:
+
+- Returns saved-library total, posted/listened count, and percentage.
+
+`_row_to_saved_library_album(self, row)`:
+
+- Converts a SQLite row into `SavedLibraryAlbum`.
+
 `save_discord_prompt(self, prompt)`:
 
 - Inserts a Discord prompt row.
@@ -1539,6 +1740,61 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 `get_recently_played(self, limit=50)`:
 
 - Calls `GET /me/player/recently-played?limit={limit}`.
+
+`get_saved_albums_page(self, limit=50, offset=0, url=None)`:
+
+- Calls one saved-albums page, capped at Spotify's limit of 50.
+
+`get_all_saved_albums(self, first_page=None)`:
+
+- Follows saved-album paging links until no `next` URL remains.
+
+`check_library_contains_album(self, album_id_or_uri)`:
+
+- Checks whether one album URI is saved in the user's Spotify library.
+
+### `src/saved_library.py`
+
+`SavedLibraryService.__init__(self, db, spotify)`:
+
+- Stores database and Spotify collaborators.
+
+`sync(self, force=False)`:
+
+- Fetches the first saved-albums page, validates total and first-page hash, and either skips or reconciles the full saved-library table.
+
+`compute_first_page_hash(self, page)`:
+
+- Hashes stable first-page album IDs plus `added_at` values.
+
+`_build_saved_album(self, item, existing_by_id, wordpress_posts)`:
+
+- Converts one Spotify saved-album item into `SavedLibraryAlbum`, or returns `None` when it is not an included Album/EP.
+
+`_get_release_type(self, item, existing_by_id)`:
+
+- Reuses an existing release type when possible, otherwise classifies from `album.total_tracks` and embedded `album.tracks.items`.
+- Falls back to fetching full album tracks only when embedded track data is incomplete.
+
+`_parse_total_tracks(self, album)`:
+
+- Parses Spotify's `total_tracks` field into an integer when possible.
+
+`_get_complete_embedded_tracks(self, album, total_tracks)`:
+
+- Returns embedded track items when they are complete enough for release-type classification.
+
+`_find_matching_wordpress_post(self, normalized_title, normalized_artists, wordpress_posts)`:
+
+- Finds a WordPress post with matching normalized title and exact normalized artist set.
+
+`_get_cover_url(self, album)`:
+
+- Returns the first Spotify image URL when present.
+
+`_parse_spotify_datetime(self, value)`:
+
+- Parses Spotify ISO timestamps, including trailing `Z`.
 
 ### `src/tracker.py`
 
@@ -1639,7 +1895,11 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 `_publish_release(self, release, as_relisten=False)`:
 
-- Performs publish workflow and release status updates.
+- Performs publish workflow, release status updates, saved-library posted/listened marking, saved-library membership warning, and audit logging.
+
+`_warn_if_published_album_not_saved(self, release)`:
+
+- Checks Spotify saved-library membership after publish and sends a Discord warning when the album is not saved.
 
 `_cleanup_published_releases_if_due(self, now=None)`:
 
@@ -1930,7 +2190,7 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 `_setup_commands(self)`:
 
-- Registers `/inprogress`, `/current`, `/service`, and `on_ready`.
+- Registers `/inprogress`, `/current`, `/random`, `/service`, and `on_ready`.
 
 `_register_views(self)`:
 
@@ -1980,6 +2240,10 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 - Sends publish notification and saves undo prompt.
 
+`send_library_missing_notification(self, release)`:
+
+- Sends a warning DM when a published album is not saved in Spotify.
+
 `handle_prompt_action(self, interaction, action)`:
 
 - Central dispatcher for prompt-backed button actions.
@@ -2018,7 +2282,7 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 `_handle_undo_post(self, interaction, release, prompt)`:
 
-- Trashes WordPress post and deletes release state.
+- Trashes WordPress post, clears saved-library posted/listened state, and deletes release state.
 
 `_handle_keep_post(self, interaction, release, prompt)`:
 
@@ -2072,6 +2336,14 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 - Wraps tracker publish outcomes into Discord messages.
 
+`_handle_random(self, interaction)`:
+
+- Handles `/random` by selecting one unposted saved-library album.
+
+`_build_random_album_embed(self, album)`:
+
+- Builds the `/random` embed from cached saved-library fields.
+
 `_build_inprogress_embed(self, page_data)`:
 
 - Builds `/inprogress` embed.
@@ -2098,7 +2370,7 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 `_handle_service(self, interaction)`:
 
-- Handles `/service`.
+- Handles `/service`, including saved-library stats.
 
 ### `src/models.py`
 
@@ -2113,6 +2385,9 @@ Classes:
 - `Release`
 - `PlaybackState`
 - `WordPressPost`
+- `SavedLibraryAlbum`
+- `SavedLibraryStats`
+- `SavedLibrarySyncResult`
 - `DiscordPrompt`
 
 These are covered in [Data Models And State](#data-models-and-state).
@@ -2164,8 +2439,8 @@ PYTHONPATH=src python3 -m unittest -v
 Observed in this environment on 2026-05-27:
 
 ```text
-Ran 74 tests
-OK (skipped=45)
+Ran 80 tests
+OK (skipped=47)
 ```
 
 Many tests skipped because the active interpreter did not have optional/runtime dependencies installed, especially imports that require `discord.py`, `httpx`, and downstream modules. After installing `requirements.txt`, run the same command again to exercise the skipped integration-adjacent unit tests.
@@ -2209,9 +2484,16 @@ PYTHONPATH=src python3 -m unittest -v
 - Verifies first unlistened countable track selection.
 - Verifies non-countable/listened tracks are skipped.
 
+`TestSavedLibraryService`:
+
+- Verifies matching total and first-page hash skips full sync.
+- Verifies full sync filters to Album/EP entries, matches WordPress posts, saves state, and deletes removed albums.
+- Verifies saved-library release typing uses embedded `/me/albums` track data and only falls back to full track fetches for incomplete low-track-count payloads.
+
 `TestDiscordBotEmbeds`:
 
 - Verifies Discord embed formatting and view labels.
+- Verifies `/random` embed uses cached Spotify link and cover URL.
 - Verifies add-content modal flow.
 - Verifies post content update handling.
 - Verifies undo behavior.
@@ -2265,7 +2547,7 @@ rg -n "^(class|def|async def) |^    (class|def|async def) " main.py src scripts 
 Useful endpoint/control command:
 
 ```bash
-rg -n "@self\\.tree\\.command|custom_id=|/me/player|/albums|/wp-json" main.py src README.md DEPLOYMENT.md DOCKER_DEPLOYMENT.md
+rg -n "@self\\.tree\\.command|custom_id=|/me/player|/me/albums|/me/library|/albums|/wp-json" main.py src README.md DEPLOYMENT.md DOCKER_DEPLOYMENT.md
 ```
 
 ## Deployment And Operations
@@ -2417,9 +2699,10 @@ LIMIT 20;
 
 Discord:
 
-- `/service`: service status and active release count.
+- `/service`: service status, active release count, saved-library count, and listened percentage.
 - `/current`: current playback and trackability.
 - `/inprogress`: tracked release progress.
+- `/random`: random unposted saved-library Album/EP.
 
 SQLite:
 
@@ -2499,6 +2782,7 @@ Spotify token problems:
 This section intentionally documents rough edges and current code truth.
 
 - `SpotifyClient.get_recently_played()` exists but the tracker loop does not currently use it.
+- Saved-library sync requires the `user-library-read` Spotify scope. Persisted tokens created before this scope was added may need to be regenerated.
 - `/service` displays `last_poll` if present, but the tracker does not appear to write `service_state["last_poll"]`.
 - `LifecycleStatus.AWAITING_RELISTEN_DECISION` is explicitly marked legacy, and current code should not enter it.
 - Spotify OAuth callback handling is incomplete. `_wait_for_callback()` asks the user to paste the code instead of running a callback server.

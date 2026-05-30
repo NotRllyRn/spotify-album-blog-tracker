@@ -14,7 +14,7 @@ from urllib.parse import urlparse, urlunparse
 from config import Config
 from database import Database
 from tracker import Tracker
-from models import Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost
+from models import Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost, SavedLibraryAlbum
 from inprogress import INPROGRESS_PAGE_SIZE, InProgressPage, build_inprogress_page, get_next_unlistened_track
 
 logger = logging.getLogger(__name__)
@@ -348,6 +348,10 @@ class DiscordBot:
         async def service(interaction: discord.Interaction):
             await self._handle_service(interaction)
 
+        @self.tree.command(name="random", description="Pick a random unposted saved-library album")
+        async def random(interaction: discord.Interaction):
+            await self._handle_random(interaction)
+
         @self.bot.event
         async def on_ready():
             await self.tree.sync()
@@ -520,6 +524,23 @@ class DiscordBot:
             await self.db.save_discord_prompt(prompt)
 
         return message
+
+    async def send_library_missing_notification(self, release: Release) -> Optional[discord.Message]:
+        """Warn that a published album is not saved in the user's Spotify library."""
+        embed = discord.Embed(
+            title="Published album is not saved in Spotify",
+            description=f"{release.title} by {', '.join([a.name for a in release.artists])}",
+            color=0xE67E22
+        )
+        embed.add_field(name="Spotify ID", value=release.spotify_id, inline=False)
+        embed.add_field(name="Action", value="Save it in Spotify if it belongs on the listen-to list.", inline=False)
+        if release.cover_url:
+            embed.set_thumbnail(url=release.cover_url)
+
+        return await self._send_dm(
+            "A published album was not found in your saved Spotify library.",
+            embed=embed
+        )
 
     async def handle_prompt_action(self, interaction: discord.Interaction, action: str):
         if action != "add_content":
@@ -756,6 +777,7 @@ class DiscordBot:
 
         success = await self.tracker.publisher.trash_post(post_id)
         if success:
+            await self.db.mark_saved_library_album_unposted(release.spotify_id)
             await self.db.delete_release(release.spotify_id)
             await interaction.followup.send(
                 "✅ The post has been moved to trash and removed from the tracking database.",
@@ -1288,6 +1310,51 @@ class DiscordBot:
                 ephemeral=True
             )
 
+    async def _handle_random(self, interaction: discord.Interaction):
+        """Handle /random command."""
+        if not self._check_authorized(interaction.user.id):
+            await interaction.response.send_message(
+                "❌ You are not authorized to use this command.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        try:
+            album = await self.db.get_random_unposted_saved_library_album()
+            if album is None:
+                await interaction.followup.send(
+                    "No unposted saved-library albums found.",
+                    ephemeral=True
+                )
+                return
+
+            await interaction.followup.send(embed=self._build_random_album_embed(album), ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error in /random: {e}")
+            await interaction.followup.send(
+                f"❌ Error picking a random album: {str(e)[:100]}",
+                ephemeral=True
+            )
+
+    def _build_random_album_embed(self, album: SavedLibraryAlbum) -> discord.Embed:
+        artist_text = ", ".join(album.artists[:5]) or "Unknown"
+        embed = discord.Embed(
+            title=album.title,
+            description=artist_text,
+            url=album.spotify_url or None,
+            color=0x1DB954
+        )
+        embed.add_field(name="Release type", value=album.release_type.value, inline=True)
+        embed.add_field(name="Saved", value=f"<t:{int(album.added_at.timestamp())}:D>", inline=True)
+        embed.add_field(name="Spotify ID", value=album.spotify_id, inline=False)
+        if album.spotify_url:
+            embed.add_field(name="Spotify link", value=album.spotify_url, inline=False)
+        if album.cover_url:
+            embed.set_thumbnail(url=album.cover_url)
+        return embed
+
     async def _handle_service(self, interaction: discord.Interaction):
         """Handle /service command."""
         # Check authorization
@@ -1304,6 +1371,8 @@ class DiscordBot:
             # Get service status
             active_releases = await self.db.get_active_releases()
             last_poll = await self.db.get_service_state("last_poll")
+            saved_library_stats = await self.db.get_saved_library_stats()
+            saved_library_last_sync = await self.db.get_service_state("spotify_saved_library.last_synced_at")
 
             embed = discord.Embed(
                 title="Service Status",
@@ -1321,6 +1390,19 @@ class DiscordBot:
                 inline=True
             )
             embed.add_field(
+                name="Saved Library Albums",
+                value=str(saved_library_stats.total),
+                inline=True
+            )
+            embed.add_field(
+                name="Listened",
+                value=(
+                    f"{saved_library_stats.posted_listened}/{saved_library_stats.total} "
+                    f"({saved_library_stats.percent * 100:.1f}%)"
+                ),
+                inline=True
+            )
+            embed.add_field(
                 name="Database",
                 value="✅ Connected",
                 inline=True
@@ -1333,9 +1415,16 @@ class DiscordBot:
                     inline=True
                 )
 
+            if saved_library_last_sync:
+                embed.add_field(
+                    name="Library Sync",
+                    value=f"<t:{int(datetime.fromisoformat(saved_library_last_sync).timestamp())}:R>",
+                    inline=True
+                )
+
             embed.add_field(
                 name="Commands",
-                value="/inprogress, /current, /service",
+                value="/inprogress, /current, /random, /service",
                 inline=False
             )
 

@@ -3,13 +3,24 @@ Database layer using aiosqlite.
 """
 
 import aiosqlite
+import json
 import logging
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from datetime import datetime
 
 from config import Config
-from models import Release, Artist, Track, WordPressPost, DiscordPrompt, ReleaseType, LifecycleStatus
+from models import (
+    Release,
+    Artist,
+    Track,
+    WordPressPost,
+    DiscordPrompt,
+    ReleaseType,
+    LifecycleStatus,
+    SavedLibraryAlbum,
+    SavedLibraryStats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +297,6 @@ class Database:
             FROM wordpress_post_cache
         """)
         rows = await cursor.fetchall()
-        import json
         
         return [WordPressPost(
             id=row[0],
@@ -300,7 +310,6 @@ class Database:
     async def save_wordpress_posts(self, posts: List[WordPressPost]):
         """Save WordPress posts cache."""
         await self.connection.execute("DELETE FROM wordpress_post_cache")
-        import json
         for post in posts:
             await self.connection.execute("""
                 INSERT INTO wordpress_post_cache
@@ -313,6 +322,173 @@ class Database:
             ))
 
         await self.connection.commit()
+
+    # Saved Spotify library operations
+    async def get_saved_library_album(self, spotify_id: str) -> Optional[SavedLibraryAlbum]:
+        """Get one saved Spotify library album by ID."""
+        cursor = await self.connection.execute("""
+            SELECT spotify_id, spotify_uri, spotify_url, title, normalized_title,
+                   artists_json, normalized_artists_json, album_type, release_type,
+                   cover_url, added_at, is_posted_listened, wordpress_post_id,
+                   created_at, updated_at
+            FROM saved_library_album
+            WHERE spotify_id = ?
+        """, (spotify_id,))
+        row = await cursor.fetchone()
+        return self._row_to_saved_library_album(row) if row else None
+
+    async def get_saved_library_album_ids(self) -> Set[str]:
+        """Get all stored saved-library Spotify album IDs."""
+        cursor = await self.connection.execute("SELECT spotify_id FROM saved_library_album")
+        rows = await cursor.fetchall()
+        return {row[0] for row in rows}
+
+    async def get_saved_library_albums_by_id(self) -> Dict[str, SavedLibraryAlbum]:
+        """Get all stored saved-library albums keyed by Spotify ID."""
+        cursor = await self.connection.execute("""
+            SELECT spotify_id, spotify_uri, spotify_url, title, normalized_title,
+                   artists_json, normalized_artists_json, album_type, release_type,
+                   cover_url, added_at, is_posted_listened, wordpress_post_id,
+                   created_at, updated_at
+            FROM saved_library_album
+        """)
+        rows = await cursor.fetchall()
+        albums = [self._row_to_saved_library_album(row) for row in rows]
+        return {album.spotify_id: album for album in albums}
+
+    async def upsert_saved_library_album(self, album: SavedLibraryAlbum):
+        """Insert or update a saved-library album."""
+        now = datetime.now()
+        created_at = album.created_at or now
+        updated_at = album.updated_at or now
+
+        await self.connection.execute("""
+            INSERT INTO saved_library_album
+            (spotify_id, spotify_uri, spotify_url, title, normalized_title,
+             artists_json, normalized_artists_json, album_type, release_type,
+             cover_url, added_at, is_posted_listened, wordpress_post_id,
+             created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(spotify_id) DO UPDATE SET
+                spotify_uri = excluded.spotify_uri,
+                spotify_url = excluded.spotify_url,
+                title = excluded.title,
+                normalized_title = excluded.normalized_title,
+                artists_json = excluded.artists_json,
+                normalized_artists_json = excluded.normalized_artists_json,
+                album_type = excluded.album_type,
+                release_type = excluded.release_type,
+                cover_url = excluded.cover_url,
+                added_at = excluded.added_at,
+                is_posted_listened = excluded.is_posted_listened,
+                wordpress_post_id = excluded.wordpress_post_id,
+                updated_at = excluded.updated_at
+        """, (
+            album.spotify_id,
+            album.spotify_uri,
+            album.spotify_url,
+            album.title,
+            album.normalized_title,
+            json.dumps(album.artists),
+            json.dumps(album.normalized_artists),
+            album.album_type,
+            album.release_type.value,
+            album.cover_url,
+            album.added_at.isoformat(),
+            album.is_posted_listened,
+            album.wordpress_post_id,
+            created_at.isoformat(),
+            updated_at.isoformat(),
+        ))
+        await self.connection.commit()
+
+    async def delete_saved_library_albums(self, spotify_ids: List[str]) -> int:
+        """Delete saved-library albums by Spotify ID."""
+        if not spotify_ids:
+            return 0
+
+        placeholders = ", ".join("?" for _ in spotify_ids)
+        cursor = await self.connection.execute(
+            f"DELETE FROM saved_library_album WHERE spotify_id IN ({placeholders})",
+            spotify_ids,
+        )
+        await self.connection.commit()
+        return cursor.rowcount
+
+    async def mark_saved_library_album_posted(
+        self,
+        spotify_id: str,
+        wordpress_post_id: Optional[int],
+    ) -> bool:
+        """Mark a saved-library album as posted/listened if it exists."""
+        cursor = await self.connection.execute("""
+            UPDATE saved_library_album
+            SET is_posted_listened = 1,
+                wordpress_post_id = ?,
+                updated_at = ?
+            WHERE spotify_id = ?
+        """, (wordpress_post_id, datetime.now().isoformat(), spotify_id))
+        await self.connection.commit()
+        return cursor.rowcount > 0
+
+    async def mark_saved_library_album_unposted(self, spotify_id: str) -> bool:
+        """Clear the posted/listened state for a saved-library album if it exists."""
+        cursor = await self.connection.execute("""
+            UPDATE saved_library_album
+            SET is_posted_listened = 0,
+                wordpress_post_id = NULL,
+                updated_at = ?
+            WHERE spotify_id = ?
+        """, (datetime.now().isoformat(), spotify_id))
+        await self.connection.commit()
+        return cursor.rowcount > 0
+
+    async def get_random_unposted_saved_library_album(self) -> Optional[SavedLibraryAlbum]:
+        """Return a random saved-library album that has not been posted/listened."""
+        cursor = await self.connection.execute("""
+            SELECT spotify_id, spotify_uri, spotify_url, title, normalized_title,
+                   artists_json, normalized_artists_json, album_type, release_type,
+                   cover_url, added_at, is_posted_listened, wordpress_post_id,
+                   created_at, updated_at
+            FROM saved_library_album
+            WHERE is_posted_listened = 0
+            ORDER BY RANDOM()
+            LIMIT 1
+        """)
+        row = await cursor.fetchone()
+        return self._row_to_saved_library_album(row) if row else None
+
+    async def get_saved_library_stats(self) -> SavedLibraryStats:
+        """Return total and posted/listened saved-library counts."""
+        cursor = await self.connection.execute("""
+            SELECT COUNT(*), COALESCE(SUM(CASE WHEN is_posted_listened THEN 1 ELSE 0 END), 0)
+            FROM saved_library_album
+        """)
+        row = await cursor.fetchone()
+        total = int(row[0] or 0)
+        posted_listened = int(row[1] or 0)
+        percent = (posted_listened / total) if total else 0.0
+        return SavedLibraryStats(total=total, posted_listened=posted_listened, percent=percent)
+
+    def _row_to_saved_library_album(self, row: tuple) -> SavedLibraryAlbum:
+        """Convert a saved-library database row to a model."""
+        return SavedLibraryAlbum(
+            spotify_id=row[0],
+            spotify_uri=row[1],
+            spotify_url=row[2],
+            title=row[3],
+            normalized_title=row[4],
+            artists=json.loads(row[5]),
+            normalized_artists=json.loads(row[6]),
+            album_type=row[7],
+            release_type=ReleaseType(row[8]),
+            cover_url=row[9],
+            added_at=datetime.fromisoformat(row[10]),
+            is_posted_listened=bool(row[11]),
+            wordpress_post_id=row[12],
+            created_at=datetime.fromisoformat(row[13]) if row[13] else None,
+            updated_at=datetime.fromisoformat(row[14]) if row[14] else None,
+        )
 
     # Discord operations
     async def save_discord_prompt(self, prompt: DiscordPrompt):

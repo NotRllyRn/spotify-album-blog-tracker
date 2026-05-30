@@ -31,6 +31,8 @@ from models import (
     LifecycleStatus,
     PlaybackState,
     WordPressPost,
+    SavedLibraryAlbum,
+    SavedLibraryStats,
     DiscordPrompt,
     PromptState,
     PromptType,
@@ -41,6 +43,19 @@ try:
     from tracker import Tracker
 except ModuleNotFoundError:
     Tracker = None
+
+try:
+    from saved_library import (
+        SAVED_LIBRARY_FIRST_PAGE_HASH_KEY,
+        SAVED_LIBRARY_LAST_SYNCED_AT_KEY,
+        SAVED_LIBRARY_TOTAL_KEY,
+        SavedLibraryService,
+    )
+except ModuleNotFoundError:
+    SavedLibraryService = None
+    SAVED_LIBRARY_FIRST_PAGE_HASH_KEY = None
+    SAVED_LIBRARY_LAST_SYNCED_AT_KEY = None
+    SAVED_LIBRARY_TOTAL_KEY = None
 
 try:
     from discord_bot import DiscordBot, CurrentPlaybackActionView, CurrentPostContext, PublishedPostActionView, RelistenApprovalPromptView
@@ -415,6 +430,210 @@ class TestNextTrackSelection(unittest.TestCase):
         self.assertIsNone(get_next_unlistened_track(release))
 
 
+@unittest.skipIf(SavedLibraryService is None, "saved library dependencies are not installed")
+class TestSavedLibraryService(unittest.IsolatedAsyncioTestCase):
+    """Test saved Spotify library synchronization."""
+
+    def make_track(self, track_id="track_1", duration_ms=300000):
+        return {"id": track_id, "name": track_id, "duration_ms": duration_ms}
+
+    def make_saved_item(
+        self,
+        album_id,
+        title="Album Title",
+        added_at="2024-01-01T00:00:00Z",
+        album_type="album",
+        total_tracks=8,
+        tracks=None,
+    ):
+        tracks = tracks if tracks is not None else [
+            self.make_track(f"{album_id}_track_{index}")
+            for index in range(min(total_tracks, 20))
+        ]
+        return {
+            "added_at": added_at,
+            "album": {
+                "id": album_id,
+                "uri": f"spotify:album:{album_id}",
+                "name": title,
+                "album_type": album_type,
+                "total_tracks": total_tracks,
+                "tracks": {"items": tracks},
+                "artists": [{"name": "Artist"}],
+                "images": [{"url": f"https://example.com/{album_id}.jpg"}],
+                "external_urls": {"spotify": f"https://open.spotify.com/album/{album_id}"},
+            }
+        }
+
+    def make_album_model(self, album_id):
+        return SavedLibraryAlbum(
+            spotify_id=album_id,
+            spotify_uri=f"spotify:album:{album_id}",
+            spotify_url=f"https://open.spotify.com/album/{album_id}",
+            title="Old Album",
+            normalized_title="old album",
+            artists=["Artist"],
+            normalized_artists=["artist"],
+            album_type="album",
+            release_type=ReleaseType.ALBUM,
+            cover_url="https://example.com/old.jpg",
+            added_at=datetime(2024, 1, 1),
+        )
+
+    async def test_matching_total_and_hash_skips_full_sync(self):
+        first_page = {
+            "total": 1,
+            "items": [self.make_saved_item("album_1")],
+            "next": "https://api.spotify.com/v1/me/albums?offset=50&limit=50",
+        }
+        service = SavedLibraryService.__new__(SavedLibraryService)
+        service.spotify = type(
+            "FakeSpotify",
+            (),
+            {"get_saved_albums_page": AsyncMock(return_value=first_page)}
+        )()
+        first_page_hash = service.compute_first_page_hash(first_page)
+
+        class FakeDatabase:
+            async def get_service_state(self, key):
+                return {
+                    SAVED_LIBRARY_TOTAL_KEY: "1",
+                    SAVED_LIBRARY_FIRST_PAGE_HASH_KEY: first_page_hash,
+                }.get(key)
+
+            async def get_saved_library_stats(self):
+                return SavedLibraryStats(total=1, posted_listened=0, percent=0.0)
+
+            async def get_saved_library_albums_by_id(self):
+                raise AssertionError("Full sync should be skipped")
+
+        service.db = FakeDatabase()
+
+        result = await service.sync()
+
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.stored_total, 1)
+        service.spotify.get_saved_albums_page.assert_awaited_once()
+
+    async def test_full_sync_reconciles_album_ep_entries_and_wordpress_posts(self):
+        first_page = {
+            "total": 2,
+            "items": [
+                self.make_saved_item("album_1", "Album Title"),
+                self.make_saved_item("single_1", "Single Title", album_type="single"),
+            ],
+            "next": None,
+        }
+        saved_albums = {}
+        deleted = []
+        saved_state = {}
+
+        class FakeSpotify:
+            async def get_saved_albums_page(self, limit=50, offset=0, url=None):
+                return first_page
+
+            async def get_all_saved_albums(self, first_page=None):
+                return list(first_page["items"])
+
+            async def get_album_tracks(self, album_id):
+                raise AssertionError("Complete saved album payloads should not fetch tracks")
+
+        class FakeDatabase:
+            async def get_service_state(self, key):
+                return None
+
+            async def get_saved_library_albums_by_id(self):
+                return {
+                    "removed_album": self_album
+                }
+
+            async def get_wordpress_posts(self):
+                return [
+                    WordPressPost(
+                        id=123,
+                        title="Album Title",
+                        normalized_title="album title",
+                        artists=["Artist"],
+                        normalized_artists=["artist"],
+                        link="https://example.com/album-title",
+                    )
+                ]
+
+            async def delete_saved_library_albums(self, spotify_ids):
+                deleted.extend(spotify_ids)
+                return len(spotify_ids)
+
+            async def upsert_saved_library_album(self, album):
+                saved_albums[album.spotify_id] = album
+
+            async def save_service_state(self, key, value):
+                saved_state[key] = value
+
+        self_album = self.make_album_model("removed_album")
+        service = SavedLibraryService(FakeDatabase(), FakeSpotify())
+
+        result = await service.sync()
+
+        self.assertFalse(result.skipped)
+        self.assertEqual(set(saved_albums), {"album_1"})
+        self.assertTrue(saved_albums["album_1"].is_posted_listened)
+        self.assertEqual(saved_albums["album_1"].wordpress_post_id, 123)
+        self.assertEqual(deleted, ["removed_album"])
+        self.assertEqual(saved_state[SAVED_LIBRARY_TOTAL_KEY], "2")
+        self.assertIn(SAVED_LIBRARY_FIRST_PAGE_HASH_KEY, saved_state)
+        self.assertIn(SAVED_LIBRARY_LAST_SYNCED_AT_KEY, saved_state)
+
+    async def test_low_track_count_album_uses_embedded_tracks_for_ep_classification(self):
+        item = self.make_saved_item(
+            "album_ep",
+            total_tracks=5,
+            tracks=[
+                self.make_track("track_1", 180000),
+                self.make_track("track_2", 180000),
+                self.make_track("track_3", 180000),
+                self.make_track("track_4", 180000),
+                self.make_track("track_5", 180000),
+            ],
+        )
+        spotify = type(
+            "FakeSpotify",
+            (),
+            {"get_album_tracks": AsyncMock(side_effect=AssertionError("Embedded tracks should be enough"))}
+        )()
+        service = SavedLibraryService(db=None, spotify=spotify)
+
+        release_type = await service._get_release_type(item, existing_by_id={})
+
+        self.assertEqual(release_type, ReleaseType.EP)
+        spotify.get_album_tracks.assert_not_awaited()
+
+    async def test_incomplete_embedded_tracks_falls_back_to_album_tracks_endpoint(self):
+        item = self.make_saved_item(
+            "album_sparse",
+            total_tracks=5,
+            tracks=[self.make_track("track_1", 180000)],
+        )
+        spotify = type(
+            "FakeSpotify",
+            (),
+            {
+                "get_album_tracks": AsyncMock(return_value=[
+                    self.make_track("track_1", 180000),
+                    self.make_track("track_2", 180000),
+                    self.make_track("track_3", 180000),
+                    self.make_track("track_4", 180000),
+                    self.make_track("track_5", 180000),
+                ])
+            }
+        )()
+        service = SavedLibraryService(db=None, spotify=spotify)
+
+        release_type = await service._get_release_type(item, existing_by_id={})
+
+        self.assertEqual(release_type, ReleaseType.EP)
+        spotify.get_album_tracks.assert_awaited_once_with("album_sparse")
+
+
 @unittest.skipIf(DiscordBot is None, "discord bot dependencies are not installed")
 class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
     """Test embed formatting for Discord bot views."""
@@ -556,6 +775,29 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(labels, ["Yes, track as relisten"])
 
+    def test_random_album_embed_uses_cached_cover_and_spotify_link(self):
+        album = SavedLibraryAlbum(
+            spotify_id="album_random",
+            spotify_uri="spotify:album:album_random",
+            spotify_url="https://open.spotify.com/album/album_random",
+            title="Random Album",
+            normalized_title="random album",
+            artists=["Artist"],
+            normalized_artists=["artist"],
+            album_type="album",
+            release_type=ReleaseType.ALBUM,
+            cover_url="https://example.com/random.jpg",
+            added_at=datetime(2024, 1, 1, 12, 0, 0),
+        )
+
+        embed = self.bot._build_random_album_embed(album)
+        field_map = {field.name: field.value for field in embed.fields}
+
+        self.assertEqual(embed.title, "Random Album")
+        self.assertEqual(embed.url, "https://open.spotify.com/album/album_random")
+        self.assertEqual(embed.thumbnail.url, "https://example.com/random.jpg")
+        self.assertEqual(field_map["Release type"], "Album")
+
     async def test_add_content_action_opens_modal_without_completing_prompt(self):
         release = make_release_for_test("album_modal", "Album Modal", datetime(2024, 1, 1, 12, 0, 0))
         release.wordpress_post_id = 654
@@ -689,6 +931,7 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         db = type("FakeDatabase", (), {})()
         db.update_discord_prompt_state = AsyncMock()
         db.delete_release = AsyncMock(return_value=True)
+        db.mark_saved_library_album_unposted = AsyncMock(return_value=True)
         publisher = type("FakePublisher", (), {})()
         publisher.trash_post = AsyncMock(return_value=True)
         self.bot.db = db
@@ -699,6 +942,7 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         db.update_discord_prompt_state.assert_awaited_once_with("message_1", PromptState.ACCEPTED.value)
         publisher.trash_post.assert_awaited_once_with(321)
+        db.mark_saved_library_album_unposted.assert_awaited_once_with(release.spotify_id)
         db.delete_release.assert_awaited_once_with(release.spotify_id)
         interaction.followup.send.assert_awaited_once_with(
             "✅ The post has been moved to trash and removed from the tracking database.",
@@ -1070,6 +1314,9 @@ class TestTrackerPublishNow(unittest.IsolatedAsyncioTestCase):
             async def save_release(self, release_to_save):
                 saved_statuses.append((release_to_save.status, release_to_save.published_at))
 
+            async def mark_saved_library_album_posted(self, spotify_id, wordpress_post_id):
+                self.marked_posted = (spotify_id, wordpress_post_id)
+
             async def log_audit_event(self, event_type, payload):
                 audit_events.append((event_type, payload))
 
@@ -1079,7 +1326,8 @@ class TestTrackerPublishNow(unittest.IsolatedAsyncioTestCase):
                 return {"id": 456}
 
         tracker = Tracker.__new__(Tracker)
-        tracker.db = FakeDatabase()
+        db = FakeDatabase()
+        tracker.db = db
         tracker.publisher = FakePublisher()
         tracker.discord_bot = None
 
@@ -1088,6 +1336,7 @@ class TestTrackerPublishNow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved_statuses[0][0], LifecycleStatus.PUBLISHING)
         self.assertEqual(saved_statuses[1][0], LifecycleStatus.PUBLISHED_RECENTLY)
         self.assertIsNotNone(saved_statuses[1][1])
+        self.assertEqual(db.marked_posted, (release.spotify_id, 456))
         self.assertEqual(audit_events[0][0], "release_published")
 
     async def test_cleanup_published_releases_uses_24_hour_cutoff_and_audits(self):
@@ -1170,6 +1419,51 @@ class TestTrackerPublishNow(unittest.IsolatedAsyncioTestCase):
         deleted = await tracker._delete_published_release_if_expired(release, now)
 
         self.assertFalse(deleted)
+
+    async def test_publish_warns_when_album_is_not_saved_in_library(self):
+        release = make_release_for_test("album_missing", "Album Missing", datetime(2024, 1, 1, 12, 0, 0))
+
+        class FakeDatabase:
+            async def save_release(self, release_to_save):
+                return None
+
+            async def mark_saved_library_album_posted(self, spotify_id, wordpress_post_id):
+                return False
+
+            async def log_audit_event(self, event_type, payload):
+                return None
+
+        class FakePublisher:
+            async def publish_release(self, release_to_publish, as_relisten=False):
+                release_to_publish.wordpress_post_id = 789
+                return {"id": 789}
+
+        class FakeSpotify:
+            async def check_library_contains_album(self, spotify_id):
+                return False
+
+        class FakeDiscordBot:
+            def __init__(self):
+                self.published = None
+                self.missing = None
+
+            async def send_publish_notification(self, release_to_send, post):
+                self.published = (release_to_send, post)
+
+            async def send_library_missing_notification(self, release_to_send):
+                self.missing = release_to_send
+
+        discord_bot = FakeDiscordBot()
+        tracker = Tracker.__new__(Tracker)
+        tracker.db = FakeDatabase()
+        tracker.publisher = FakePublisher()
+        tracker.spotify = FakeSpotify()
+        tracker.discord_bot = discord_bot
+
+        await tracker._publish_release(release)
+
+        self.assertIs(discord_bot.missing, release)
+        self.assertEqual(discord_bot.published[1]["id"], 789)
 
 
 @unittest.skipIf(Tracker is None, "tracker dependencies are not installed")

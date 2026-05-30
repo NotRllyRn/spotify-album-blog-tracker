@@ -489,9 +489,11 @@ class Tracker:
             release.status = LifecycleStatus.PUBLISHED_RECENTLY
             release.published_at = datetime.now()
             await self.db.save_release(release)
+            await self.db.mark_saved_library_album_posted(release.spotify_id, post.get("id"))
 
             if self.discord_bot:
                 await self.discord_bot.send_publish_notification(release, post)
+                await self._warn_if_published_album_not_saved(release)
 
             await self.db.log_audit_event("release_published", {
                 "spotify_id": release.spotify_id,
@@ -505,6 +507,17 @@ class Tracker:
             release.status = LifecycleStatus.ACTIVE  # Reset status on failure
             await self.db.save_release(release)
             raise
+
+    async def _warn_if_published_album_not_saved(self, release: Release):
+        """Warn through Discord when a published album is not saved in Spotify library."""
+        try:
+            is_saved = await self.spotify.check_library_contains_album(release.spotify_id)
+        except Exception as e:
+            logger.error(f"Error checking saved-library state for {release.spotify_id}: {e}")
+            return
+
+        if not is_saved and self.discord_bot:
+            await self.discord_bot.send_library_missing_notification(release)
 
     async def _cleanup_published_releases_if_due(self, now: Optional[datetime] = None):
         """Run post-publish retention cleanup at a bounded interval."""

@@ -56,7 +56,7 @@ class SpotifyClient:
             'redirect_uri': self.redirect_uri,
             'code_challenge_method': 'S256',
             'code_challenge': code_challenge,
-            'scope': 'user-read-playback-state user-read-recently-played'
+            'scope': 'user-read-playback-state user-read-recently-played user-library-read'
         })
 
         logger.info("Opening browser for Spotify authorization...")
@@ -197,3 +197,50 @@ class SpotifyClient:
         response = await self.client.get(f"/me/player/recently-played?limit={limit}")
         response.raise_for_status()
         return response.json()["items"]
+
+    async def get_saved_albums_page(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get one page of the current user's saved albums."""
+        await self._ensure_token()
+
+        if url:
+            response = await self.client.get(url)
+        else:
+            response = await self.client.get(
+                "/me/albums",
+                params={"limit": min(limit, 50), "offset": offset}
+            )
+        response.raise_for_status()
+        return response.json()
+
+    async def get_all_saved_albums(self, first_page: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Get all saved album items, following Spotify paging links."""
+        await self._ensure_token()
+
+        page = first_page or await self.get_saved_albums_page(limit=50, offset=0)
+        items = list(page.get("items", []))
+        url = page.get("next")
+
+        while url:
+            page = await self.get_saved_albums_page(url=url)
+            items.extend(page.get("items", []))
+            url = page.get("next")
+
+        return items
+
+    async def check_library_contains_album(self, album_id_or_uri: str) -> bool:
+        """Return whether an album URI is saved in the current user's library."""
+        await self._ensure_token()
+
+        album_uri = album_id_or_uri
+        if not album_uri.startswith("spotify:album:"):
+            album_uri = f"spotify:album:{album_id_or_uri}"
+
+        response = await self.client.get("/me/library/contains", params={"uris": album_uri})
+        response.raise_for_status()
+        results = response.json()
+        return bool(results[0]) if results else False

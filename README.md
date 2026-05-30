@@ -9,6 +9,7 @@ The service is fully implemented and tested. It successfully:
 - ✅ Classifies releases (Album/EP/Single/Compilation)
 - ✅ Publishes to WordPress with artwork and metadata
 - ✅ Prevents duplicate posts
+- ✅ Tracks saved Spotify library Albums/EPs as a listen-to list
 - ✅ Provides Discord bot control
 - ✅ Persists state in SQLite database
 
@@ -73,6 +74,7 @@ DISCORD_USER_ID=your_user_id
 
 - `/inprogress` - Show currently tracked releases
 - `/current` - Show current playback status
+- `/random` - Pick a random unposted album from your saved Spotify library
 - `/service` - Show service status
 
 ## WordPress Setup
@@ -97,6 +99,7 @@ DISCORD_USER_ID=your_user_id
 
 - `/inprogress`: View active releases
 - `/current`: Show current playback and manual publish
+- `/random`: Pick a random unposted saved-library album
 - `/service`: Service status
 
 ## License
