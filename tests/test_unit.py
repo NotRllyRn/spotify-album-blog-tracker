@@ -32,6 +32,7 @@ from models import (
     PlaybackState,
     WordPressPost,
     SavedLibraryAlbum,
+    SavedLibrarySnapshotItem,
     SavedLibraryStats,
     DiscordPrompt,
     PromptState,
@@ -47,6 +48,7 @@ except ModuleNotFoundError:
 try:
     from saved_library import (
         SAVED_LIBRARY_FIRST_PAGE_HASH_KEY,
+        SAVED_LIBRARY_LAST_FULL_AUDIT_AT_KEY,
         SAVED_LIBRARY_LAST_SYNCED_AT_KEY,
         SAVED_LIBRARY_TOTAL_KEY,
         SavedLibraryService,
@@ -54,6 +56,7 @@ try:
 except ModuleNotFoundError:
     SavedLibraryService = None
     SAVED_LIBRARY_FIRST_PAGE_HASH_KEY = None
+    SAVED_LIBRARY_LAST_FULL_AUDIT_AT_KEY = None
     SAVED_LIBRARY_LAST_SYNCED_AT_KEY = None
     SAVED_LIBRARY_TOTAL_KEY = None
 
@@ -480,6 +483,15 @@ class TestSavedLibraryService(unittest.IsolatedAsyncioTestCase):
             added_at=datetime(2024, 1, 1),
         )
 
+    def make_snapshot_item(self, album_id, position=0):
+        return SavedLibrarySnapshotItem(
+            spotify_id=album_id,
+            spotify_uri=f"spotify:album:{album_id}",
+            added_at=datetime(2024, 1, 1),
+            position=position,
+            last_seen_at=datetime(2024, 1, 1),
+        )
+
     async def test_matching_total_and_hash_skips_full_sync(self):
         first_page = {
             "total": 1,
@@ -499,7 +511,11 @@ class TestSavedLibraryService(unittest.IsolatedAsyncioTestCase):
                 return {
                     SAVED_LIBRARY_TOTAL_KEY: "1",
                     SAVED_LIBRARY_FIRST_PAGE_HASH_KEY: first_page_hash,
+                    SAVED_LIBRARY_LAST_FULL_AUDIT_AT_KEY: datetime.now().isoformat(),
                 }.get(key)
+
+            async def get_saved_library_snapshot_items(self):
+                return [self_outer.make_snapshot_item("album_1")]
 
             async def get_saved_library_stats(self):
                 return SavedLibraryStats(total=1, posted_listened=0, percent=0.0)
@@ -507,6 +523,7 @@ class TestSavedLibraryService(unittest.IsolatedAsyncioTestCase):
             async def get_saved_library_albums_by_id(self):
                 raise AssertionError("Full sync should be skipped")
 
+        self_outer = self
         service.db = FakeDatabase()
 
         result = await service.sync()
@@ -542,6 +559,9 @@ class TestSavedLibraryService(unittest.IsolatedAsyncioTestCase):
             async def get_service_state(self, key):
                 return None
 
+            async def get_saved_library_snapshot_items(self):
+                return []
+
             async def get_saved_library_albums_by_id(self):
                 return {
                     "removed_album": self_album
@@ -566,6 +586,9 @@ class TestSavedLibraryService(unittest.IsolatedAsyncioTestCase):
             async def upsert_saved_library_album(self, album):
                 saved_albums[album.spotify_id] = album
 
+            async def replace_saved_library_snapshot(self, items):
+                saved_state["snapshot_ids"] = [item.spotify_id for item in items]
+
             async def save_service_state(self, key, value):
                 saved_state[key] = value
 
@@ -579,9 +602,162 @@ class TestSavedLibraryService(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(saved_albums["album_1"].is_posted_listened)
         self.assertEqual(saved_albums["album_1"].wordpress_post_id, 123)
         self.assertEqual(deleted, ["removed_album"])
+        self.assertEqual(saved_state["snapshot_ids"], ["album_1", "single_1"])
         self.assertEqual(saved_state[SAVED_LIBRARY_TOTAL_KEY], "2")
         self.assertIn(SAVED_LIBRARY_FIRST_PAGE_HASH_KEY, saved_state)
         self.assertIn(SAVED_LIBRARY_LAST_SYNCED_AT_KEY, saved_state)
+        self.assertIn(SAVED_LIBRARY_LAST_FULL_AUDIT_AT_KEY, saved_state)
+
+    async def test_incremental_sync_adds_head_items_without_full_scan(self):
+        first_page = {
+            "total": 2,
+            "items": [
+                self.make_saved_item("album_new", "New Album"),
+                self.make_saved_item("album_old", "Old Album"),
+            ],
+            "next": None,
+        }
+        old_page = {
+            "total": 1,
+            "items": [self.make_saved_item("album_old", "Old Album")],
+            "next": None,
+        }
+        service_for_hash = SavedLibraryService.__new__(SavedLibraryService)
+        first_page_hash = service_for_hash.compute_first_page_hash(first_page)
+        saved_state = {}
+        saved_albums = {}
+
+        class FakeSpotify:
+            def __init__(self):
+                self.get_saved_albums_page = AsyncMock(return_value=first_page)
+
+            async def get_all_saved_albums(self, first_page=None):
+                raise AssertionError("Incremental addition should not fetch every saved-library page")
+
+            async def get_album_tracks(self, album_id):
+                raise AssertionError("Complete saved album payloads should not fetch tracks")
+
+        class FakeDatabase:
+            async def get_service_state(self, key):
+                return {
+                    SAVED_LIBRARY_TOTAL_KEY: "1",
+                    SAVED_LIBRARY_FIRST_PAGE_HASH_KEY: service_for_hash.compute_first_page_hash(old_page),
+                    SAVED_LIBRARY_LAST_FULL_AUDIT_AT_KEY: datetime.now().isoformat(),
+                }.get(key)
+
+            async def get_saved_library_snapshot_items(self):
+                return [self_outer.make_snapshot_item("album_old", 0)]
+
+            async def get_saved_library_albums_by_id(self):
+                return {"album_old": self_outer.make_album_model("album_old")}
+
+            async def get_wordpress_posts(self):
+                return []
+
+            async def delete_saved_library_albums(self, spotify_ids):
+                self_outer.assertEqual(spotify_ids, [])
+                return 0
+
+            async def upsert_saved_library_album(self, album):
+                saved_albums[album.spotify_id] = album
+
+            async def replace_saved_library_snapshot(self, items):
+                saved_state["snapshot_ids"] = [item.spotify_id for item in items]
+
+            async def save_service_state(self, key, value):
+                saved_state[key] = value
+
+            async def get_saved_library_stats(self):
+                return SavedLibraryStats(total=2, posted_listened=0, percent=0.0)
+
+        self_outer = self
+        spotify = FakeSpotify()
+        service = SavedLibraryService(FakeDatabase(), spotify)
+
+        result = await service.sync()
+
+        self.assertFalse(result.skipped)
+        self.assertEqual(set(saved_albums), {"album_new"})
+        self.assertEqual(saved_state["snapshot_ids"], ["album_new", "album_old"])
+        self.assertEqual(saved_state[SAVED_LIBRARY_TOTAL_KEY], "2")
+        self.assertNotIn(SAVED_LIBRARY_LAST_FULL_AUDIT_AT_KEY, saved_state)
+        spotify.get_saved_albums_page.assert_awaited_once()
+
+    async def test_incremental_sync_removes_sparse_items_without_full_scan(self):
+        first_page = {
+            "total": 2,
+            "items": [
+                self.make_saved_item("album_1", "Album 1"),
+                self.make_saved_item("album_3", "Album 3"),
+            ],
+            "next": None,
+        }
+        old_page = {
+            "total": 3,
+            "items": [
+                self.make_saved_item("album_1", "Album 1"),
+                self.make_saved_item("album_2", "Album 2"),
+                self.make_saved_item("album_3", "Album 3"),
+            ],
+            "next": None,
+        }
+        service_for_hash = SavedLibraryService.__new__(SavedLibraryService)
+        saved_state = {}
+        deleted = []
+
+        class FakeSpotify:
+            def __init__(self):
+                self.get_saved_albums_page = AsyncMock(return_value=first_page)
+
+            async def get_all_saved_albums(self, first_page=None):
+                raise AssertionError("Incremental removal should not fetch every saved-library page")
+
+        class FakeDatabase:
+            async def get_service_state(self, key):
+                return {
+                    SAVED_LIBRARY_TOTAL_KEY: "3",
+                    SAVED_LIBRARY_FIRST_PAGE_HASH_KEY: service_for_hash.compute_first_page_hash(old_page),
+                    SAVED_LIBRARY_LAST_FULL_AUDIT_AT_KEY: datetime.now().isoformat(),
+                }.get(key)
+
+            async def get_saved_library_snapshot_items(self):
+                return [
+                    self_outer.make_snapshot_item("album_1", 0),
+                    self_outer.make_snapshot_item("album_2", 1),
+                    self_outer.make_snapshot_item("album_3", 2),
+                ]
+
+            async def get_saved_library_albums_by_id(self):
+                return {
+                    "album_1": self_outer.make_album_model("album_1"),
+                    "album_2": self_outer.make_album_model("album_2"),
+                    "album_3": self_outer.make_album_model("album_3"),
+                }
+
+            async def delete_saved_library_albums(self, spotify_ids):
+                deleted.extend(spotify_ids)
+                return len(spotify_ids)
+
+            async def replace_saved_library_snapshot(self, items):
+                saved_state["snapshot_ids"] = [item.spotify_id for item in items]
+
+            async def save_service_state(self, key, value):
+                saved_state[key] = value
+
+            async def get_saved_library_stats(self):
+                return SavedLibraryStats(total=2, posted_listened=0, percent=0.0)
+
+        self_outer = self
+        spotify = FakeSpotify()
+        service = SavedLibraryService(FakeDatabase(), spotify)
+
+        result = await service.sync()
+
+        self.assertFalse(result.skipped)
+        self.assertEqual(deleted, ["album_2"])
+        self.assertEqual(saved_state["snapshot_ids"], ["album_1", "album_3"])
+        self.assertEqual(saved_state[SAVED_LIBRARY_TOTAL_KEY], "2")
+        spotify.get_saved_albums_page.assert_awaited_once()
 
     async def test_low_track_count_album_uses_embedded_tracks_for_ep_classification(self):
         item = self.make_saved_item(

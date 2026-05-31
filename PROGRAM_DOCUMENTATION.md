@@ -28,7 +28,7 @@ The program is built around one recurring question: "Is the user currently liste
 The service ties together four systems:
 
 - Spotify: source of playback state, album metadata, track lists, saved-library data, and artwork URLs.
-- SQLite: local durable state for releases, tracks, saved-library albums, WordPress post cache, prompts, audit events, and service state.
+- SQLite: local durable state for releases, tracks, saved-library albums and snapshots, WordPress post cache, prompts, audit events, and service state.
 - WordPress: destination for published album posts, categories, tags, and uploaded artwork.
 - Discord: control plane for the operator through slash commands, DMs, buttons, and modals.
 
@@ -337,6 +337,20 @@ SavedLibraryAlbum(
 
 `SavedLibraryStats` contains total saved-library rows, posted/listened rows, and the posted/listened percentage. `SavedLibrarySyncResult` summarizes one saved-library synchronization run.
 
+`SavedLibrarySnapshotItem` stores one lightweight identity row from the complete Spotify saved library:
+
+```python
+SavedLibrarySnapshotItem(
+    spotify_id="album-id",
+    spotify_uri="spotify:album:album-id",
+    added_at=datetime.now(),
+    position=0,
+    last_seen_at=datetime.now(),
+)
+```
+
+The snapshot model intentionally does not duplicate album title, artists, cover art, or posted/listened state. Those richer fields live in `SavedLibraryAlbum` only when the saved item qualifies for the listen-to list.
+
 `DiscordPrompt` stores prompt state for persistent button handling:
 
 ```python
@@ -395,6 +409,13 @@ Current code keeps a published release only in `PUBLISHED_RECENTLY` for a short 
 - indexes for posted/listened filtering and saved date ordering
 
 This table mirrors the current Spotify saved library for items the app treats as Albums or EPs.
+
+`005_saved_library_snapshot.sql` adds:
+
+- `saved_library_snapshot_item`
+- indexes for saved-library order and saved date lookup
+
+This table is a complete ordered identity snapshot of the current Spotify saved library. It exists so saved-library sync can reconcile common additions and removals without requesting every `/me/albums` page.
 
 ### Tables
 
@@ -490,6 +511,16 @@ This table caches published WordPress posts and artist tags for duplicate detect
 
 This table is the listen-to list. It is kept as an exact mirror of current Spotify saved Albums and EPs, so albums removed from Spotify are deleted locally. `is_posted_listened` is the canonical completion flag and means the album has a matching published WordPress post.
 
+`saved_library_snapshot_item`:
+
+- `spotify_id TEXT PRIMARY KEY`
+- `spotify_uri TEXT NOT NULL`
+- `added_at TEXT NOT NULL`
+- `position INTEGER NOT NULL`
+- `last_seen_at TEXT NOT NULL`
+
+This table stores the complete Spotify saved-library order for all saved albums, including items that are excluded from `saved_library_album`. It contains only identity and ordering metadata so incremental sync can detect additions and sparse removals with far fewer Spotify requests.
+
 `discord_prompt`:
 
 - `id INTEGER PRIMARY KEY AUTOINCREMENT`
@@ -525,6 +556,7 @@ Saved-library sync stores validation state under:
 - `spotify_saved_library.total`
 - `spotify_saved_library.first_page_hash`
 - `spotify_saved_library.last_synced_at`
+- `spotify_saved_library.last_full_audit_at`
 
 ### Relationships And Retention
 
@@ -792,7 +824,17 @@ The sync stores two validation values in `service_state`:
 - `spotify_saved_library.total`: the Spotify endpoint's `total` value.
 - `spotify_saved_library.first_page_hash`: a stable SHA-256 hash of first-page album IDs plus `added_at` values.
 
-If both match the previous run, the sync stops without fetching later pages. If either value differs, the sync follows every `next` link and reconciles the full local table.
+The sync also stores a complete lightweight ordered identity snapshot in `saved_library_snapshot_item`. That snapshot includes all saved Spotify albums returned by `/me/albums`, including singles and compilations that are not eligible for the listen-to list. The richer `saved_library_album` table remains limited to Albums and EPs.
+
+If both validation values match the previous run, the sync stops without fetching later pages. If either value differs, the sync first tries an incremental reconciliation against the local snapshot:
+
+- Head additions: fetch only enough head pages to find an existing snapshot item, then prepend the new Spotify items locally.
+- Sparse removals: binary-search changed saved-album pages to identify removed IDs without walking every page.
+- Mixed head additions plus removals: apply the detected head additions, then use the sparse-removal probe path.
+
+The incremental path falls back to a full scan when the change is ambiguous, when more than 10 removals would need probing, when no nearby snapshot boundary can be found within 10 head pages, when validation state is missing, when the snapshot count does not match the last saved Spotify total, when the snapshot table is missing/empty for a non-empty library, or when the weekly full audit is due.
+
+Full scans still follow every `next` link and reconcile all local state. They also refresh `spotify_saved_library.last_full_audit_at`.
 
 ### Reconciliation Rules
 
@@ -809,7 +851,7 @@ Existing WordPress posts are matched using the same duplicate-detection shape as
 
 Matching entries are marked `is_posted_listened=True` and store `wordpress_post_id`. Non-matching entries remain eligible for `/random`.
 
-If an album disappears from the current Spotify saved-library response, its `saved_library_album` row is deleted even if it was previously posted.
+If an album disappears from the current Spotify saved-library response, its snapshot row is removed. Its `saved_library_album` row is also deleted when one exists, even if it was previously posted.
 
 ## Tracker Loop And Core Logic
 
@@ -1627,6 +1669,14 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 - Returns saved-library rows keyed by Spotify ID.
 
+`get_saved_library_snapshot_items(self)`:
+
+- Returns the complete saved-library identity snapshot ordered by Spotify saved-library position.
+
+`replace_saved_library_snapshot(self, items)`:
+
+- Replaces the full saved-library identity snapshot in one database transaction.
+
 `upsert_saved_library_album(self, album)`:
 
 - Inserts or updates one saved-library row.
@@ -1761,11 +1811,47 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 `sync(self, force=False)`:
 
-- Fetches the first saved-albums page, validates total and first-page hash, and either skips or reconciles the full saved-library table.
+- Fetches the first saved-albums page, validates total and first-page hash, and either skips, performs an incremental snapshot reconciliation, or falls back to a full saved-library scan.
 
 `compute_first_page_hash(self, page)`:
 
 - Hashes stable first-page album IDs plus `added_at` values.
+
+`_run_full_reconcile(self, first_page, current_total, first_page_hash, reason)`:
+
+- Follows all saved-album pages, rebuilds `saved_library_snapshot_item`, reconciles `saved_library_album`, and refreshes full-audit service state.
+
+`_run_incremental_reconcile(self, first_page, current_total, first_page_hash, snapshot_items, existing_by_id)`:
+
+- Handles common changed-library cases without full pagination: head additions, sparse removals, and simple mixed head additions/removals.
+
+`_apply_incremental_changes(self, current_total, first_page_hash, addition_items, removed_ids, new_order, old_by_id, existing_by_id, reason)`:
+
+- Persists an incremental reconciliation by deleting removed listen-to rows, upserting newly included Albums/EPs, replacing the snapshot, and saving validation state.
+
+`_fetch_head_until_known_album(self, first_page, old_by_id, current_total, page_cache)`:
+
+- Reads head pages until a previously known Spotify album ID appears, capped by `SAVED_LIBRARY_MAX_INCREMENTAL_HEAD_PAGES`.
+
+`_remove_missing_ids_with_probes(self, candidate_order, current_total, removals_needed, page_cache)`:
+
+- Finds removed IDs through repeated page probes instead of walking every saved-library page.
+
+`_find_first_missing_id(self, local_order, current_total, page_cache)`:
+
+- Binary-searches Spotify pages to find the first local snapshot ID missing from the current saved-library order.
+
+`_rebuild_snapshot_items(self, new_order, old_by_id, addition_items)`:
+
+- Combines new saved-album response items with preserved existing snapshot metadata and assigns fresh positions.
+
+`_build_snapshot_item(self, item, position)`:
+
+- Converts one Spotify saved-album item into a lightweight `SavedLibrarySnapshotItem`.
+
+`_parse_state_int(self, value)`:
+
+- Parses integer service-state values for validation checks.
 
 `_build_saved_album(self, item, existing_by_id, wordpress_posts)`:
 
@@ -2386,6 +2472,7 @@ Classes:
 - `PlaybackState`
 - `WordPressPost`
 - `SavedLibraryAlbum`
+- `SavedLibrarySnapshotItem`
 - `SavedLibraryStats`
 - `SavedLibrarySyncResult`
 - `DiscordPrompt`
@@ -2488,6 +2575,7 @@ PYTHONPATH=src python3 -m unittest -v
 
 - Verifies matching total and first-page hash skips full sync.
 - Verifies full sync filters to Album/EP entries, matches WordPress posts, saves state, and deletes removed albums.
+- Verifies incremental head additions and sparse removals avoid full saved-library pagination.
 - Verifies saved-library release typing uses embedded `/me/albums` track data and only falls back to full track fetches for incomplete low-track-count payloads.
 
 `TestDiscordBotEmbeds`:

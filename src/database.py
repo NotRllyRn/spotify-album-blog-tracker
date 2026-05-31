@@ -19,6 +19,7 @@ from models import (
     ReleaseType,
     LifecycleStatus,
     SavedLibraryAlbum,
+    SavedLibrarySnapshotItem,
     SavedLibraryStats,
 )
 
@@ -355,6 +356,42 @@ class Database:
         rows = await cursor.fetchall()
         albums = [self._row_to_saved_library_album(row) for row in rows]
         return {album.spotify_id: album for album in albums}
+
+    async def get_saved_library_snapshot_items(self) -> List[SavedLibrarySnapshotItem]:
+        """Get the complete saved-library identity snapshot in Spotify order."""
+        cursor = await self.connection.execute("""
+            SELECT spotify_id, spotify_uri, added_at, position, last_seen_at
+            FROM saved_library_snapshot_item
+            ORDER BY position ASC
+        """)
+        rows = await cursor.fetchall()
+        return [
+            SavedLibrarySnapshotItem(
+                spotify_id=row[0],
+                spotify_uri=row[1],
+                added_at=datetime.fromisoformat(row[2]),
+                position=int(row[3]),
+                last_seen_at=datetime.fromisoformat(row[4]),
+            )
+            for row in rows
+        ]
+
+    async def replace_saved_library_snapshot(self, items: List[SavedLibrarySnapshotItem]):
+        """Replace the complete saved-library identity snapshot."""
+        await self.connection.execute("DELETE FROM saved_library_snapshot_item")
+        for item in items:
+            await self.connection.execute("""
+                INSERT INTO saved_library_snapshot_item
+                (spotify_id, spotify_uri, added_at, position, last_seen_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                item.spotify_id,
+                item.spotify_uri,
+                item.added_at.isoformat(),
+                item.position,
+                item.last_seen_at.isoformat(),
+            ))
+        await self.connection.commit()
 
     async def upsert_saved_library_album(self, album: SavedLibraryAlbum):
         """Insert or update a saved-library album."""

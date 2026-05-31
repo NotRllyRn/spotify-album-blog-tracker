@@ -114,6 +114,14 @@ class SavedLibraryAlbum:
     updated_at: Optional[datetime] = None
 
 @dataclass
+class SavedLibrarySnapshotItem:
+    spotify_id: str
+    spotify_uri: str
+    added_at: datetime
+    position: int
+    last_seen_at: datetime
+
+@dataclass
 class SavedLibraryStats:
     total: int
     posted_listened: int
