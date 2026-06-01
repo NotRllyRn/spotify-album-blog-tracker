@@ -318,6 +318,17 @@ class ConfirmCurrentPostView(PromptView):
             ephemeral=True
         )
 
+
+class RandomAlbumView(PromptView):
+    @discord.ui.button(
+        label="Re-roll",
+        style=discord.ButtonStyle.secondary,
+        custom_id="random_album_reroll"
+    )
+    async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.discord_bot._handle_random_reroll(interaction)
+
+
 class DiscordBot:
     def __init__(self, config: Config, db: Database, tracker: Tracker):
         self.config = config
@@ -362,6 +373,7 @@ class DiscordBot:
         self.bot.add_view(SeventyFivePromptView(self))
         self.bot.add_view(RelistenApprovalPromptView(self))
         self.bot.add_view(PublishedPostActionView(self))
+        self.bot.add_view(RandomAlbumView(self))
 
     async def start(self):
         """Start the Discord bot."""
@@ -1330,13 +1342,49 @@ class DiscordBot:
                 )
                 return
 
-            await interaction.followup.send(embed=self._build_random_album_embed(album), ephemeral=True)
+            await interaction.followup.send(
+                embed=self._build_random_album_embed(album),
+                view=RandomAlbumView(self),
+                ephemeral=True
+            )
         except Exception as e:
             logger.error(f"Error in /random: {e}")
             await interaction.followup.send(
                 f"❌ Error picking a random album: {str(e)[:100]}",
                 ephemeral=True
             )
+
+    async def _handle_random_reroll(self, interaction: discord.Interaction):
+        """Handle the /random re-roll button by editing the existing message."""
+        if not self._check_authorized(interaction.user.id):
+            await interaction.response.send_message(
+                "❌ You are not authorized to interact with this prompt.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            album = await self.db.get_random_unposted_saved_library_album()
+            if album is None:
+                await interaction.response.edit_message(
+                    content="No unposted saved-library albums found.",
+                    embed=None,
+                    view=None
+                )
+                return
+
+            await interaction.response.edit_message(
+                content=None,
+                embed=self._build_random_album_embed(album),
+                view=RandomAlbumView(self)
+            )
+        except Exception as e:
+            logger.error(f"Error re-rolling /random: {e}")
+            message = f"❌ Error picking a random album: {str(e)[:100]}"
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
 
     def _build_random_album_embed(self, album: SavedLibraryAlbum) -> discord.Embed:
         artist_text = ", ".join(album.artists[:5]) or "Unknown"

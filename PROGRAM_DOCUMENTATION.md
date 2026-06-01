@@ -1317,6 +1317,7 @@ Persistent prompt views also run `PromptView.interaction_check()`. Unauthorized 
 - Selects one random `saved_library_album` where `is_posted_listened=False`.
 - Uses only cached database fields; it does not call Spotify for artwork or metadata.
 - Shows title, artists, release type, saved date, Spotify ID, Spotify link, and cached cover thumbnail.
+- Provides a Re-roll button that edits the original `/random` message with another random album.
 - Returns a simple empty-state message when every saved-library Album/EP has already been posted/listened.
 
 `/service`:
@@ -2424,7 +2425,11 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 `_handle_random(self, interaction)`:
 
-- Handles `/random` by selecting one unposted saved-library album.
+- Handles `/random` by selecting one unposted saved-library album and attaching a Re-roll button.
+
+`_handle_random_reroll(self, interaction)`:
+
+- Handles the Re-roll button by editing the original `/random` message with another random album or the empty state.
 
 `_build_random_album_embed(self, album)`:
 

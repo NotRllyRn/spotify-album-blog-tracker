@@ -61,12 +61,20 @@ except ModuleNotFoundError:
     SAVED_LIBRARY_TOTAL_KEY = None
 
 try:
-    from discord_bot import DiscordBot, CurrentPlaybackActionView, CurrentPostContext, PublishedPostActionView, RelistenApprovalPromptView
+    from discord_bot import (
+        DiscordBot,
+        CurrentPlaybackActionView,
+        CurrentPostContext,
+        PublishedPostActionView,
+        RandomAlbumView,
+        RelistenApprovalPromptView,
+    )
 except ModuleNotFoundError:
     DiscordBot = None
     CurrentPlaybackActionView = None
     CurrentPostContext = None
     PublishedPostActionView = None
+    RandomAlbumView = None
     RelistenApprovalPromptView = None
 
 try:
@@ -816,6 +824,7 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.bot = DiscordBot.__new__(DiscordBot)
+        self.bot.config = type("FakeConfig", (), {"discord_user_id": 123})()
         self.bot.tracker = type(
             "FakeTracker",
             (),
@@ -867,6 +876,7 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
             {
                 "send_message": AsyncMock(),
                 "send_modal": AsyncMock(),
+                "edit_message": AsyncMock(),
                 "defer": AsyncMock(),
                 "is_done": Mock(return_value=response_done)
             }
@@ -883,8 +893,24 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
                 "response": response,
                 "followup": followup,
                 "message": type("FakeMessage", (), {"id": message_id})(),
+                "user": type("FakeUser", (), {"id": 123})(),
             }
         )()
+
+    def make_saved_library_album(self, spotify_id="album_random", title="Random Album"):
+        return SavedLibraryAlbum(
+            spotify_id=spotify_id,
+            spotify_uri=f"spotify:album:{spotify_id}",
+            spotify_url=f"https://open.spotify.com/album/{spotify_id}",
+            title=title,
+            normalized_title=normalize_text(title),
+            artists=["Artist"],
+            normalized_artists=["artist"],
+            album_type="album",
+            release_type=ReleaseType.ALBUM,
+            cover_url=f"https://example.com/{spotify_id}.jpg",
+            added_at=datetime(2024, 1, 1, 12, 0, 0),
+        )
 
     def test_inprogress_format_includes_next_track(self):
         release = make_release_for_test(
@@ -951,28 +977,66 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(labels, ["Yes, track as relisten"])
 
+    def test_random_album_view_has_single_reroll_action(self):
+        labels = [child.label for child in RandomAlbumView(self.bot).children]
+
+        self.assertEqual(labels, ["Re-roll"])
+
     def test_random_album_embed_uses_cached_cover_and_spotify_link(self):
-        album = SavedLibraryAlbum(
-            spotify_id="album_random",
-            spotify_uri="spotify:album:album_random",
-            spotify_url="https://open.spotify.com/album/album_random",
-            title="Random Album",
-            normalized_title="random album",
-            artists=["Artist"],
-            normalized_artists=["artist"],
-            album_type="album",
-            release_type=ReleaseType.ALBUM,
-            cover_url="https://example.com/random.jpg",
-            added_at=datetime(2024, 1, 1, 12, 0, 0),
-        )
+        album = self.make_saved_library_album()
 
         embed = self.bot._build_random_album_embed(album)
         field_map = {field.name: field.value for field in embed.fields}
 
         self.assertEqual(embed.title, "Random Album")
         self.assertEqual(embed.url, "https://open.spotify.com/album/album_random")
-        self.assertEqual(embed.thumbnail.url, "https://example.com/random.jpg")
+        self.assertEqual(embed.thumbnail.url, "https://example.com/album_random.jpg")
         self.assertEqual(field_map["Release type"], "Album")
+
+    async def test_random_command_sends_reroll_view(self):
+        album = self.make_saved_library_album()
+        db = type("FakeDatabase", (), {})()
+        db.get_random_unposted_saved_library_album = AsyncMock(return_value=album)
+        self.bot.db = db
+        interaction = self.make_interaction()
+
+        await self.bot._handle_random(interaction)
+
+        interaction.response.defer.assert_awaited_once()
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        self.assertEqual(kwargs["embed"].title, "Random Album")
+        self.assertIsInstance(kwargs["view"], RandomAlbumView)
+        self.assertTrue(kwargs["ephemeral"])
+
+    async def test_random_reroll_edits_original_message(self):
+        album = self.make_saved_library_album("album_new", "New Album")
+        db = type("FakeDatabase", (), {})()
+        db.get_random_unposted_saved_library_album = AsyncMock(return_value=album)
+        self.bot.db = db
+        interaction = self.make_interaction()
+
+        await self.bot._handle_random_reroll(interaction)
+
+        interaction.response.edit_message.assert_awaited_once()
+        kwargs = interaction.response.edit_message.await_args.kwargs
+        self.assertIsNone(kwargs["content"])
+        self.assertEqual(kwargs["embed"].title, "New Album")
+        self.assertIsInstance(kwargs["view"], RandomAlbumView)
+
+    async def test_random_reroll_edits_to_empty_state_when_no_album_exists(self):
+        db = type("FakeDatabase", (), {})()
+        db.get_random_unposted_saved_library_album = AsyncMock(return_value=None)
+        self.bot.db = db
+        interaction = self.make_interaction()
+
+        await self.bot._handle_random_reroll(interaction)
+
+        interaction.response.edit_message.assert_awaited_once_with(
+            content="No unposted saved-library albums found.",
+            embed=None,
+            view=None
+        )
 
     async def test_add_content_action_opens_modal_without_completing_prompt(self):
         release = make_release_for_test("album_modal", "Album Modal", datetime(2024, 1, 1, 12, 0, 0))

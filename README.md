@@ -74,7 +74,7 @@ DISCORD_USER_ID=your_user_id
 
 - `/inprogress` - Show currently tracked releases
 - `/current` - Show current playback status
-- `/random` - Pick a random unposted album from your saved Spotify library
+- `/random` - Pick a random unposted album from your saved Spotify library, with a re-roll button
 - `/service` - Show service status
 
 ## WordPress Setup
