@@ -387,8 +387,8 @@ class EditorTracksView(discord.ui.View):
         next_button.callback = self._nav_next
         self.add_item(next_button)
 
-    def _make_track_callback(self, spotify_id: str) -> Callable[[discord.Interaction, discord.ui.Button], Awaitable[None]]:
-        async def _cb(interaction: discord.Interaction, button: discord.ui.Button):
+    def _make_track_callback(self, spotify_id: str) -> Callable[[discord.Interaction], Awaitable[None]]:
+        async def _cb(interaction: discord.Interaction):
             try:
                 current = next((t for t in self.editor_view.tracks_for_editor() if t.spotify_id == spotify_id), None)
                 if current is None:
@@ -402,14 +402,14 @@ class EditorTracksView(discord.ui.View):
                 )
         return _cb
 
-    async def _nav_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _nav_prev(self, interaction: discord.Interaction):
         new_view = EditorTracksView(self.editor_view, page=max(0, self.page - 1))
         await interaction.response.edit_message(
             embed=self.editor_view.build_tracks_embed(page=new_view.page),
             view=new_view,
         )
 
-    async def _nav_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _nav_next(self, interaction: discord.Interaction):
         tracks = self.editor_view.tracks_for_editor()
         total_pages = max(1, (len(tracks) + NUM_TRACKS_PER_PAGE - 1) // NUM_TRACKS_PER_PAGE)
         new_page = min(total_pages - 1, self.page + 1)
@@ -419,7 +419,7 @@ class EditorTracksView(discord.ui.View):
             view=new_view,
         )
 
-    async def _back_to_editor(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _back_to_editor(self, interaction: discord.Interaction):
         await interaction.response.edit_message(
             embed=self.editor_view.build_editor_embed(),
             view=self.editor_view,
@@ -557,12 +557,9 @@ class EditorView(discord.ui.View):
     # --- Discord callback helpers ----------------------------------------
 
     def _make_bool_callback(self, name: str):
-        async def _cb(interaction: discord.Interaction, button: discord.ui.Button):
+        async def _cb(interaction: discord.Interaction):
             try:
-                new_value = not getattr(self.state, name)
-                await self._apply_field_edit(name, new_value, interaction)
-                button.label = self._bool_label(name)
-                button.style = discord.ButtonStyle.success if new_value else discord.ButtonStyle.secondary
+                await self._apply_field_edit(name, not getattr(self.state, name), interaction)
             except _LockedForPublish:
                 await interaction.response.send_message(
                     "⏳ Publishing now; try again in a second.",
@@ -571,9 +568,8 @@ class EditorView(discord.ui.View):
         return _cb
 
     def _make_modal_callback(self, name: str):
-        async def _cb(interaction: discord.Interaction, button: discord.ui.Button):
-            modal = self._build_modal(name)
-            await interaction.response.send_modal(modal)
+        async def _cb(interaction: discord.Interaction):
+            await interaction.response.send_modal(self._build_modal(name))
         return _cb
 
     def _build_modal(self, name: str):
@@ -589,12 +585,12 @@ class EditorView(discord.ui.View):
     def _build_body_modal(self) -> "BodyModal":
         return BodyModal(self)
 
-    async def _open_body_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _open_body_modal(self, interaction: discord.Interaction):
         await interaction.response.send_modal(self._build_body_modal())
 
     # --- Top-level transitions -------------------------------------------
 
-    async def _open_tracks(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _open_tracks(self, interaction: discord.Interaction):
         await self.sink.snapshot()  # ensure highlight rows reflect current source
         new_view = EditorTracksView(self, page=0)
         await interaction.response.edit_message(
@@ -602,7 +598,7 @@ class EditorView(discord.ui.View):
             view=new_view,
         )
 
-    async def _resync(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _resync(self, interaction: discord.Interaction):
         if self.sink.mode != "post-publish":
             await interaction.response.send_message(
                 "⚠️ Re-sync is only available in post-publish mode.",
@@ -622,7 +618,7 @@ class EditorView(discord.ui.View):
                 ephemeral=True,
             )
 
-    async def _refresh_display(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _refresh_display(self, interaction: discord.Interaction):
         await self.sink.snapshot()
         self._rebuild_button_labels()
         await interaction.response.edit_message(
@@ -630,7 +626,7 @@ class EditorView(discord.ui.View):
             view=self,
         )
 
-    async def _done(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _done(self, interaction: discord.Interaction):
         try:
             await interaction.message.delete()
         except Exception:
@@ -692,8 +688,9 @@ class EditorView(discord.ui.View):
 
     async def _apply_field_edit(self, name: str, value: Any, interaction: discord.Interaction):
         await self.sink.update_field(name, value)
-        # Re-render in place; bool rows label themselves post-update, scalar
-        # rows reflect the new value via the modal default on the next open.
+        # Refresh in-place button labels so toggles flip and scalar rows
+        # preview the new value before the embed re-renders.
+        self._rebuild_button_labels()
         try:
             await interaction.response.edit_message(
                 embed=self.build_editor_embed(),

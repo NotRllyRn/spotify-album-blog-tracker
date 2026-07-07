@@ -1565,6 +1565,8 @@ Presence updates are best-effort; exceptions are swallowed.
 
 `src/editor_view.py` exposes a persistent Discord embed for editing the SCF human-curated fields both before and after publish.
 
+> **discord.py callback contract.** Every dynamic button callback has signature `(self, interaction)`. discord.py 2.x invokes `await item.callback(interaction)`; the static `@discord.ui.button` decorator adds the second positional argument automatically, but callbacks assigned via `button.callback = ...` must not declare `button` as a parameter. The editor's bool-toggles refresh label and style by mutating `self.children` in `_apply_field_edit` before `edit_message`, so the next render reflects the new state without holding per-button references.
+
 Strategy-shaped sinks:
 
 - `PrePublishSink(db, release)`: writes edits to the in-memory `Release` and calls `db.save_release(release)`. The next publish emits the new values via `_build_scf_payload`.

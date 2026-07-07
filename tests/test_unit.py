@@ -2,6 +2,7 @@
 Unit tests for core logic: classification, normalization, progress, duplicate matching.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -107,6 +108,8 @@ except ModuleNotFoundError:
 try:
     from editor_view import (
         EditorState,
+        EditorView,
+        EditorTracksView,
         PrePublishSink,
         PostPublishSink,
         build_editor_embed,
@@ -116,6 +119,8 @@ try:
     )
 except ModuleNotFoundError:
     EditorState = None
+    EditorView = None
+    EditorTracksView = None
     PrePublishSink = None
     PostPublishSink = None
     build_editor_embed = None
@@ -3127,6 +3132,152 @@ class TestEditorWiring(unittest.IsolatedAsyncioTestCase):
         self.bot._send_dm.assert_not_awaited()
         interaction.response.send_message.assert_awaited_once()
         self.assertIn("WordPress post ID is missing", interaction.response.send_message.await_args.args[0])
+
+
+@unittest.skipIf(EditorState is None, "editor_view module is not importable")
+class TestDynamicButtonCallbackSignatures(unittest.TestCase):
+    """All dynamic button callbacks must take only ``(self, interaction)``.
+
+    discord.py 2.x invokes ``item.callback(interaction)``; declaring
+    ``button`` as a second positional parameter raises TypeError at runtime.
+    """
+
+    def test_all_dynamic_callbacks_use_one_arg_signature(self):
+        import inspect
+        candidates = [
+            (EditorView, [
+                "_open_tracks", "_resync", "_refresh_display", "_done", "_open_body_modal",
+            ]),
+            (EditorTracksView, [
+                "_nav_prev", "_nav_next", "_back_to_editor",
+            ]),
+        ]
+        for cls, methods in candidates:
+            for name in methods:
+                sig = inspect.signature(getattr(cls, name))
+                params = [p.name for p in sig.parameters.values()]
+                self.assertEqual(
+                    params, ["self", "interaction"],
+                    f"{cls.__name__}.{name} signature should be (self, interaction); got {params}",
+                )
+
+
+@unittest.skipIf(EditorState is None, "editor_view module is not importable")
+class TestEditorViewRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
+    """The EditorView itself, when wired to a PrePublishSink, must dispatch all
+    dynamic button callbacks with one argument and end up rebuilding button
+    labels that reflect the new state."""
+
+    def make_release(self):
+        tracks = [
+            Track(spotify_id="t1", title="Track 1", normalized_title="track 1",
+                  duration_ms=1000, disc_number=1, track_number=1,
+                  is_countable=True, listened=False, highlight=False),
+        ]
+        return make_release_for_test("album_dispatch", "Dispatch Album", datetime(2024, 1, 1), tracks=tracks)
+
+    def make_interaction(self):
+        response = type(
+            "FakeResponse",
+            (),
+            {
+                "send_message": AsyncMock(),
+                "send_modal": AsyncMock(),
+                "edit_message": AsyncMock(),
+                "defer": AsyncMock(),
+                "is_done": Mock(return_value=False),
+            },
+        )()
+        followup = type("FakeFollowup", (), {"send": AsyncMock()})()
+        return type(
+            "FakeInteraction",
+            (),
+            {
+                "response": response,
+                "followup": followup,
+                "message": type("FakeMessage", (), {"id": "m1"})(),
+                "user": type("FakeUser", (), {"id": 123})(),
+            },
+        )()
+
+    async def test_bool_callback_toggles_state_and_rebuilds_label(self):
+        db = MagicMock()
+        db.save_release = AsyncMock()
+        release = self.make_release()
+        sink = PrePublishSink(db=db, release=release)
+        await sink.snapshot()
+
+        view = EditorView(
+            sink=sink,
+            release_title=release.title,
+            tracks_for_editor=lambda: list(release.tracks),
+        )
+        # Locate the bool button for "favorite".
+        button = next(
+            child for child in view.children
+            if getattr(child, "custom_id", "") == "editor:bool:favorite"
+        )
+        # Snapshot the original label & style.
+        original_label = button.label
+        original_style = button.style
+        # Find and call its callback (the actual function discord.py would call).
+        callback = button.callback
+        self.assertTrue(asyncio.iscoroutinefunction(callback))
+
+        interaction = self.make_interaction()
+        await callback(interaction)
+
+        # State on both the editor and the underlying release flipped.
+        self.assertTrue(sink.state.favorite)
+        self.assertTrue(release.favorite)
+        # Button label reflects the new state, AND edit_message was used to re-render.
+        self.assertNotEqual(button.label, original_label)
+        self.assertNotEqual(button.style, original_style)
+        interaction.response.edit_message.assert_awaited_once()
+
+    async def test_done_callback_tries_to_delete_message(self):
+        db = MagicMock()
+        db.save_release = AsyncMock()
+        release = self.make_release()
+        sink = PrePublishSink(db=db, release=release)
+        await sink.snapshot()
+        view = EditorView(
+            sink=sink,
+            release_title=release.title,
+            tracks_for_editor=lambda: list(release.tracks),
+        )
+        done_button = next(
+            child for child in view.children
+            if getattr(child, "custom_id", "") == "editor:nav:done"
+        )
+        interaction = self.make_interaction()
+        # Using MagicMock for message so `.delete()` is awaitable.
+        interaction.message = MagicMock()
+        interaction.message.delete = AsyncMock()
+        await done_button.callback(interaction)
+        interaction.message.delete.assert_awaited_once()
+
+    async def test_open_tracks_callback_creates_subview(self):
+        db = MagicMock()
+        db.save_release = AsyncMock()
+        release = self.make_release()
+        sink = PrePublishSink(db=db, release=release)
+        await sink.snapshot()
+        view = EditorView(
+            sink=sink,
+            release_title=release.title,
+            tracks_for_editor=lambda: list(release.tracks),
+        )
+        tracks_button = next(
+            child for child in view.children
+            if getattr(child, "custom_id", "") == "editor:open:tracks"
+        )
+        interaction = self.make_interaction()
+        await tracks_button.callback(interaction)
+        interaction.response.edit_message.assert_awaited_once()
+        kwargs = interaction.response.edit_message.await_args.kwargs
+        # The new view is a tracks sub-view, not the editor itself.
+        self.assertIsInstance(kwargs["view"], EditorTracksView)
 
 
 if __name__ == "__main__":
