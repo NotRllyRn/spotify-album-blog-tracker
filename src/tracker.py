@@ -228,7 +228,8 @@ class Tracker:
                 disc_number=t.get("disc_number", 1),
                 track_number=t.get("track_number", i + 1),
                 is_countable=not t.get("is_local", False) and t.get("is_playable", True),
-                listened=False
+                listened=False,
+                explicit=bool(t.get("explicit", False)),
             ))
 
         # Compute type
@@ -484,7 +485,8 @@ class Tracker:
             await self.db.save_release(release)
 
             # Publish via publisher
-            post = await self.publisher.publish_release(release, as_relisten=as_relisten)
+            result = await self.publisher.publish_release(release, as_relisten=as_relisten)
+            post = result.post
 
             release.status = LifecycleStatus.PUBLISHED_RECENTLY
             release.published_at = datetime.now()
@@ -492,7 +494,7 @@ class Tracker:
             await self.db.mark_saved_library_album_posted(release.spotify_id, post.get("id"))
 
             if self.discord_bot:
-                await self.discord_bot.send_publish_notification(release, post)
+                await self.discord_bot.send_publish_notification(release, result)
                 await self._warn_if_published_album_not_saved(release)
 
             await self.db.log_audit_event("release_published", {

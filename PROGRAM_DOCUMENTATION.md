@@ -43,6 +43,7 @@ Main components:
 - `src/publisher.py`: high-level WordPress publishing workflow.
 - `src/wordpress_client.py`: low-level WordPress REST API client.
 - `src/discord_bot.py`: Discord slash commands, buttons, modals, DMs, and presence updates.
+- `src/lastfm_client.py`: async Last.fm client used to fill the SCF mood-tag repeater.
 - `src/models.py`: enums and dataclasses used across the application.
 - `src/utils.py`: normalization and release classification helpers.
 - `src/inprogress.py`: pure helpers for `/inprogress` pagination.
@@ -158,13 +159,18 @@ Discord:
 - `DISCORD_BOT_TOKEN`: required. Discord bot token.
 - `DISCORD_USER_ID`: required. Numeric Discord user ID. It is immediately converted to `int`.
 
+Last.fm and SCF auto-fill:
+
+- `LASTFM_API_KEY`: optional unless `SPOTIFY_BLOG_TRACKER_FILL_SCF=1`. Last.fm API key used to look up `album.mbid` and the SCF `music_mood_tags` repeater on every Discord publish.
+- `SPOTIFY_BLOG_TRACKER_FILL_SCF`: optional. Set to `1` to enable SCF auto-fill after every Discord-published post. When enabled, `LASTFM_API_KEY` becomes required. Defaults to off.
+
 Logging:
 
 - `LOG_LEVEL`: optional. Used by `logging_config._resolve_log_level`; defaults to `INFO`.
 
 ### Validation
 
-`Config._validate()` requires Spotify client credentials, WordPress credentials, Discord bot token, and Discord user ID. Missing values raise `ValueError`.
+`Config._validate()` requires Spotify client credentials, WordPress credentials, Discord bot token, and Discord user ID. When `SPOTIFY_BLOG_TRACKER_FILL_SCF=1`, `LASTFM_API_KEY` is added to the required list. Missing values raise `ValueError`.
 
 Important behavior: `DISCORD_USER_ID` is converted with `int(os.getenv("DISCORD_USER_ID"))` before `_validate()` runs. If it is absent or non-numeric, object construction fails before the missing-config list can be produced.
 
@@ -254,10 +260,11 @@ Track(
     listened=False,
     listened_at=None,
     listened_source=None,
+    highlight=False,
 )
 ```
 
-`is_countable` controls progress. Non-countable tracks do not affect completion.
+`is_countable` controls progress. Non-countable tracks do not affect completion. `highlight` is the SCF `music_tracks` row sub-field editable through the Discord editor.
 
 `Release`:
 
@@ -285,8 +292,14 @@ Release(
     is_relisten=False,
     duplicate_state="none",
     duplicate_post_id=None,
+    rating=None,
+    favorite=False,
+    notes=None,
+    unreleased=False,
 )
 ```
+
+`rating` (0-100), `favorite`, `notes`, and `unreleased` are the SCF human-curated fields exposed by the Discord editor. `release.tracks[i].highlight` carries the per-track row value. All four release fields and `track.highlight` round-trip through SQLite (migration 006) and through the SCF auto-fill payload on publish.
 
 `PlaybackState`:
 
@@ -416,6 +429,16 @@ This table mirrors the current Spotify saved library for items the app treats as
 - indexes for saved-library order and saved date lookup
 
 This table is a complete ordered identity snapshot of the current Spotify saved library. It exists so saved-library sync can reconcile common additions and removals without requesting every `/me/albums` page.
+
+`006_editor_scf_fields.sql` adds:
+
+- `release_lifecycle.rating` (INTEGER, nullable)
+- `release_lifecycle.favorite` (BOOLEAN, not null, default 0)
+- `release_lifecycle.notes` (TEXT, nullable)
+- `release_lifecycle.unreleased` (BOOLEAN, not null, default 0)
+- `release_track.highlight` (BOOLEAN, not null, default 0)
+
+These are the SCF human-curated fields editable through the Discord editor (see `src/editor_view.py`). They are read back through `db.get_release(...)` on every editor interaction, and propagated into the SCF auto-fill payload on publish (see `Publisher._build_scf_payload`).
 
 ### Tables
 
@@ -774,6 +797,24 @@ GET /me/library/contains?uris=spotify:album:{album_id}
 ```
 
 Returns whether the album URI is saved in the user's Spotify library. The code uses the current generic library contains endpoint rather than the older album-specific contains endpoint.
+
+## Last.fm Integration
+
+The Last.fm client in `src/lastfm_client.py` is a read-only helper used exclusively by the SCF auto-fill in `Publisher`. It deliberately has no fuzzy-search ladder (the Discord flow always knows the Spotify album ID, so there is nothing to match), only two end uses:
+
+### Endpoints Used
+
+`album_getinfo(artist, album)`:
+
+```http
+GET https://ws.audioscrobbler.com/2.0/?method=album.getinfo&artist=<a>&album=<b>&api_key=<k>&format=json
+```
+
+Returns `{"mbid": str, "tags": [{"name": str}, ...]}`, or `{}` on missing key, blank inputs, HTTP errors, or unexpected payloads.
+
+### Mood Tag Filtering
+
+`pick_mood_tags(album_info, max_n=3)` flattens tag names, drops empty entries, applies the complement-script blocklist (`LFM_TAG_BLOCKLIST` in `lastfm_client.py`), and keeps the top `max_n`. The intent is to match exactly the tag set that `Wordpress-PostToAlbum-Script` would write for the same release, so the Discord-driven fill and the manual complement script can be used interchangeably on the same blog.
 
 ### Playback State Shape Used By The Tracker
 
@@ -1142,10 +1183,12 @@ DELETE /wp-json/wp/v2/media/{media_id}
 4. Resolves or creates artist tags.
 5. Builds the category list from `release.release_type`.
 6. Adds `Relisten` category if `as_relisten=True`.
-7. Creates a published WordPress post.
-8. Stores `wordpress_post_id` and `wordpress_media_id` on the release object.
-9. Forces a WordPress post-cache refresh.
-10. Returns the created post JSON.
+7. When `Config.fill_scf_enabled` is true, computes the listen-count for the SCF `listen-count` field BEFORE `create_post`, so the about-to-be-created post is not double-counted (see [SCF Auto-Fill](#scf-auto-fill)).
+8. Creates a published WordPress post.
+9. When `Config.fill_scf_enabled` is true, fills the SCF `acf` block on the new post (see [SCF Auto-Fill](#scf-auto-fill)).
+10. Stores `wordpress_post_id` and `wordpress_media_id` on the release object.
+11. Forces a WordPress post-cache refresh.
+12. Returns a `PublishResult` with `post`, `scf_pending_tags`, and `listen_count` (see [Data Models](#data-models-and-state)).
 
 Post data shape:
 
@@ -1159,6 +1202,51 @@ Post data shape:
     "featured_media": media_id or 0,
 }
 ```
+
+### SCF Auto-Fill
+
+When the `SPOTIFY_BLOG_TRACKER_FILL_SCF=1` feature flag is set, every Discord-published release gets the same SCF `acf` block that `Wordpress-PostToAlbum-Script` writes for the rest of the blog. The fill happens in two steps on the new post, both of which are no-ops when the flag is off:
+
+1. `_build_scf_payload(release, listen_count, post)` serialises what's already in the in-memory `Release` (album metadata, track list, artwork URL, release date) plus one Last.fm call (`album.getinfo`) into the `acf` payload. It returns `(acf, fetch_status)` where `fetch_status["mood_tags"]` is `None` when Last.fm returned no usable tags and a list otherwise.
+2. `_fill_post_scf(post_id, acf_payload)` `POST /wp/v2/posts/{id}` with `{"acf": ...}`. SCF keeps any un-supplied meta intact on update.
+
+#### Fields
+
+All sources are Spotify (in-memory on the `Release`) or derived from Spotify data, except `lastfm_release_id` and `music_mood_tags`, which come from Last.fm.
+
+| SCF field | Type | Source |
+| --- | --- | --- |
+| `music_tracks` | repeater | countable tracks in the Release (`is_countable=True`) |
+| `music_length_ms` | number | `sum(t.duration_ms for t in countable_tracks)` |
+| `spotify_album_id` | text | `release.spotify_id` |
+| `spotify_album_url` | url | `https://open.spotify.com/album/{id}` |
+| `music_release_date` | date_picker | Spotify `release_date` (coerced YYYY/YYYY-MM to first-of-month, formatted `d/m/Y`) |
+| `music_listened_at` | date_picker | the post's own `date` field (formatted `d/m/Y`) |
+| `lastfm_release_id` | text | Last.fm `album.getinfo` → `album.mbid` (empty if absent) |
+| `music_total_tracks` | number | `len(countable_tracks)` |
+| `music_avg_track_ms` | number | `music_length_ms // music_total_tracks` |
+| `music_explicit` | true_false | `any(t.explicit for t in countable_tracks)` |
+| `music_mood_tags` | repeater | Top 3 Last.fm tags after the complement-script blocklist |
+| `listen-count` | number | `_count_listen_index(release)` (see below) |
+
+Each `music_tracks` row is built from a countable Track as `{disc_number, track_number, title, duration_ms, spotify_id, highlight:false, explicit: t.explicit}`. Track `explicit` is captured at tracking time in `_build_release_from_spotify` from the Spotify track payload; it defaults to `False` when the API does not return the field on simplified album-track objects.
+
+The blocklist for mood tags is the same one used by `Wordpress-PostToAlbum-Script`:
+
+```python
+LFM_TAG_BLOCKLIST = (
+    r"^\d{4}$", r"^aoty$", r"^best of \d{4}$",
+    r"^seen live$", r"^favorites?$", r"^under \d+$",
+)
+```
+
+#### `listen-count`
+
+`Publisher._count_listen_index(release)` walks `db.get_wordpress_posts()` and counts the cached posts whose normalised title and normalised artist set match the release, then adds one. The result is written to SCF as `listen-count` and surfaced in the Discord embed (see [Publish Notification](#publish-notification)) as a `Listen count` field when the value is greater than `1`. The count is computed BEFORE `create_post` so the post being created is not double-counted.
+
+#### Failure handling
+
+`_build_scf_payload` swallows Last.fm HTTP errors and returns an empty `tags` list, so a Last.fm outage can never block a publish. The publish itself always succeeds, even if `_fill_post_scf` raises: the publish path logs the SCF error, marks the post in the result with `scf_pending_tags = ["scf_error"]`, and the operator still gets the standard publish notification. The only field that can plausibly be missing is `music_mood_tags`; the embed surfaces that gap so it is visible instead of silent.
 
 ### Categories
 
@@ -1269,6 +1357,24 @@ Behavior:
 
 to `WordPressClient.update_post`.
 
+### Updating SCF After Publish
+
+`Publisher.update_post_scf(post_id, partial_acf)` PATCHes the live WordPress post with the supplied SCF `acf` block:
+
+```python
+{"acf": partial_acf}
+```
+
+This is a one-line wrapper over `WordPressClient.update_post`. SCF accepts partial `acf` dicts; included fields replace, omitted fields are untouched. The Discord post-publish editor (see `src/editor_view.py`) routes every field edit through this helper.
+
+`WordPressClient.get_post_acf(post_id)` is the read counterpart:
+
+```text
+GET /wp/v2/posts/{post_id}?context=edit
+```
+
+It returns the `acf` block of the live post, or `{}` if the post has no SCF fields yet. The post-publish editor calls this on every `snapshot()` to keep its embed in sync with the canonical values on WordPress.
+
 ### Trash/Undo
 
 `Publisher.trash_post(post_id)` calls:
@@ -1346,7 +1452,7 @@ Relisten approval prompt: `RelistenApprovalPromptView`
 
 Published-post actions: `PublishedPostActionView`
 
-- `prompt_add_content`: opens the post-content modal.
+- `prompt_edit_metadata`: opens the SCF editor (post-publish mode) in the user's DMs.
 - `prompt_undo_post`: moves the WordPress post to trash, clears saved-library posted/listened state if present, and deletes the release from the tracking database.
 - `prompt_keep_post`: marks the prompt declined and leaves the post alone.
 
@@ -1360,6 +1466,7 @@ In-progress page: `InProgressView`
 Release action view: `ReleaseActionView`
 
 - `release_publish_early`: publish selected release now.
+- `release_edit_metadata`: open the SCF editor (pre-publish mode) for the selected release.
 - `release_remove_database`: ask for removal confirmation.
 - `release_show_missing_songs`: list unlistened countable tracks.
 - `release_back_to_inprogress`: return to the in-progress list.
@@ -1382,6 +1489,27 @@ Post content modal: `PostContentModal`
 
 - `post_content_body`: required paragraph text, max length 4000.
 
+SCF editor view: `EditorView`
+
+- `editor:bool:favorite`: toggle the SCF `music_favorite` flag inline.
+- `editor:bool:unreleased`: toggle the SCF `unreleased` flag inline.
+- `editor:modal:rating`: open a single-field modal for the SCF `music_rating` (integer 0-100).
+- `editor:modal:notes`: open a single-field paragraph modal for the SCF `music_notes` (max 4000).
+- `editor:modal:body`: open a single-field paragraph modal to replace the WP post `content` (post-publish only).
+- `editor:open:tracks`: open the paginated track-highlight sub-view.
+- `editor:nav:resync` (post-publish only): re-read the live SCF from WP into the editor.
+- `editor:nav:refresh`: rebuild the embed from the current in-memory state.
+- `editor:nav:done`: delete the editor message.
+
+SCF editor track highlight view: `EditorTracksView`
+
+- `editor:track:<spotify_id>:<page>`: toggle one track's `highlight` flag inline (in-memory pre-publish; PATCH `music_tracks` post-publish).
+- `editor:nav:back_to_editor:<page>`: swap back to the parent editor.
+- `editor:nav:tracks_prev:<page>`: previous page of track buttons.
+- `editor:nav:tracks_next:<page>`: next page of track buttons.
+
+Every button above uses a `custom_id` prefixed with `editor:` so persistent views are re-registered on bot ready. Track highlight buttons have a `spotify_id` in their custom_id and are not re-routable across bot restarts; the user can recover by re-opening the editor (see `handle_prompt_action`).
+
 ### Discord Prompt Handling
 
 All button actions flow through `handle_prompt_action(interaction, action)` for prompt-backed views.
@@ -1395,11 +1523,11 @@ General behavior:
 5. Route by prompt type and action.
 6. Send a success/error response.
 
-`add_content` is special: it does not defer first because it needs to open a modal.
+`edit_metadata` (post-publish) and `add_content` are special: they do not defer first because the editor / modal needs the interaction token to respond.
 
 ### Publish Notification
 
-After successful WordPress publishing, `send_publish_notification(release, post)` DMs:
+After successful WordPress publishing, `send_publish_notification(release, result)` DMs a `discord.Embed` with all the existing fields plus what the SCF block exposed:
 
 - title
 - artist list
@@ -1409,6 +1537,14 @@ After successful WordPress publishing, `send_publish_notification(release, post)
 - progress
 - artwork thumbnail
 - original post ID if relisten
+- `Listen count` (only when `result.listen_count > 1`)
+- `⚠️ SCF metadata` field (only when the SCF block wrote everything except mood tags)
+
+The plain-text line above the embed reflects what was filled:
+
+- `The release has been published to WordPress and SCF metadata was auto-filled.` when mood tags landed.
+- `The release has been published to WordPress, but SCF mood tags could not be filled (Last.fm returned no tags).` when Last.fm had no usable tags for this release.
+- `The release has been published to WordPress.` when `SPOTIFY_BLOG_TRACKER_FILL_SCF` is off.
 
 It attaches the published-post actions view and saves a `PromptType.PROMPT_UNDO` prompt.
 
@@ -1424,6 +1560,30 @@ Presence updates are best-effort; exceptions are swallowed.
 ### Public WordPress Links
 
 `_get_public_wordpress_link(raw_link)` rewrites the scheme and host of a WordPress link using `WORDPRESS_PUBLIC_URL`, while preserving the path, params, query, and fragment. This allows internal WordPress API URLs to become public-facing links in Discord.
+
+### SCF Editor
+
+`src/editor_view.py` exposes a persistent Discord embed for editing the SCF human-curated fields both before and after publish.
+
+Strategy-shaped sinks:
+
+- `PrePublishSink(db, release)`: writes edits to the in-memory `Release` and calls `db.save_release(release)`. The next publish emits the new values via `_build_scf_payload`.
+- `PostPublishSink(publisher, wordpress_client, post_id, initial_acf=None)`: re-reads the live `acf` block on every `snapshot()` and PATCHes updates through `Publisher.update_post_scf`.
+
+Factory helpers:
+
+- `open_pre_publish_editor(db, release, on_open)`: defer-reads the current SCF values off the release, constructs the `EditorView`, and lets the caller deliver it (typically via `_send_dm`).
+- `open_post_publish_editor(publisher, wordpress_client, post_id, release_title, initial_acf, on_open)`: pre-fetches `GET /wp/v2/posts/{id}?context=edit`, constructs the `EditorView`, and lets the caller deliver it.
+
+Field-name bridge (used by `PostPublishSink.update_field`):
+
+- `rating` → `music_rating` (number, default 0).
+- `favorite` → `music_favorite` (true_false).
+- `notes` → `music_notes` (text).
+- `unreleased` → `unreleased` (true_false).
+- per-track `highlight` → single-row patch into `music_tracks` repeater.
+
+The publish pipeline (`Publisher._build_scf_payload`) re-reads `release.rating / favorite / notes / unreleased / track.highlight` so pre-publish edits ride along with the SCF auto-fill on publish, without any merge step.
 
 ## Helpers
 
@@ -2018,17 +2178,25 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 - Converts Discord modal body text to escaped WordPress paragraph HTML.
 
+`_coerce_spotify_release_date(value)`:
+
+- Expands Spotify `YYYY` or `YYYY-MM` partial dates to `YYYY-01-01` / `YYYY-MM-01` (SCF `date_picker` rejects partial dates). Full ISO dates pass through.
+
+`_format_scf_date(value)`:
+
+- Renders an ISO date/datetime (or empty) as `d/m/Y` for SCF `date_picker` fields.
+
 `Publisher.__init__(self, config, db)`:
 
-- Creates `WordPressClient`, category cache, and tag cache.
+- Creates `WordPressClient`, `LastFMClient`, category cache, tag cache, and the `_fill_scf_enabled` flag (driven by `Config.fill_scf_enabled`).
 
 `close(self)`:
 
-- Closes WordPress client.
+- Closes WordPress and Last.fm clients.
 
 `publish_release(self, release, as_relisten=False)`:
 
-- Creates WordPress post with categories, artist tags, and featured artwork.
+- Creates WordPress post with categories, artist tags, featured artwork, and (when `fill_scf_enabled`) the SCF `acf` block. Counts matching existing posts BEFORE `create_post` so `listen-count` does not double-count. Returns a `PublishResult`.
 
 `trash_post(self, post_id)`:
 
@@ -2057,6 +2225,18 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 `_save_post_cache_validation_state(self, posts_result)`:
 
 - Saves `X-WP-Total` and first-page hash to service state.
+
+`_count_listen_index(self, release)`:
+
+- Counts cached WordPress posts whose normalised title and normalised artist set match the release, returns `matches + 1`. Used to fill SCF `listen-count` and surface in the Discord embed.
+
+`_build_scf_payload(self, release, listen_count, post)`:
+
+- Builds the SCF `acf` payload from in-memory `Release` data plus one Last.fm call, and reports which fields could not be filled (`fetch_status["mood_tags"]` is `None` when Last.fm returned no usable tags).
+
+`_fill_post_scf(self, post_id, acf_payload)`:
+
+- `POST /wp/v2/posts/{post_id}` with `{"acf": acf_payload}` so SCF picks up the new fields while leaving un-supplied meta intact.
 
 ### `src/wordpress_client.py`
 
@@ -2323,9 +2503,9 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 - Sends relisten approval prompt DM.
 
-`send_publish_notification(self, release, post)`:
+`send_publish_notification(self, release, result)`:
 
-- Sends publish notification and saves undo prompt.
+- Sends publish notification and saves undo prompt. `result` is a `PublishResult`; the embed adds a `Listen count` field when `result.listen_count > 1` and a `⚠️ SCF metadata` field when `result.scf_pending_tags` is non-empty. The plain-text line above the embed reflects whether SCF mood tags landed.
 
 `send_library_missing_notification(self, release)`:
 
@@ -2472,7 +2652,7 @@ Classes:
 - `PromptType`
 - `PromptState`
 - `Artist`
-- `Track`
+- `Track` (carries an `explicit: bool` field captured at tracking time so the SCF `music_tracks` repeater and `music_explicit` field can be filled without an extra Spotify call)
 - `Release`
 - `PlaybackState`
 - `WordPressPost`
@@ -2481,8 +2661,19 @@ Classes:
 - `SavedLibraryStats`
 - `SavedLibrarySyncResult`
 - `DiscordPrompt`
+- `PublishResult` (returned by `Publisher.publish_release`; fields: `post: dict`, `scf_pending_tags: list[str]`, `listen_count: int`)
 
 These are covered in [Data Models And State](#data-models-and-state).
+
+### `src/lastfm_client.py`
+
+- `LFM_TAG_BLOCKLIST` (tuple of regex patterns used by `pick_mood_tags`)
+- `LastFMClient(api_key)`
+- `LastFMClient.album_getinfo(artist, album)`
+- `LastFMClient.close()`
+- `pick_mood_tags(album_info, max_n=3)`
+
+These are covered in [Last.fm Integration](#lastfm-integration) and [SCF Auto-Fill](#scf-auto-fill).
 
 ### `src/utils.py`
 
@@ -2528,14 +2719,12 @@ Run tests:
 PYTHONPATH=src python3 -m unittest -v
 ```
 
-Observed in this environment on 2026-05-27:
+Observed in this environment on 2026-07-07:
 
 ```text
-Ran 80 tests
-OK (skipped=47)
+Ran 114 tests
+OK
 ```
-
-Many tests skipped because the active interpreter did not have optional/runtime dependencies installed, especially imports that require `discord.py`, `httpx`, and downstream modules. After installing `requirements.txt`, run the same command again to exercise the skipped integration-adjacent unit tests.
 
 Install dependencies:
 
@@ -2623,11 +2812,37 @@ PYTHONPATH=src python3 -m unittest -v
 - Verifies post-cache refresh short-circuiting.
 - Verifies forced refresh rebuilds cache and saves validation state.
 - Verifies content formatting and WordPress content update.
-- Verifies publishing still succeeds if forced cache refresh after publish fails.
+- Verifies publishing still succeeds if forced cache refresh after publish fails, and now also exercises the new `PublishResult` contract.
 
 `TestDuplicateDetection`:
 
 - Verifies normalized title and artist-set matching behavior.
+
+`TestLastFMMoodTags`:
+
+- Verifies the Last.fm blocklist filter, the top-3 cap, and that flat-string tag lists work the same as dict-shaped inputs.
+
+`TestLastFMClientAlbumGetInfo`:
+
+- Verifies the client returns an empty dict when the API key is missing or the inputs are blank.
+- Verifies `mbid` and tag-name extraction from a real-shaped payload.
+- Verifies that HTTP errors and malformed payloads return an empty dict without raising.
+
+`TestSCFDateHelpers`:
+
+- Verifies `_coerce_spotify_release_date` expands `YYYY` to `YYYY-01-01` and `YYYY-MM` to `YYYY-MM-01` while leaving a full ISO date unchanged.
+- Verifies `_format_scf_date` renders ISO dates and datetimes as `d/m/Y` and tolerates empty input.
+
+`TestPublisherSCFFill`:
+
+- Verifies `_build_scf_payload` uses only countable tracks, sums their durations, derives totals/averages/explicit-flag, and coerces release dates and post dates.
+- Verifies `_fill_post_scf` PATCHes the `acf` block on the new post.
+- Verifies `_count_listen_index` returns `matches + 1`.
+- Verifies the Real `publish_release` path with SCF enabled returns a `PublishResult`, calls `update_post`, marks mood-tags pending when Last.fm has no tags, marks `scf_error` when the SCF update raises, and is a no-op when the feature flag is off.
+
+`TestPublishNotificationEmbed`:
+
+- Verifies the SCF auto-fill text appears when everything landed, the mood-tags-unavailable text appears when Last.fm had no tags, the corresponding `⚠️ SCF metadata` field is added in that case, and the `Listen count` field appears only when `result.listen_count > 1`.
 
 ### Manual Documentation Verification
 

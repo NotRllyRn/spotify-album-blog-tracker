@@ -50,6 +50,8 @@ class Track:
     listened: bool
     listened_at: Optional[datetime] = None
     listened_source: Optional[str] = None
+    explicit: bool = False
+    highlight: bool = False
 
 @dataclass
 class Release:
@@ -75,6 +77,10 @@ class Release:
     is_relisten: bool = False
     duplicate_state: Optional[str] = None
     duplicate_post_id: Optional[int] = None
+    rating: Optional[int] = None
+    favorite: bool = False
+    notes: Optional[str] = None
+    unreleased: bool = False
 
 @dataclass
 class PlaybackState:
@@ -147,3 +153,10 @@ class DiscordPrompt:
     created_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
     context_json: Optional[str] = None
+
+
+@dataclass
+class PublishResult:
+    post: Dict[str, Any]
+    scf_pending_tags: List[str]
+    listen_count: int

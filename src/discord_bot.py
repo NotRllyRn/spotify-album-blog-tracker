@@ -14,8 +14,9 @@ from urllib.parse import urlparse, urlunparse
 from config import Config
 from database import Database
 from tracker import Tracker
-from models import Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost, SavedLibraryAlbum
+from models import PublishResult, Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost, SavedLibraryAlbum
 from inprogress import INPROGRESS_PAGE_SIZE, InProgressPage, build_inprogress_page, get_next_unlistened_track
+from editor_view import EditorView, open_pre_publish_editor, open_post_publish_editor
 
 logger = logging.getLogger(__name__)
 
@@ -120,12 +121,12 @@ class PostContentModal(discord.ui.Modal):
 
 class PublishedPostActionView(PromptView):
     @discord.ui.button(
-        label="Add content",
+        label="Edit metadata",
         style=discord.ButtonStyle.primary,
-        custom_id="prompt_add_content"
+        custom_id="prompt_edit_metadata"
     )
-    async def add_content(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.discord_bot.handle_prompt_action(interaction, "add_content")
+    async def edit_metadata(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.discord_bot.handle_prompt_action(interaction, "edit_metadata")
 
     @discord.ui.button(
         label="Undo post",
@@ -225,15 +226,26 @@ class ReleaseActionView(PromptView):
     @discord.ui.button(
         label="Publish early",
         style=discord.ButtonStyle.success,
-        custom_id="release_publish_early"
+        custom_id="release_publish_early",
+        row=0
     )
     async def publish_early(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.discord_bot._handle_publish_release(interaction, self.release_id)
 
     @discord.ui.button(
+        label="Edit metadata",
+        style=discord.ButtonStyle.primary,
+        custom_id="release_edit_metadata",
+        row=0
+    )
+    async def edit_metadata(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.discord_bot._handle_edit_metadata_pre_publish(interaction, self.release_id)
+
+    @discord.ui.button(
         label="Remove from database",
         style=discord.ButtonStyle.danger,
-        custom_id="release_remove_database"
+        custom_id="release_remove_database",
+        row=0
     )
     async def remove_from_database(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.discord_bot._handle_remove_release_prompt(interaction, self.release_id)
@@ -241,7 +253,8 @@ class ReleaseActionView(PromptView):
     @discord.ui.button(
         label="Show missing songs",
         style=discord.ButtonStyle.secondary,
-        custom_id="release_show_missing_songs"
+        custom_id="release_show_missing_songs",
+        row=0
     )
     async def show_missing_songs(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.discord_bot._handle_missing_songs(interaction, self.release_id)
@@ -249,7 +262,8 @@ class ReleaseActionView(PromptView):
     @discord.ui.button(
         label="Back",
         style=discord.ButtonStyle.secondary,
-        custom_id="release_back_to_inprogress"
+        custom_id="release_back_to_inprogress",
+        row=0
     )
     async def back_to_inprogress(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.discord_bot._handle_inprogress_page(interaction, self.return_page)
@@ -374,6 +388,17 @@ class DiscordBot:
         self.bot.add_view(RelistenApprovalPromptView(self))
         self.bot.add_view(PublishedPostActionView(self))
         self.bot.add_view(RandomAlbumView(self))
+        self.bot.add_view(ReleaseActionView(self, release_id="*", return_page=0))
+        # Register a placeholder editor view so the editor's static custom_ids
+        # (bool/modal/nav) are recognised after a bot restart. The placeholder
+        # sink is a no-op; only a real EditorView is sent to a user.
+        from editor_view import _NullEditorSink, _PlaceholderEditorTrackProvider
+        placeholder = EditorView(
+            sink=_NullEditorSink(),  # type: ignore[arg-type]
+            release_title="(placeholder editor)",
+            tracks_for_editor=_PlaceholderEditorTrackProvider().tracks,
+        )
+        self.bot.add_view(placeholder)
 
     async def start(self):
         """Start the Discord bot."""
@@ -497,8 +522,9 @@ class DiscordBot:
             view=view
         )
 
-    async def send_publish_notification(self, release: Release, post: dict) -> Optional[discord.Message]:
+    async def send_publish_notification(self, release: Release, result: PublishResult) -> Optional[discord.Message]:
         """Send notification after a release is published."""
+        post = result.post
         embed = discord.Embed(
             title=f"Release {'republished' if release.is_relisten else 'published'} to WordPress",
             description=f"{release.title} by {', '.join([a.name for a in release.artists])}",
@@ -514,12 +540,34 @@ class DiscordBot:
         if release.is_relisten and release.duplicate_post_id:
             embed.add_field(name="Relisten", value=f"Original post ID: {release.duplicate_post_id}", inline=False)
 
+        if result.listen_count > 1:
+            embed.add_field(name="Listen count", value=str(result.listen_count), inline=True)
+
+        if "mood_tags" in result.scf_pending_tags:
+            embed.add_field(
+                name="⚠️ SCF metadata",
+                value="Filled automatically · mood tags unavailable (Last.fm returned no tags for this release)",
+                inline=False,
+            )
+
+        if result.scf_pending_tags and "mood_tags" in result.scf_pending_tags:
+            content = (
+                "The release has been published to WordPress, but SCF mood tags could not be filled "
+                "(Last.fm returned no tags)."
+            )
+        else:
+            content = (
+                "The release has been published to WordPress and SCF metadata was auto-filled."
+                if result.scf_pending_tags == [] and result.listen_count
+                else "The release has been published to WordPress."
+            )
+
         view = None
         if release.wordpress_post_id:
             view = PublishedPostActionView(self)
 
         message = await self._send_dm(
-            "The release has been published to WordPress.",
+            content,
             embed=embed,
             view=view
         )
@@ -555,7 +603,7 @@ class DiscordBot:
         )
 
     async def handle_prompt_action(self, interaction: discord.Interaction, action: str):
-        if action != "add_content":
+        if action not in ("add_content", "edit_metadata"):
             await interaction.response.defer(ephemeral=True)
 
         prompt = await self.db.get_discord_prompt(str(interaction.message.id))
@@ -585,7 +633,7 @@ class DiscordBot:
         can_handle_without_release = (
             (
                 prompt.prompt_type == PromptType.PROMPT_UNDO.value
-                and action == "add_content"
+                and action in ("add_content", "edit_metadata")
             )
             or (
                 prompt.prompt_type == PromptType.PROMPT_RELISTEN_APPROVAL.value
@@ -615,6 +663,8 @@ class DiscordBot:
             elif prompt.prompt_type == PromptType.PROMPT_UNDO.value:
                 if action == "add_content":
                     await self._handle_add_content(interaction, release, prompt)
+                elif action == "edit_metadata":
+                    await self._handle_edit_metadata_post_publish(interaction, release, prompt)
                 elif action == "undo_post":
                     await self._handle_undo_post(interaction, release, prompt)
                 elif action == "keep_post":
@@ -653,6 +703,88 @@ class DiscordBot:
         if release and release.wordpress_post_id:
             return release.wordpress_post_id
         return fallback_wordpress_post_id
+
+    async def _handle_edit_metadata_pre_publish(self, interaction: discord.Interaction, release_id: str):
+        """Open a pre-publish editor for the given release id."""
+        release = await self.db.get_release(release_id)
+        if release is None:
+            await self._send_prompt_action_response(
+                interaction,
+                "⚠️ Unable to find the selected release.",
+            )
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        try:
+
+            async def _deliver(view: EditorView, embed: discord.Embed) -> None:
+                await self._send_dm(
+                    content=f"Pre-publish editor for **{release.title}**",
+                    embed=embed,
+                    view=view,
+                )
+
+            await open_pre_publish_editor(
+                db=self.db,
+                release=release,
+                on_open=_deliver,
+            )
+            await interaction.followup.send(
+                f"✅ Pre-publish editor opened in your DMs for {release.title}.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Failed to open pre-publish editor: {e}")
+            await interaction.followup.send(
+                f"❌ Failed to open editor: {str(e)[:100]}",
+                ephemeral=True,
+            )
+
+    async def _handle_edit_metadata_post_publish(
+        self,
+        interaction: discord.Interaction,
+        release: Optional[Release],
+        prompt: DiscordPrompt,
+    ):
+        """Open a post-publish editor for the published post the prompt points at."""
+        post_id = self._resolve_wordpress_post_id(release, prompt)
+        if not post_id:
+            await self._send_prompt_action_response(
+                interaction,
+                "⚠️ Unable to open the editor because the WordPress post ID is missing.",
+            )
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        try:
+            title = release.title if release else f"post {post_id}"
+            initial_acf = await self.tracker.publisher.wordpress.get_post_acf(post_id)
+
+            async def _deliver(view: EditorView, embed: discord.Embed) -> None:
+                await self._send_dm(
+                    content=f"Post-publish editor for **{title}**",
+                    embed=embed,
+                    view=view,
+                )
+
+            await open_post_publish_editor(
+                publisher=self.tracker.publisher,
+                wordpress_client=self.tracker.publisher.wordpress,
+                post_id=post_id,
+                release_title=title,
+                initial_acf=initial_acf,
+                on_open=_deliver,
+            )
+            await interaction.followup.send(
+                f"✅ Post-publish editor opened in your DMs for {title}.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Failed to open post-publish editor: {e}")
+            await interaction.followup.send(
+                f"❌ Failed to open editor: {str(e)[:100]}",
+                ephemeral=True,
+            )
 
     async def _handle_75_publish(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
         await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.ACCEPTED.value)

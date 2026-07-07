@@ -39,6 +39,10 @@ class Config:
         self.discord_bot_token = os.getenv("DISCORD_BOT_TOKEN")
         self.discord_user_id = int(os.getenv("DISCORD_USER_ID"))
 
+        # Last.fm (only required when SCF auto-fill is on; matches .env.example gate)
+        self.lastfm_api_key = os.getenv("LASTFM_API_KEY")
+        self.fill_scf_enabled = os.getenv("SPOTIFY_BLOG_TRACKER_FILL_SCF") == "1"
+
         # Load persisted tokens if available
         self._load_persisted_tokens()
 
@@ -86,6 +90,9 @@ class Config:
             ("DISCORD_BOT_TOKEN", self.discord_bot_token),
             ("DISCORD_USER_ID", self.discord_user_id),
         ]
+
+        if self.fill_scf_enabled:
+            required.append(("LASTFM_API_KEY", self.lastfm_api_key))
 
         missing = [name for name, value in required if not value]
         if missing:

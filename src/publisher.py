@@ -5,7 +5,8 @@ WordPress publishing service.
 import httpx
 import logging
 import re
-from typing import Dict, Any, Optional
+from datetime import datetime
+from typing import Dict, Any, Optional, Tuple
 from pathlib import Path
 import tempfile
 from html import escape
@@ -13,7 +14,8 @@ from html import escape
 from config import Config
 from database import Database
 from wordpress_client import WordPressClient
-from models import Release
+from models import PublishResult, Release
+from lastfm_client import LastFMClient, pick_mood_tags
 
 logger = logging.getLogger(__name__)
 
@@ -41,22 +43,56 @@ def format_discord_content_for_wordpress(raw_content: str) -> str:
     return "\n\n".join(formatted_paragraphs)
 
 
+def _coerce_spotify_release_date(value: str) -> str:
+    """SCF rejects partial dates; expand ``YYYY`` / ``YYYY-MM`` to first-of-month."""
+    text = (value or "").strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return text
+
+
+def _format_scf_date(value: Optional[str]) -> str:
+    """Render an ISO date (or empty) as ``d/m/Y`` for SCF ``date_picker`` fields."""
+    if not value:
+        return ""
+    text = value.strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text).strftime("%d/%m/%Y")
+    except ValueError:
+        return text
+
+
 class Publisher:
     """Handles publishing releases to WordPress."""
+
+    # Class-level default so test code paths that bypass __init__ via __new__
+    # can still construct a publisher with SCF auto-fill disabled.
+    _fill_scf_enabled: bool = False
 
     def __init__(self, config: Config, db: Database):
         self.config = config
         self.db = db
         self.wordpress = WordPressClient(config)
+        self.lastfm = LastFMClient(getattr(config, "lastfm_api_key", None))
         self.category_cache: Dict[str, int] = {}
         self.tag_cache: Dict[str, int] = {}
+        self._fill_scf_enabled = bool(getattr(config, "fill_scf_enabled", False))
 
     async def close(self):
         """Close WordPress client."""
         await self.wordpress.close()
+        await self.lastfm.close()
 
-    async def publish_release(self, release: Release, as_relisten: bool = False) -> Dict[str, Any]:
-        """Publish a release to WordPress."""
+    async def publish_release(self, release: Release, as_relisten: bool = False) -> PublishResult:
+        """Publish a release to WordPress and return a typed publish outcome."""
         logger.info(f"Publishing {release.title} to WordPress")
 
         try:
@@ -85,6 +121,10 @@ class Publisher:
                 "featured_media": media_id if media_id else 0,
             }
 
+            # Count existing matching posts BEFORE create_post so the count
+            # does not double-count the about-to-be-created post.
+            listen_count = await self._count_listen_index(release) if self._fill_scf_enabled else 1
+
             post = await self.wordpress.create_post(post_data)
             logger.info(f"Post created: {post['id']} - {post['title']}")
 
@@ -92,12 +132,27 @@ class Publisher:
             release.wordpress_media_id = media_id
             release.published_at = None  # Will be set by tracker
 
+            scf_pending_tags: list[str] = []
+            if self._fill_scf_enabled:
+                try:
+                    acf_payload, fetch_status = await self._build_scf_payload(release, listen_count, post)
+                    await self._fill_post_scf(post["id"], acf_payload)
+                    if fetch_status.get("mood_tags") is None:
+                        scf_pending_tags.append("mood_tags")
+                except Exception as scf_error:
+                    logger.error(f"SCF auto-fill failed for post {post['id']}: {scf_error}")
+                    scf_pending_tags.append("scf_error")
+
             try:
                 await self.refresh_post_cache(force=True)
             except Exception as e:
                 logger.error(f"Post cache refresh failed after publish: {e}")
 
-            return post
+            return PublishResult(
+                post=post,
+                scf_pending_tags=scf_pending_tags,
+                listen_count=listen_count,
+            )
 
         except Exception as e:
             logger.error(f"Error publishing release: {e}")
@@ -119,6 +174,12 @@ class Publisher:
         formatted_content = format_discord_content_for_wordpress(raw_content)
         post = await self.wordpress.update_post(post_id, {"content": formatted_content})
         logger.info(f"Updated WordPress post content: post_id={post_id}")
+        return post
+
+    async def update_post_scf(self, post_id: int, partial_acf: Dict[str, Any]) -> Dict[str, Any]:
+        """Patch a WordPress post's SCF ``acf`` block with the supplied fields."""
+        post = await self.wordpress.update_post(post_id, {"acf": partial_acf})
+        logger.info("Updated SCF metadata for post %s: %s", post_id, sorted(partial_acf.keys()))
         return post
 
     async def _ensure_categories(self):
@@ -255,3 +316,78 @@ class Publisher:
 
         await self.db.save_service_state(POST_CACHE_TOTAL_KEY, posts_result.x_wp_total)
         await self.db.save_service_state(POST_CACHE_FIRST_PAGE_HASH_KEY, posts_result.first_page_hash)
+
+    async def _count_listen_index(self, release: Release) -> int:
+        """Return the listen-count to write to SCF (matches + 1 for the new post)."""
+        from utils import normalize_artist_list
+
+        title = release.normalized_title
+        artists = set(normalize_artist_list([a.name for a in release.artists]))
+        posts = await self.db.get_wordpress_posts()
+        matches = sum(
+            1 for post in posts
+            if post.normalized_title == title
+            and set(post.normalized_artists) == artists
+        )
+        return matches + 1
+
+    async def _build_scf_payload(
+        self,
+        release: Release,
+        listen_count: int,
+        post: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Optional[list]]]:
+        """Build the SCF ``acf`` block and report which fields could not be filled."""
+        countable_tracks = [t for t in release.tracks if t.is_countable]
+        length_ms = sum(t.duration_ms for t in countable_tracks)
+        total_tracks = len(countable_tracks)
+        avg_track_ms = length_ms // total_tracks if total_tracks else 0
+        any_explicit = any(t.explicit for t in countable_tracks)
+
+        first_artist = release.artists[0].name if release.artists else ""
+        try:
+            album_info = await self.lastfm.album_getinfo(first_artist, release.title)
+        except Exception as error:
+            logger.warning("Last.fm lookup failed for %s - %s: %s", first_artist, release.title, error)
+            album_info = {}
+
+        mood_tags = pick_mood_tags(album_info)
+        fetch_status: Dict[str, Optional[list]] = {"mood_tags": mood_tags or None}
+
+        track_rows = [
+            {
+                "disc_number": t.disc_number,
+                "track_number": t.track_number,
+                "title": t.title,
+                "duration_ms": t.duration_ms,
+                "spotify_id": t.spotify_id,
+                "highlight": t.highlight,
+                "explicit": t.explicit,
+            }
+            for t in countable_tracks
+        ]
+
+        acf = {
+            "music_tracks": track_rows,
+            "music_length_ms": length_ms,
+            "spotify_album_id": release.spotify_id,
+            "spotify_album_url": f"https://open.spotify.com/album/{release.spotify_id}",
+            "music_release_date": _format_scf_date(_coerce_spotify_release_date(release.release_date)),
+            "music_listened_at": _format_scf_date(post.get("date")),
+            "lastfm_release_id": album_info.get("mbid", "") if isinstance(album_info, dict) else "",
+            "music_total_tracks": total_tracks,
+            "music_avg_track_ms": avg_track_ms,
+            "music_explicit": any_explicit,
+            "music_mood_tags": [{"mood": tag} for tag in mood_tags],
+            "listen-count": listen_count,
+            "music_rating": release.rating if release.rating is not None else "",
+            "music_favorite": release.favorite,
+            "music_notes": release.notes or "",
+            "unreleased": release.unreleased,
+        }
+        return acf, fetch_status
+
+    async def _fill_post_scf(self, post_id: int, acf_payload: Dict[str, Any]) -> None:
+        """PATCH a WordPress post with the SCF ``acf`` block."""
+        await self.wordpress.update_post(post_id, {"acf": acf_payload})
+        logger.info("Filled SCF metadata for post %s", post_id)

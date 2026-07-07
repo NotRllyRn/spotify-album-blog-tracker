@@ -154,6 +154,13 @@ class WordPressClient:
         response.raise_for_status()
         return response.json()
 
+    async def get_post_acf(self, post_id: int) -> dict:
+        """Fetch the live ``acf`` block for a post so the editor can read current SCF values."""
+        url = f"{self.api_url}/posts/{post_id}"
+        response = await self.client.get(url, params={"context": "edit"})
+        response.raise_for_status()
+        return (response.json().get("acf") or {})
+
     async def delete_post(self, post_id: int, force: bool = False) -> Dict[str, Any]:
         """Delete a post (move to trash if force=False)."""
         url = f"{self.api_url}/posts/{post_id}"

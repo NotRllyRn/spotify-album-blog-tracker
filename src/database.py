@@ -118,6 +118,10 @@ class Database:
             release.is_relisten,
             release.duplicate_state,
             release.duplicate_post_id,
+            release.rating,
+            release.favorite,
+            release.notes,
+            release.unreleased,
         )
 
         cursor = await self.connection.execute("""
@@ -125,8 +129,9 @@ class Database:
             (spotify_id, title, normalized_title, release_type, raw_spotify_type,
              cover_url, release_date, total_tracks, total_duration_ms, progress, status,
              first_seen, last_seen, completed_at, published_at, wordpress_post_id,
-             wordpress_media_id, is_relisten, duplicate_state, duplicate_post_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             wordpress_media_id, is_relisten, duplicate_state, duplicate_post_id,
+             rating, favorite, notes, unreleased)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
 
         release_id = cursor.lastrowid
@@ -220,7 +225,7 @@ class Database:
         """Get tracks for a release."""
         cursor = await self.connection.execute("""
             SELECT spotify_id, title, normalized_title, duration_ms, disc_number, track_number,
-                   is_countable, listened, listened_at, listened_source
+                   is_countable, listened, listened_at, listened_source, highlight
             FROM release_track WHERE release_id = ? ORDER BY disc_number, track_number
         """, (release_id,))
         rows = await cursor.fetchall()
@@ -234,7 +239,8 @@ class Database:
             is_countable=bool(row[6]),
             listened=bool(row[7]),
             listened_at=datetime.fromisoformat(row[8]) if row[8] else None,
-            listened_source=row[9]
+            listened_source=row[9],
+            highlight=bool(row[10]) if len(row) > 10 else False,
         ) for row in rows]
 
     async def _save_release_artists(self, release_id: int, artists: List[Artist]):
@@ -253,14 +259,15 @@ class Database:
             await self.connection.execute("""
                 INSERT INTO release_track
                 (release_id, spotify_id, title, normalized_title, duration_ms, disc_number,
-                 track_number, is_countable, listened, listened_at, listened_source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 track_number, is_countable, listened, listened_at, listened_source, highlight)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 release_id, track.spotify_id, track.title, track.normalized_title,
                 track.duration_ms, track.disc_number, track.track_number,
                 track.is_countable, track.listened,
                 track.listened_at.isoformat() if track.listened_at else None,
-                track.listened_source
+                track.listened_source,
+                track.highlight,
             ))
 
     def _row_to_release(self, row: tuple, artists: List[Artist], tracks: List[Track]) -> Release:
@@ -288,6 +295,10 @@ class Database:
             is_relisten=bool(row[20]) if len(row) > 20 else row[18] == "found",
             duplicate_state=row[18],
             duplicate_post_id=row[19],
+            rating=row[21] if len(row) > 21 else None,
+            favorite=bool(row[22]) if len(row) > 22 else False,
+            notes=row[23] if len(row) > 23 else None,
+            unreleased=bool(row[24]) if len(row) > 24 else False,
         )
 
     # WordPress operations
