@@ -39,9 +39,10 @@ class Config:
         self.discord_bot_token = os.getenv("DISCORD_BOT_TOKEN")
         self.discord_user_id = int(os.getenv("DISCORD_USER_ID"))
 
-        # Last.fm (only required when SCF auto-fill is on; matches .env.example gate)
+        # Last.fm: required when SCF auto-fill is on (default), so the mood-tag repeater
+        # can be backfilled. Set SPOTIFY_BLOG_TRACKER_FILL_SCF=0 to opt out.
         self.lastfm_api_key = os.getenv("LASTFM_API_KEY")
-        self.fill_scf_enabled = os.getenv("SPOTIFY_BLOG_TRACKER_FILL_SCF") == "1"
+        self.fill_scf_enabled = os.getenv("SPOTIFY_BLOG_TRACKER_FILL_SCF", "1") == "1"
 
         # Load persisted tokens if available
         self._load_persisted_tokens()

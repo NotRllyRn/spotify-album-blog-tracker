@@ -162,7 +162,7 @@ Discord:
 Last.fm and SCF auto-fill:
 
 - `LASTFM_API_KEY`: optional unless `SPOTIFY_BLOG_TRACKER_FILL_SCF=1`. Last.fm API key used to look up `album.mbid` and the SCF `music_mood_tags` repeater on every Discord publish.
-- `SPOTIFY_BLOG_TRACKER_FILL_SCF`: optional. Set to `1` to enable SCF auto-fill after every Discord-published post. When enabled, `LASTFM_API_KEY` becomes required. Defaults to off.
+- `SPOTIFY_BLOG_TRACKER_FILL_SCF`: optional. Defaults to `1` (SCF auto-fill enabled after every Discord-published post). Set to `0` to opt out. When enabled (the default), `LASTFM_API_KEY` becomes required.
 
 Logging:
 
