@@ -3280,5 +3280,78 @@ class TestEditorViewRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(kwargs["view"], EditorTracksView)
 
 
+@unittest.skipIf(EditorView is None, "editor_view module is not importable")
+class TestEditorTracksViewRowLayout(unittest.TestCase):
+    """``EditorTracksView`` must construct within the Discord 5-row / 5-per-row cap.
+
+    Regression: ``row=1+offset`` with ``NUM_TRACKS_PER_PAGE=5`` produced
+    ``row=5`` for the last track, which raised ``ValueError: row cannot be
+    negative or greater than or equal to 5`` (see ``discord/ui/item.py``).
+    """
+
+    def _sink(self):
+        from database import Database  # not used; placeholder
+        return MagicMock()
+
+    def _editor_view(self, tracks):
+        sink = MagicMock()
+        sink.mode = "pre-publish"
+        sink.state = MagicMock()
+        sink.snapshot = AsyncMock(return_value=sink.state)
+        sink.update_field = AsyncMock()
+        sink.update_track_highlight = AsyncMock()
+        return EditorView(
+            sink=sink,
+            release_title="Test",
+            tracks_for_editor=lambda: list(tracks),
+        )
+
+    def _tracks(self, n):
+        return [
+            Track(
+                spotify_id=f"t{i}", title=f"Track {i}", normalized_title=f"track {i}",
+                duration_ms=1000, disc_number=1, track_number=i,
+                is_countable=True, listened=False, highlight=(i % 2 == 0),
+            )
+            for i in range(1, n + 1)
+        ]
+
+    def test_tracks_subview_with_five_tracks_does_not_raise(self):
+        editor = self._editor_view(self._tracks(5))
+        # No exception means the row math is in bounds.
+        sub = EditorTracksView(editor, page=0)
+        # Three structural rows: 0 = Back, 1 = tracks, 2 = Pager.
+        rows = {c.row for c in sub.children}
+        self.assertTrue(rows.issubset({0, 1, 2}))
+        self.assertEqual(len(sub.children), 1 + 5 + 2)  # back + 5 tracks + 2 pager
+
+    def test_tracks_subview_with_one_track_uses_row_1(self):
+        editor = self._editor_view(self._tracks(1))
+        sub = EditorTracksView(editor, page=0)
+        track_button = next(c for c in sub.children if "track_toggle" not in (c.custom_id or "") and "track" in (c.custom_id or "") and "nav" not in (c.custom_id or ""))
+        self.assertEqual(track_button.row, 1)
+
+    def test_pager_sits_on_row_2(self):
+        editor = self._editor_view(self._tracks(5))
+        sub = EditorTracksView(editor, page=0)
+        pager_buttons = [c for c in sub.children if "tracks_prev" in (c.custom_id or "") or "tracks_next" in (c.custom_id or "")]
+        for button in pager_buttons:
+            self.assertEqual(button.row, 2)
+
+    def test_back_button_always_on_row_0(self):
+        editor = self._editor_view(self._tracks(5))
+        sub = EditorTracksView(editor, page=0)
+        back = next(c for c in sub.children if "back_to_editor" in (c.custom_id or ""))
+        self.assertEqual(back.row, 0)
+
+    def test_each_row_never_exceeds_five_components(self):
+        editor = self._editor_view(self._tracks(5))
+        sub = EditorTracksView(editor, page=0)
+        from collections import Counter
+        per_row = Counter(c.row for c in sub.children)
+        for row, count in per_row.items():
+            self.assertLessEqual(count, 5, f"row {row} has {count} components (>5)")
+
+
 if __name__ == "__main__":
     unittest.main()

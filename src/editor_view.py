@@ -330,7 +330,7 @@ class EditorTracksView(discord.ui.View):
 
     def _build_buttons(self) -> None:
         self.clear_items()
-        # Back to editor button in its own row
+        # Row 0 — Back to the main editor.
         back = discord.ui.Button(
             label="← Back to editor",
             style=discord.ButtonStyle.secondary,
@@ -344,6 +344,7 @@ class EditorTracksView(discord.ui.View):
         start = self.page * NUM_TRACKS_PER_PAGE
         page_tracks = tracks[start : start + NUM_TRACKS_PER_PAGE]
 
+        # Row 1 — at most 5 track buttons (Discord allows 5 components per row).
         if not page_tracks:
             note = discord.ui.Button(
                 label="No tracks on this page",
@@ -360,19 +361,19 @@ class EditorTracksView(discord.ui.View):
                     style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
                     emoji="⭐" if on else None,
                     custom_id=f"{CUSTOM_ID_PREFIX}:track:{track.spotify_id}:{self.page}",
-                    row=1 + offset,  # only 5 rows; offset 0-4 → row 1-5
+                    row=1,
                 )
                 button.callback = self._make_track_callback(track.spotify_id)
                 self.add_item(button)
 
-        # Pager in the last row
+        # Row 2 — Prev/Next pager. Two components, well under the 5-per-row limit.
         total_pages = max(1, (len(tracks) + NUM_TRACKS_PER_PAGE - 1) // NUM_TRACKS_PER_PAGE)
         prev_button = discord.ui.Button(
             label="◀ Prev",
             style=discord.ButtonStyle.secondary,
             custom_id=f"{CUSTOM_ID_PREFIX}:nav:tracks_prev:{self.page}",
             disabled=self.page <= 0,
-            row=4,
+            row=2,
         )
         prev_button.callback = self._nav_prev
         self.add_item(prev_button)
@@ -382,7 +383,7 @@ class EditorTracksView(discord.ui.View):
             style=discord.ButtonStyle.secondary,
             custom_id=f"{CUSTOM_ID_PREFIX}:nav:tracks_next:{self.page}",
             disabled=self.page >= total_pages - 1,
-            row=4,
+            row=2,
         )
         next_button.callback = self._nav_next
         self.add_item(next_button)
