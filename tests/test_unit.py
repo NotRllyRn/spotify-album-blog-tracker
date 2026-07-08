@@ -3353,5 +3353,116 @@ class TestEditorTracksViewRowLayout(unittest.TestCase):
             self.assertLessEqual(count, 5, f"row {row} has {count} components (>5)")
 
 
+@unittest.skipIf(EditorView is None, "editor_view module is not importable")
+class TestEditorStateStaysFreshAcrossNavigation(unittest.IsolatedAsyncioTestCase):
+    """Regression: after clicking ``Highlight tracks`` (which calls
+    ``self.sink.snapshot()`` and replaces ``sink.state``) and returning to the
+    editor, the editor must still reflect the latest edits. Previously
+    ``EditorView.state`` was captured at __init__ time, so it went stale on the
+    first nav round-trip. The fix is the @property that delegates to
+    ``self.sink.state``."""
+
+    def _make_view(self):
+        db = MagicMock()
+        db.save_release = AsyncMock()
+        tracks = [
+            Track(spotify_id="t1", title="Track 1", normalized_title="track 1",
+                  duration_ms=1000, disc_number=1, track_number=1,
+                  is_countable=True, listened=False, highlight=False),
+            Track(spotify_id="t2", title="Track 2", normalized_title="track 2",
+                  duration_ms=1000, disc_number=1, track_number=2,
+                  is_countable=True, listened=False, highlight=False),
+            Track(spotify_id="t3", title="Track 3", normalized_title="track 3",
+                  duration_ms=1000, disc_number=1, track_number=3,
+                  is_countable=True, listened=False, highlight=False),
+            Track(spotify_id="t4", title="Track 4", normalized_title="track 4",
+                  duration_ms=1000, disc_number=1, track_number=4,
+                  is_countable=True, listened=False, highlight=False),
+            Track(spotify_id="t5", title="Track 5", normalized_title="track 5",
+                  duration_ms=1000, disc_number=1, track_number=5,
+                  is_countable=True, listened=False, highlight=False),
+        ]
+        release = make_release_for_test("album_fresh", "Fresh Album", datetime(2024, 1, 1), tracks=tracks)
+        sink = PrePublishSink(db=db, release=release)
+        return EditorView(
+            sink=sink,
+            release_title=release.title,
+            tracks_for_editor=lambda: list(release.tracks),
+        ), sink, release
+
+    def _inter(self):
+        response = type(
+            "FakeResponse",
+            (),
+            {
+                "send_message": AsyncMock(),
+                "send_modal": AsyncMock(),
+                "edit_message": AsyncMock(),
+                "defer": AsyncMock(),
+                "is_done": Mock(return_value=False),
+            },
+        )()
+        followup = type("FakeFollowup", (), {"send": AsyncMock()})()
+        return type(
+            "FakeInteraction",
+            (),
+            {
+                "response": response,
+                "followup": followup,
+                "message": type("FakeMessage", (), {"id": "m1"})(),
+                "user": type("FakeUser", (), {"id": 123})(),
+            },
+        )()
+
+    def test_state_property_returns_current_sink_state(self):
+        view, sink, _ = self._make_view()
+        self.assertIs(view.state, sink.state)
+        # After sink.snapshot() replaces the state, the editor sees the new state.
+        new_state = EditorState(rating=42)
+        sink.state = new_state
+        self.assertIs(view.state, new_state)
+        self.assertEqual(view.state.rating, 42)
+
+    async def test_field_edit_after_navigation_updates_view(self):
+        """The exact bug: edit a field, navigate to tracks, navigate back,
+        then click a bool toggle. The toggle must land on the same ``self`` that
+        is observing the latest state; the embed + button label must update."""
+        view, sink, _ = self._make_view()
+
+        # Step 1: edit the rating so we can prove state survives the navigation.
+        await sink.update_field("rating", 87)
+        view._rebuild_button_labels()
+
+        # Step 2: navigate to tracks (which calls sink.snapshot and replaces state).
+        tracks_btn = next(c for c in view.children if c.custom_id == "editor:open:tracks")
+        nav_inter = self._inter()
+        await tracks_btn.callback(nav_inter)
+        sub_view = nav_inter.response.edit_message.await_args.kwargs['view']
+        # Step 3: navigate back.
+        back_btn = next(c for c in sub_view.children if c.custom_id == "editor:nav:back_to_editor:0")
+        back_inter = self._inter()
+        await back_btn.callback(back_inter)
+        restored = back_inter.response.edit_message.await_args.kwargs['view']
+
+        # The restored view and the embed should still reflect the rating edit.
+        embed_after_back = back_inter.response.edit_message.await_args.kwargs['embed']
+        rating_field = next(f.value for f in embed_after_back.fields if f.name == 'Rating')
+        self.assertEqual(rating_field, '87')
+
+        # Step 4: click favorite on the restored view.
+        fav_btn = next(c for c in restored.children if c.custom_id == "editor:bool:favorite")
+        click_inter = self._inter()
+        await fav_btn.callback(click_inter)
+
+        # DB was updated; the embed that was sent reflects the new state; the
+        # button on the same view object has the updated label.
+        self.assertTrue(sink.state.favorite)
+        self.assertTrue(view.state.favorite)
+        self.assertEqual(fav_btn.label, "Favorite: ✅")
+        click_embed = click_inter.response.edit_message.await_args.kwargs['embed']
+        booleans_field = next(f.value for f in click_embed.fields if f.name == 'Booleans')
+        self.assertIn('favorite: ✅', booleans_field)
+
+
 if __name__ == "__main__":
     unittest.main()

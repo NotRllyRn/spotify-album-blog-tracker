@@ -445,10 +445,33 @@ class EditorView(discord.ui.View):
         self.sink = sink
         self.release_title = release_title
         self._tracks_for_editor = tracks_for_editor
-        self.state: EditorState = sink.state  # populated at open time
+        # NB: ``state`` is a @property below that always reads ``self.sink.state``; the
+        # manual assignment here is intentionally a no-op so callers that pass the old
+        # ``state=`` kwarg keep working. ``sink.snapshot()`` may replace ``sink.state``
+        # mid-session (e.g. when navigating to the tracks sub-view) and the property
+        # makes that change visible to the embed/label rebuilds without holding a
+        # stale snapshot here.
+        self.state = sink.state  # noqa: F841 — see state setter below
         # Mark "non-prefilled" custom_ids to satisfy Discord's persistent-view requirement.
         # Each button class below uses self.role-style construction with row attrs.
         self._add_buttons()
+
+    @property
+    def state(self) -> EditorState:
+        """Always return the sink's current state.
+
+        ``PrePublishSink.snapshot()`` and ``PostPublishSink.snapshot()`` each replace
+        ``self.sink.state`` with a fresh ``EditorState``. Early versions of the editor
+        captured ``self.state`` at __init__ time, so it went stale on the first nav
+        round-trip and every subsequent edit mutated ``sink.state`` while the view kept
+        reading its own ``state``. The property keeps them tied together.
+        """
+        return self.sink.state
+
+    @state.setter
+    def state(self, value: EditorState) -> None:
+        """No-op setter kept for backward compatibility with ``self.state = sink.state``."""
+        return None
 
     # Discord persistent-view compatibility: every button below is constructed
     # using a row-anchored declaration so the persistent custom_id gives
