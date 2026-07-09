@@ -400,11 +400,22 @@ class DiscordBot:
         async def editor(interaction: discord.Interaction, post_id: int):
             await self._handle_editor(interaction, post_id)
 
+        logger.info(
+            "Registered %d slash command(s) locally: %s",
+            len(self.tree.get_commands()),
+            [c.name for c in self.tree.get_commands()],
+        )
+
         @self.bot.event
         async def on_ready():
-            await self.tree.sync()
+            synced = await self.tree.sync()
             self.ready_event.set()
             logger.info(f"Discord bot logged in as {self.bot.user}")
+            logger.info(
+                "tree.sync() returned %d command(s) from Discord: %s",
+                len(synced),
+                [c.name for c in synced],
+            )
 
     def _register_views(self):
         self.bot.add_view(SeventyFivePromptView(self))

@@ -137,6 +137,15 @@ When `SPOTIFY_BLOG_TRACKER_FILL_SCF=1`, every Discord-published release is backf
 
 The SCF editor is the recommended way to add ratings, notes, favorites, unreleased flags, and per-track highlights. Pre-publish edits are persisted to the local database and emitted as part of the SCF auto-fill payload when the release is published. Post-publish edits immediately PATCH the live `acf` block on WordPress; a re-fetch via "Re-sync from WP" reads the canonical values back from the post.
 
+## Troubleshooting: slash commands not appearing
+
+Slash commands are registered globally on every bot startup. Discord's UI caches the per-server command list, so even if the bot has 6 commands registered, your Discord client may show only the ones it cached from a previous bot startup. Symptoms:
+
+- Typing `/` shows a stale subset (often the four original commands).
+- Typing `/search` (or any newer command) as plain text does nothing — Discord only fires slash commands selected from its autocomplete UI.
+
+Fix: reload your Discord client (`Ctrl+R` / `Cmd+R`, or fully quit and reopen). On `on_ready` the service logs both the local command count and the count Discord returned from `tree.sync()`; if those numbers match, your Discord client just needs a refresh. Global command updates can also take up to ~1 hour to propagate across Discord after the PUT to `/applications/<id>/commands`, so repeated bot restarts within minutes can be ignored at Discord's side (daily command-write limit).
+
 ## License
 
 MIT

@@ -89,9 +89,9 @@ def _score_token(token: str, hay: str) -> float:
     return fuzz.WRatio(token, hay) / 100.0
 
 
-def _is_cache_stale(db: Any, now: datetime) -> bool:
+async def _is_cache_stale(db: Any, now: datetime) -> bool:
     """Cache is stale when empty or older than ``WORDPRESS_CACHE_MAX_AGE_HOURS``."""
-    raw = db.get_service_state(LAST_SYNCED_AT_KEY)
+    raw = await db.get_service_state(LAST_SYNCED_AT_KEY)
     if not raw:
         return True
     try:
@@ -185,7 +185,7 @@ async def search_for_posts(
 
     cache_posts = await db.get_wordpress_posts()
     cache_empty = not cache_posts
-    cache_stale = cache_empty or _is_cache_stale(db, datetime.now())
+    cache_stale = cache_empty or await _is_cache_stale(db, datetime.now())
 
     if force_source != "live" and not cache_empty and not cache_stale:
         matches = rank_matches(cache_posts, query, threshold)
