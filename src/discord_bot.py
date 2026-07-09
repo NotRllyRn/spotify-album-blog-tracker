@@ -1627,7 +1627,7 @@ class DiscordBot:
 
             embed.add_field(
                 name="Commands",
-                value="/inprogress, /current, /random, /service",
+                value="/inprogress, /current, /random, /service, /search, /editor",
                 inline=False
             )
 

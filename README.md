@@ -130,6 +130,8 @@ When `SPOTIFY_BLOG_TRACKER_FILL_SCF=1`, every Discord-published release is backf
 - `/current`: Show current playback and manual publish
 - `/random`: Pick a random unposted saved-library album
 - `/service`: Service status
+- `/search query`: Fuzzy search cached WordPress posts; pick one to open the persistent metadata editor in your DM
+- `/editor post_id`: Open the metadata editor against a known WordPress post ID
 
 ## Editor Flow
 
