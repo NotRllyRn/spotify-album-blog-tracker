@@ -7,17 +7,13 @@ wiring lives in ``src/discord_bot.py``; this file is intentionally
 View-only and has no Discord business logic.
 """
 
+import uuid
 from dataclasses import dataclass
-from typing import List, Optional, TYPE_CHECKING, Protocol
+from typing import List, Protocol
 
 import discord
 
-from search import (
-    FUZZY_BASE_THRESHOLD,
-    FUZZY_LOOSE_THRESHOLD,
-    RESULT_CAP,
-    SearchMatch,
-)
+from search import FUZZY_BASE_THRESHOLD, FUZZY_LOOSE_THRESHOLD, RESULT_CAP, SearchMatch
 
 
 # --- Constants --------------------------------------------------------------
@@ -26,7 +22,7 @@ CUSTOM_ID_PREFIX = "search"
 EMBED_PREVIEW_ROWS = 3
 SELECT_LABEL_LIMIT = 100
 SELECT_DESC_LIMIT = 100
-VIEW_TIMEOUT_SECONDS = 900  # 15 minutes — falls within Discord's idle limit.
+VIEW_TIMEOUT_SECONDS = 900  # 15 minutes
 
 
 # --- Public data shapes -----------------------------------------------------
@@ -39,13 +35,13 @@ class PickerRequest:
     query: str
     threshold: float
     source: str  # "cache" | "live"
+    nonce: str = ""  # unique-per-picker; isolates running /search invocations.
 
 
 class SearchDispatcher(Protocol):
-    """Methods SearchPickerView lean on; implemented by DiscordBot."""
+    """Methods SearchPickerView leans on; implemented by DiscordBot."""
 
-    async def render_cache_picker(self, query: str, threshold: float) -> "PickerRender": ...
-    async def render_live_picker(self, query: str, threshold: float) -> "PickerRender": ...
+    async def render_picker(self, query: str, threshold: float, *, force_source: str | None = None) -> "PickerRender": ...
     async def open_editor_for_post(self, interaction: discord.Interaction, post_id: int, request: PickerRequest) -> None: ...
 
 
@@ -69,6 +65,10 @@ def _threshold_label(threshold: float) -> str:
     if abs(threshold - FUZZY_BASE_THRESHOLD) < 1e-9:
         return "0.55 (base)"
     return f"{threshold:.2f}"
+
+
+def _new_nonce() -> str:
+    return uuid.uuid4().hex[:8]
 
 
 # --- Embed ------------------------------------------------------------------
@@ -125,6 +125,11 @@ class SearchPickerView(discord.ui.View):
         self.request = request
         self.matches = matches
 
+        # Per-picker nonce tags every custom_id so two /search invocations in
+        # the same channel can't collide on the rerun routes.
+        nonce = request.nonce or _new_nonce()
+        cid = lambda name: f"{CUSTOM_ID_PREFIX}:{name}:{nonce}"  # noqa: E731
+
         if matches:
             options = [
                 discord.SelectOption(
@@ -142,7 +147,7 @@ class SearchPickerView(discord.ui.View):
                 min_values=1,
                 max_values=1,
                 options=options,
-                custom_id=f"{CUSTOM_ID_PREFIX}:select",
+                custom_id=cid("select"),
                 row=0,
             )
 
@@ -157,16 +162,19 @@ class SearchPickerView(discord.ui.View):
             select.callback = on_select
             self.add_item(select)
 
-        # Footer buttons: rerun with different threshold or source.
-        self.add_item(self._make_button("Search again", row=1, on_click=self._rerun_cache))
-        self.add_item(self._make_button("Match loosely", row=1, on_click=self._rerun_loose))
-        self.add_item(self._make_button("Search live", row=1, on_click=self._rerun_live))
+        # Footer buttons.
+        self.add_item(self._make_button("Search again", row=1, on_click=self._rerun_cache, nonce=nonce))
+        self.add_item(self._make_button("Match loosely", row=1, on_click=self._rerun_loose, nonce=nonce))
+        self.add_item(self._make_button("Search live", row=1, on_click=self._rerun_live, nonce=nonce))
+        # Aesthetic Done button: deletes the picker message.
+        self.add_item(self._make_button("Done", row=1, on_click=self._done, nonce=nonce))
 
-    def _make_button(self, label: str, *, row: int, on_click) -> discord.ui.Button:
+    def _make_button(self, label: str, *, row: int, on_click, nonce: str) -> discord.ui.Button:
+        key = label.lower().replace(" ", "_")
         btn = discord.ui.Button(
             label=label,
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"{CUSTOM_ID_PREFIX}:{label.lower().replace(' ', '_')}",
+            style=discord.ButtonStyle.secondary if label != "Done" else discord.ButtonStyle.danger,
+            custom_id=f"{CUSTOM_ID_PREFIX}:{key}:{nonce}",
             row=row,
         )
         btn.callback = on_click
@@ -174,15 +182,11 @@ class SearchPickerView(discord.ui.View):
 
     async def _rerun(self, interaction: discord.Interaction, *, threshold: float, force_live: bool) -> None:
         await interaction.response.defer(ephemeral=True)
-        new_request = PickerRequest(
-            query=self.request.query,
-            threshold=threshold,
-            source="live" if force_live else "cache",
+        render = await self.dispatcher.render_picker(
+            self.request.query,
+            threshold,
+            force_source="live" if force_live else None,
         )
-        if force_live:
-            render = await self.dispatcher.render_live_picker(self.request.query, threshold)
-        else:
-            render = await self.dispatcher.render_cache_picker(self.request.query, threshold)
         await interaction.edit_original_response(embed=render.embed, view=render.view)
 
     async def _rerun_cache(self, interaction: discord.Interaction) -> None:
@@ -193,3 +197,11 @@ class SearchPickerView(discord.ui.View):
 
     async def _rerun_live(self, interaction: discord.Interaction) -> None:
         await self._rerun(interaction, threshold=self.request.threshold, force_live=True)
+
+    async def _done(self, interaction: discord.Interaction) -> None:
+        """Delete the picker message; the DM-side editor is unaffected."""
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except Exception:
+            pass

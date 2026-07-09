@@ -1,18 +1,27 @@
 """
 Fuzzy search over cached or live WordPress posts.
 
-Public seam: ``rank_matches(posts, query, threshold)`` returns a ranked
-list of ``SearchMatch`` (capped at ``RESULT_CAP``). Used by both the
-cache path (slice 1), the live WP path (slice 3), and the picker UI
-later in the chain.
+Public seam: ``search_for_posts(db, wordpress_client, query, *,
+threshold, force_source) -> SearchOutcome``. The Discord bot calls this
+to build the picker; the picker View itself stays a thin wrapper.
 
 Token semantics: every query token must score at least ``threshold``
-against the post haystack (title + artists). Substring matches pass
-automatically; otherwise ``rapidfuzz.fuzz.WRatio`` is used and mapped
-to ``[0.0, 1.0]``. Tiebreakers: highest score first, newest WP ID first.
+against the post haystack (title + artists, normalised). Substring
+matches pass automatically; otherwise ``rapidfuzz.fuzz.WRatio`` is
+used and mapped to ``[0.0, 1.0]``. Tiebreakers: highest score first,
+newest WP ID first. Capped at ``RESULT_CAP``.
+
+Cache freshness: when the local ``wordpress_post_cache`` table is
+empty or older than ``WORDPRESS_CACHE_MAX_AGE_HOURS`` (read from
+``service_state[LAST_SYNCED_AT_KEY]``), ``search_for_posts`` falls
+back to a live ``GET /wp/v2/posts?search=…`` and reports the swap via
+``SearchOutcome.fell_back_to_live``. The operator's Discord pick may
+point at a fresh live result that's not in ``wordpress_post_cache``
+yet — that's intentional.
 """
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, List, Optional, Protocol
 
 from rapidfuzz import fuzz
@@ -77,11 +86,19 @@ def _score_token(token: str, hay: str) -> float:
         return 0.0
     if token in hay:
         return 1.0
-    # rapidfuzz partial_ratio finds the best substring alignment within
-    # ``hay``. Better than vanilla ratio or WRatio when the haystack has
-    # padding characters (en-dashes, extra spaces) that confuse WRatio's
-    # combined heuristic on short vs long inputs.
-    return fuzz.partial_ratio(token, hay) / 100.0
+    return fuzz.WRatio(token, hay) / 100.0
+
+
+def _is_cache_stale(db: Any, now: datetime) -> bool:
+    """Cache is stale when empty or older than ``WORDPRESS_CACHE_MAX_AGE_HOURS``."""
+    raw = db.get_service_state(LAST_SYNCED_AT_KEY)
+    if not raw:
+        return True
+    try:
+        last = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    return (now - last) > timedelta(hours=WORDPRESS_CACHE_MAX_AGE_HOURS)
 
 
 # --- Public API -------------------------------------------------------------
@@ -122,38 +139,9 @@ def rank_matches(
 
 
 class WordPressClientLike(Protocol):
-    """Shape we depend on from WordPressClient; defined to keep tests fast."""
+    """Shape we depend on from WordPressClient."""
 
     async def get_posts(self, **params: Any) -> Any: ...
-
-
-def _wp_post_to_match(payload: dict) -> SearchMatch:
-    """Convert one raw WP REST post payload to a SearchMatch-shaped record."""
-    title_obj = payload.get("title") or {}
-    title = title_obj.get("rendered", "") if isinstance(title_obj, dict) else str(title_obj)
-    # Live WP search doesn't usually include artists as a flat array;
-    # the haystack falls back to title-only for live posts. Tags are not
-    # available from WP's `search` query, so artists stays empty.
-    return SearchMatch(
-        post_id=int(payload["id"]),
-        title=title,
-        artists=[],
-        link=str(payload.get("link", "") or ""),
-        score=0.0,
-    )
-
-
-async def search_live(
-    wordpress_client: WordPressClientLike,
-    query: str,
-    threshold: float = FUZZY_BASE_THRESHOLD,
-) -> List[SearchMatch]:
-    """Hit ``GET /wp/v2/posts?search=…&per_page=100`` and rank via the cache ladder."""
-    result = await wordpress_client.get_posts(search=query, per_page=100)
-    raw_posts = list(getattr(result, "posts", None) or result or [])
-    # Live WP returns dicts; convert to lightweight objects so rank_matches works.
-    proxies = [_RawPostProxy(p) for p in raw_posts]
-    return rank_matches(proxies, query, threshold)
 
 
 class _RawPostProxy:
@@ -167,3 +155,42 @@ class _RawPostProxy:
         self.id = int(payload["id"])
         self.artists: List[str] = []
         self.link = str(payload.get("link", "") or "")
+
+
+async def search_live(
+    wordpress_client: WordPressClientLike,
+    query: str,
+    threshold: float = FUZZY_BASE_THRESHOLD,
+) -> List[SearchMatch]:
+    """Hit ``GET /wp/v2/posts?search=…&per_page=100`` and rank via the same ladder."""
+    result = await wordpress_client.get_posts(search=query, per_page=100)
+    raw_posts = list(getattr(result, "posts", None) or result or [])
+    return rank_matches([_RawPostProxy(p) for p in raw_posts], query, threshold)
+
+
+# --- Single deep-module seam ------------------------------------------------
+
+
+async def search_for_posts(
+    db: Any,
+    wordpress_client: WordPressClientLike,
+    query: str,
+    *,
+    threshold: float = FUZZY_BASE_THRESHOLD,
+    force_source: Optional[str] = None,
+) -> SearchOutcome:
+    """Cache-first fuzzy search with live-WP fallback. The single public entry point."""
+    if not _normalize_query(query):
+        return SearchOutcome(matches=[], source="cache", fell_back_to_live=False)
+
+    cache_posts = await db.get_wordpress_posts()
+    cache_empty = not cache_posts
+    cache_stale = cache_empty or _is_cache_stale(db, datetime.now())
+
+    if force_source != "live" and not cache_empty and not cache_stale:
+        matches = rank_matches(cache_posts, query, threshold)
+        return SearchOutcome(matches=matches, source="cache", fell_back_to_live=False)
+
+    matches = await search_live(wordpress_client, query, threshold)
+    fell_back = force_source != "live"
+    return SearchOutcome(matches=matches, source="live", fell_back_to_live=fell_back)

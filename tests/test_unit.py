@@ -3532,9 +3532,14 @@ class TestSearchScoring(unittest.TestCase):
         self.assertEqual([m.post_id for m in matches], [101])
 
     def test_typo_falls_back_to_fuzzy(self):
-        """Spec story 3: a transposed letter still meets threshold via fuzzy.",
+        """Spec story 3: a typo'd substring still meets threshold via WRatio.
+
+        ``daarkside`` is one token (not split), so the per-token fuzzy runs
+        against the whole haystack — gives ``WRatio == 85.5`` (well above the
+        ``0.55`` threshold) even though the literal ``daarkside`` is not in
+        haystack. The exact tokenisation matters more than the algorithm here.
         """
-        matches = rank_matches(self.posts, "dark sidee")
+        matches = rank_matches(self.posts, "daarkside moon")
         self.assertEqual([m.post_id for m in matches], [101])
 
     def test_and_semantics_rejects_when_one_token_missing(self):
@@ -3697,41 +3702,31 @@ class TestSearchPickerView(unittest.IsolatedAsyncioTestCase):
 
         class _Dispatcher:
             def __init__(self):
-                self.render_cache_picker = AsyncMock(return_value=None)
-                self.render_live_picker = AsyncMock(return_value=None)
+                self.render_picker = AsyncMock(return_value=None)
                 self.open_editor_for_post = AsyncMock(return_value=None)
 
         d = _Dispatcher()
         # Default returns: re-rendered picker state.
-        from search import SearchMatch  # noqa: E402
         from search_view import PickerRender  # noqa: E402
 
-        async def _cache_render(query, threshold):
-            matches = cache_matches or []
-            embed = format_picker_embed(query, matches, source="cache",
-                                        fell_back_to_live=False, threshold=threshold)
+        async def _render(query, threshold, *, force_source=None):
+            matches = (live_matches if force_source == "live" else cache_matches) or []
+            source = "live" if force_source == "live" else "cache"
+            fell_back = source == "live" and matches is not (cache_matches or [])
+            embed = format_picker_embed(
+                query, matches, source=source, fell_back_to_live=fell_back,
+                threshold=threshold,
+            )
             return PickerRender(
                 embed=embed,
                 view=SearchPickerView(
-                    dispatcher=d, request=PickerRequest(query=query, threshold=threshold, source="cache"),
+                    dispatcher=d,
+                    request=PickerRequest(query=query, threshold=threshold, source=source),
                     matches=matches,
                 ),
             )
 
-        async def _live_render(query, threshold):
-            matches = live_matches or []
-            embed = format_picker_embed(query, matches, source="live",
-                                        fell_back_to_live=True, threshold=threshold)
-            return PickerRender(
-                embed=embed,
-                view=SearchPickerView(
-                    dispatcher=d, request=PickerRequest(query=query, threshold=threshold, source="live"),
-                    matches=matches,
-                ),
-            )
-
-        d.render_cache_picker.side_effect = _cache_render
-        d.render_live_picker.side_effect = _live_render
+        d.render_picker.side_effect = _render
         return d
 
     def test_view_has_select_when_matches_non_empty(self):
@@ -3832,11 +3827,12 @@ class TestSearchPickerView(unittest.IsolatedAsyncioTestCase):
         # Locate the "Search again" button.
         again_btn = next(c for c in view.children if getattr(c, "label", "") == "Search again")
         await again_btn.callback(self._make_interaction())
-        dispatcher.render_cache_picker.assert_awaited_once()
-        # call_args: render_cache_picker(query, threshold) — positional.
-        args, _ = dispatcher.render_cache_picker.call_args
+        dispatcher.render_picker.assert_awaited_once()
+        # call_args: render_picker(query, threshold, *, force_source=None).
+        args, kwargs = dispatcher.render_picker.call_args
         self.assertEqual(args[0], "a")
         self.assertAlmostEqual(args[1], 0.55)
+        self.assertIsNone(kwargs.get("force_source"))
 
     async def test_match_loosely_re_renders_at_0_30(self):
         """Spec story 10."""
@@ -3850,8 +3846,8 @@ class TestSearchPickerView(unittest.IsolatedAsyncioTestCase):
         )
         loose_btn = next(c for c in view.children if getattr(c, "label", "") == "Match loosely")
         await loose_btn.callback(self._make_interaction())
-        dispatcher.render_cache_picker.assert_awaited_once()
-        args, _ = dispatcher.render_cache_picker.call_args
+        dispatcher.render_picker.assert_awaited_once()
+        args, _ = dispatcher.render_picker.call_args
         self.assertAlmostEqual(args[1], 0.30)
 
     async def test_search_live_invokes_live_renderer(self):
@@ -3866,73 +3862,105 @@ class TestSearchPickerView(unittest.IsolatedAsyncioTestCase):
         )
         live_btn = next(c for c in view.children if getattr(c, "label", "") == "Search live")
         await live_btn.callback(self._make_interaction())
-        dispatcher.render_live_picker.assert_awaited_once()
+        dispatcher.render_picker.assert_awaited_once()
+        _, kwargs = dispatcher.render_picker.call_args
+        self.assertEqual(kwargs.get("force_source"), "live")
 
 
 @unittest.skipUnless(SearchPickerView is not None, "search_view.py not importable")
-class TestCacheStalenessSignal(unittest.IsolatedAsyncioTestCase):
-    """Spec stories 13-14: empty cache and stale cache auto-fall-back."""
+class TestSearchForPostsRouting(unittest.IsolatedAsyncioTestCase):
+    """Spec stories 13-14: cache-first routing with auto-fall-back to live WP."""
 
-    async def test_empty_cache_is_stale(self):
-        """Spec story 13."""
-        from datetime import datetime, timedelta
-        from search import LAST_SYNCED_AT_KEY
-        from discord_bot import DiscordBot
+    def _cached_post(self, title="Pink Floyd – Dark Side of the Moon", post_id=101):
+        from utils import normalize_text, normalize_artist_list  # noqa: E402
+        from models import WordPressPost  # noqa: E402
+        return WordPressPost(
+            id=post_id, title=title,
+            normalized_title=normalize_text(title),
+            artists=["Pink Floyd"],
+            normalized_artists=normalize_artist_list(["Pink Floyd"]),
+            link=f"https://example.com/?p={post_id}",
+        )
+
+    def _make_db(self, cached=None, last_synced_at_iso=None):
+        # ``get_service_state`` is sync (called inside ``_is_cache_stale``);
+        # ``get_wordpress_posts`` is async.
+        from unittest.mock import AsyncMock, Mock
+        db = Mock()
+        db.get_wordpress_posts = AsyncMock(return_value=cached or [])
+        db.get_service_state = Mock(return_value=last_synced_at_iso)
+        return db
+
+    def _make_wp_client(self, fake_result):
         from unittest.mock import AsyncMock
+        from types import SimpleNamespace
+        client = AsyncMock()
+        client.get_posts = AsyncMock(return_value=SimpleNamespace(posts=fake_result))
+        return client
 
-        class FakeDb:
-            async def get_wordpress_posts(self):
-                return []
-            async def get_service_state(self, key):
-                return None
+    async def test_empty_query_returns_cache_path_with_no_matches(self):
+        from search import search_for_posts
+        outcome = await search_for_posts(self._make_db(), self._make_wp_client([]), "")
+        self.assertEqual(outcome.matches, [])
+        self.assertEqual(outcome.source, "cache")
+        self.assertFalse(outcome.fell_back_to_live)
 
-        bot = DiscordBot.__new__(DiscordBot)
-        bot.db = FakeDb()
-        self.assertTrue(await bot._cache_is_stale_or_empty())
-
-    async def test_recent_cache_is_not_stale(self):
+    async def test_recent_cache_hits_cache_only(self):
+        """Spec story base case: happy path is cache-only."""
         from datetime import datetime, timedelta
-        from search import LAST_SYNCED_AT_KEY, WORDPRESS_CACHE_MAX_AGE_HOURS
+        recent = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+        db = self._make_db(cached=[self._cached_post()], last_synced_at_iso=recent)
+        wp = self._make_wp_client([])
+        from search import search_for_posts
+        outcome = await search_for_posts(db, wp, "pink floyd moon")
+        self.assertEqual(outcome.source, "cache")
+        self.assertFalse(outcome.fell_back_to_live)
+        self.assertEqual([m.post_id for m in outcome.matches], [101])
+        wp.get_posts.assert_not_awaited()
 
-        recent_iso = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
-        from utils import normalize_text, normalize_artist_list  # noqa: E402
-        from models import WordPressPost  # noqa: E402
-        cached = [WordPressPost(id=1, title="x", normalized_title=normalize_text("x"),
-                                artists=[], normalized_artists=normalize_artist_list([]),
-                                link="https://x/1")]
+    async def test_empty_cache_auto_routes_to_live(self):
+        """Spec story 13."""
+        from search import search_for_posts
+        wp = self._make_wp_client([
+            {"id": 1, "title": {"rendered": "Pink Floyd – Dark Side of the Moon"}, "link": "https://x/1"},
+        ])
+        outcome = await search_for_posts(
+            self._make_db(cached=[], last_synced_at_iso=None),
+            wp, "pink floyd moon",
+        )
+        self.assertEqual(outcome.source, "live")
+        self.assertTrue(outcome.fell_back_to_live)  # empty cache is also a fallback.
+        self.assertEqual([m.post_id for m in outcome.matches], [1])
+        wp.get_posts.assert_awaited_once()
 
-        class FakeDb:
-            async def get_wordpress_posts(self):
-                return cached
-            async def get_service_state(self, key):
-                return recent_iso
-
-        from discord_bot import DiscordBot
-        bot = DiscordBot.__new__(DiscordBot)
-        bot.db = FakeDb()
-        self.assertFalse(await bot._cache_is_stale_or_empty())
-
-    async def test_old_cache_is_stale(self):
+    async def test_stale_cache_auto_routes_to_live(self):
+        """Spec story 14: cache present but ``last_synced_at`` too old."""
         from datetime import datetime, timedelta
-        from search import WORDPRESS_CACHE_MAX_AGE_HOURS
+        old = (datetime.now() - timedelta(hours=24 * 2)).isoformat(timespec="seconds")
+        db = self._make_db(cached=[self._cached_post()], last_synced_at_iso=old)
+        wp = self._make_wp_client([
+            {"id": 1, "title": {"rendered": "Pink Floyd – Dark Side of the Moon"}, "link": "https://x/1"},
+        ])
+        from search import search_for_posts
+        outcome = await search_for_posts(db, wp, "pink floyd moon")
+        self.assertEqual(outcome.source, "live")
+        # Cache had entries but was stale: fell_back is True.
+        self.assertTrue(outcome.fell_back_to_live)
+        wp.get_posts.assert_awaited_once()
 
-        old_iso = (datetime.now() - timedelta(hours=WORDPRESS_CACHE_MAX_AGE_HOURS + 5)).isoformat(timespec="seconds")
-        from utils import normalize_text, normalize_artist_list  # noqa: E402
-        from models import WordPressPost  # noqa: E402
-        cached = [WordPressPost(id=1, title="x", normalized_title=normalize_text("x"),
-                                artists=[], normalized_artists=normalize_artist_list([]),
-                                link="https://x/1")]
-
-        class FakeDb:
-            async def get_wordpress_posts(self):
-                return cached
-            async def get_service_state(self, key):
-                return old_iso
-
-        from discord_bot import DiscordBot
-        bot = DiscordBot.__new__(DiscordBot)
-        bot.db = FakeDb()
-        self.assertTrue(await bot._cache_is_stale_or_empty())
+    async def test_force_live_skips_even_when_cache_is_fresh(self):
+        """Spec decision: ``force_source="live"`` always hits WP."""
+        from datetime import datetime, timedelta
+        recent = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+        db = self._make_db(cached=[self._cached_post()], last_synced_at_iso=recent)
+        wp = self._make_wp_client([
+            {"id": 2, "title": {"rendered": "Pink Floyd – Dark Side (Live)"}, "link": "https://x/2"},
+        ])
+        from search import search_for_posts
+        outcome = await search_for_posts(db, wp, "pink floyd", force_source="live")
+        self.assertEqual(outcome.source, "live")
+        self.assertFalse(outcome.fell_back_to_live)  # explicit force isn't a fallback.
+        wp.get_posts.assert_awaited_once()
 
 
 if __name__ == "__main__":

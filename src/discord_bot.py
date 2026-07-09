@@ -21,6 +21,7 @@ from search import (
     FUZZY_BASE_THRESHOLD,
     FUZZY_LOOSE_THRESHOLD,
     rank_matches,
+    search_for_posts,
     search_live,
 )
 from search_view import (
@@ -1651,7 +1652,7 @@ class DiscordBot:
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            render = await self.render_cache_picker(query, FUZZY_BASE_THRESHOLD)
+            render = await self.render_picker(query, FUZZY_BASE_THRESHOLD)
             await interaction.followup.send(embed=render.embed, view=render.view)
         except Exception as e:
             logger.error(f"Error in /search: {e}")
@@ -1683,59 +1684,48 @@ class DiscordBot:
             )
 
     async def render_cache_picker(self, query: str, threshold: float) -> PickerRender:
-        """Score cached posts; build a ``PickerRender`` (embed + view)."""
-        posts = await self.db.get_wordpress_posts()
-        matches = rank_matches(posts, query or "", threshold=threshold)
-        fell_back = bool((query or "").strip()) and await self._cache_is_stale_or_empty()
-        return PickerRender(
-            embed=format_picker_embed(
-                (query or "").strip(), matches,
-                source="cache", fell_back_to_live=fell_back, threshold=threshold,
-            ),
-            view=SearchPickerView(
-                dispatcher=self,
-                request=PickerRequest(query=query or "", threshold=threshold, source="cache"),
-                matches=matches,
-            ),
-        )
+        """Back-compat alias for ``render_picker``."""
+        return await self.render_picker(query, threshold, force_source=None)
 
     async def render_live_picker(self, query: str, threshold: float) -> PickerRender:
-        """Hit WP ``search=`` and rank; build a ``PickerRender``."""
-        try:
-            matches = await search_live(self.tracker.publisher.wordpress, query, threshold=threshold)
-        except Exception as e:
-            logger.error(f"Live WP search failed: {e}")
-            matches = []
+        """Back-compat alias for ``render_picker``."""
+        return await self.render_picker(query, threshold, force_source="live")
+
+    async def render_picker(
+        self,
+        query: str,
+        threshold: float,
+        *,
+        force_source: Optional[str] = None,
+    ) -> PickerRender:
+        """Single seam:  ``search.search_for_posts`` → embed + view.  ``force_source``:
+        ``None`` → auto (cache first, live on empty/stale); ``"live"`` → WP only.
+        """
+        outcome = await search_for_posts(
+            self.db,
+            self.tracker.publisher.wordpress,
+            query or "",
+            threshold=threshold,
+            force_source=force_source,
+        )
         return PickerRender(
             embed=format_picker_embed(
-                query, matches,
-                source="live", fell_back_to_live=True, threshold=threshold,
+                (query or "").strip(),
+                outcome.matches,
+                source=outcome.source,
+                fell_back_to_live=outcome.fell_back_to_live,
+                threshold=threshold,
             ),
             view=SearchPickerView(
                 dispatcher=self,
-                request=PickerRequest(query=query, threshold=threshold, source="live"),
-                matches=matches,
+                request=PickerRequest(
+                    query=query or "",
+                    threshold=threshold,
+                    source=outcome.source,
+                ),
+                matches=outcome.matches,
             ),
         )
-
-    async def _cache_is_stale_or_empty(self) -> bool:
-        """True when the WP cache is empty or hasn't been refreshed for >24h."""
-        try:
-            posts = await self.db.get_wordpress_posts()
-        except Exception:
-            return True
-        if not posts:
-            return True
-        try:
-            from search import LAST_SYNCED_AT_KEY, WORDPRESS_CACHE_MAX_AGE_HOURS
-            from datetime import datetime, timedelta
-            raw = await self.db.get_service_state(LAST_SYNCED_AT_KEY)
-            if not raw:
-                return True
-            last = datetime.fromisoformat(raw)
-            return (datetime.now() - last) > timedelta(hours=WORDPRESS_CACHE_MAX_AGE_HOURS)
-        except Exception:
-            return False
 
     async def open_editor_for_post(
         self,
