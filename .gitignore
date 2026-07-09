@@ -33,3 +33,5 @@ Thumbs.db
 
 .old/
 .pi-subagents/
+
+/test/
