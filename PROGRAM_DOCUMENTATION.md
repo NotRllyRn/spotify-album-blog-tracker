@@ -581,6 +581,12 @@ Saved-library sync stores validation state under:
 - `spotify_saved_library.last_synced_at`
 - `spotify_saved_library.last_full_audit_at`
 
+WordPress post cache refresh stores validation state under:
+
+- `wordpress_post_cache.x_wp_total`
+- `wordpress_post_cache.first_page_hash`
+- `wordpress_post_cache.last_synced_at` (ISO timestamp written by `Publisher._save_post_cache_validation_state`; consumed by `search.search_for_posts` to decide whether the local cache is fresh enough to use or whether to fall back to live WP search)
+
 ### Relationships And Retention
 
 - `release_artist` and `release_track` are attached to `release_lifecycle` by numeric `release_id`.
@@ -1282,10 +1288,11 @@ If anything fails, it logs the error and returns `None`; publishing continues wi
 
 `Publisher.refresh_post_cache(force=False)` keeps `wordpress_post_cache` current for duplicate detection.
 
-It uses two service-state keys:
+It uses three service-state keys:
 
 - `wordpress_post_cache.x_wp_total`
 - `wordpress_post_cache.first_page_hash`
+- `wordpress_post_cache.last_synced_at` (ISO timestamp written after a successful full replace by `_save_post_cache_validation_state`; read by `search.search_for_posts` to decide whether the cache is fresh enough to use)
 
 When not forced, it asks `WordPressClient.get_posts()` to validate the first page with:
 
@@ -1301,7 +1308,7 @@ If changed or forced:
 3. Convert tag IDs on posts into artist tag names.
 4. Normalize post titles and artist lists.
 5. Save the full cache to SQLite.
-6. Save validation metadata.
+6. Save validation metadata (including `last_synced_at`).
 
 ### WordPress Post And Tag Pagination
 
@@ -1438,6 +1445,20 @@ Persistent prompt views also run `PromptView.interaction_check()`. Unauthorized 
 - Lists available commands.
 
 Current note: `last_poll` is displayed but the tracker does not currently write it.
+
+`/search <query>`:
+
+- Fuzzy search of cached WordPress posts (with live-WP fall-back when the cache is empty or stale).
+- Calls `search.search_for_posts(db, wordpress_client, query, *, threshold=FUZZY_BASE_THRESHOLD, force_source=None)` and renders a `SearchPickerView`.
+- The picker has a `StringSelect` of up to 9 candidate posts plus three footer buttons ("Search again", "Match loosely", "Search live") and a "Done" button.
+- Authorisation is gated by `_check_authorized` against `config.discord_user_id`.
+- Each picker click that opens the post-publish editor writes an `audit_event` row (`search_opened_editor`) with `post_id`, the original query, and the funnel source (`cache` or `live`).
+
+`/editor <post_id>`:
+
+- Open the persistent `EditorView` against a known WordPress post ID. Cache title resolution first; falls back to a live `GET /wp/v2/posts/{id}` when the cache has no record.
+- Same audit pipeline as `/search` picks.
+- Useful as a power-user shortcut and as a recovery path when the post cache is stale.
 
 ### Persistent Views And Buttons
 
@@ -1586,6 +1607,28 @@ Field-name bridge (used by `PostPublishSink.update_field`):
 - per-track `highlight` → single-row patch into `music_tracks` repeater.
 
 The publish pipeline (`Publisher._build_scf_payload`) re-reads `release.rating / favorite / notes / unreleased / track.highlight` so pre-publish edits ride along with the SCF auto-fill on publish, without any merge step.
+
+### Fuzzy WordPress Search
+
+`/search` and `/editor` provide a name-driven way to open the existing
+post-publish `EditorView` against any published post, not just the
+ones the tracker has just published.
+
+`src/search.py` is the single seam:
+
+- `search.search_for_posts(db, wordpress_client, query, *, threshold, force_source=None) -> SearchOutcome` — the only entry the bot calls. Reads `db.get_wordpress_posts()` and `db.get_service_state(LAST_SYNCED_AT_KEY)`; auto-routes to live WP when the cache is empty, stale, or `force_source == "live"`. The result is a `SearchOutcome(matches, source, fell_back_to_live)`.
+- `search.rank_matches(posts, query, threshold)` — pure AND-token scoring; sort by score DESC then newest WP ID DESC; cap at 9. Used by `search_for_posts` and directly by callers (e.g. tests) that already have a posts list in hand.
+- `search.search_live(wordpress_client, query, threshold)` — issue `GET /wp/v2/posts?search=…&per_page=100` and re-feed through `rank_matches`. Used by `search_for_posts` for the live branch.
+- Tokenisation, normalisation, and rapidfuzz scoring live in small pure helpers (`_normalize_query`, `_haystack`, `_score_token`, `_is_cache_stale`); thresholds, the result cap, and the staleness key are top-of-module constants.
+
+`src/search_view.py` is the View-only counterpart:
+
+- `format_picker_embed(query, matches, *, source, fell_back_to_live, threshold)` — build the picker embed (pure).
+- `SearchPickerView` — ephemeral in-channel `discord.ui.View` with a `StringSelect` of up to 9 post IDs plus three footer buttons ("Search again", "Match loosely", "Search live") and a "Done" button. All custom_ids are namespaced `search:…` and tagged with a per-view UUID nonce so two concurrent `/search` invocations in the same channel don't collide.
+
+`DiscordBot.render_picker` is the Discord-side wiring: calls `search_for_posts`, builds the embed via `format_picker_embed`, and constructs the `SearchPickerView`. The three footer buttons in the picker all route back through `render_picker` with a different `threshold` or `force_source`. The `StringSelect` calls `DiscordBot.open_editor_for_post`, which DMs the persistent `EditorView` against the chosen WP post ID and writes a `search_opened_editor` audit row.
+
+Staleness plumbing: `Publisher._save_post_cache_validation_state` writes `service_state["wordpress_post_cache.last_synced_at"]` after a successful full replace. `search.search_for_posts` reads that key on every invocation; when the cache is missing or older than `WORDPRESS_CACHE_MAX_AGE_HOURS = 24`, the picker auto-routes to live WP and surfaces a banner in the embed description.
 
 ## Helpers
 
@@ -2645,6 +2688,26 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 - Handles `/service`, including saved-library stats.
 
+`_handle_search(self, interaction, query)`:
+
+- Handles `/search`. Authorisation check, deferred reply, call `render_picker` at `FUZZY_BASE_THRESHOLD`.
+
+`_handle_editor(self, interaction, post_id)`:
+
+- Handles `/editor`. Authorisation check, deferred reply, call `open_editor_for_post` with a synthetic `PickerRequest(query=f"editor:{post_id}")`.
+
+`render_picker(self, query, threshold, *, force_source=None)`:
+
+- Single seam for picker rendering. Calls `search.search_for_posts` (which encapsulates the cache-vs-live routing decision) and returns a `PickerRender`.
+
+`render_cache_picker(self, query, threshold)` / `render_live_picker(self, query, threshold)`:
+
+- Back-compat aliases: `render_picker(query, threshold, force_source=None)` and `render_picker(query, threshold, force_source="live")` respectively. Kept so external wiring can ask for cache-only or live-only without depending on the seaming call site.
+
+`open_editor_for_post(self, interaction, post_id, request)`:
+
+- Resolve the WP post's title via the local cache; fall back to a live `GET /wp/v2/posts/{id}`. Then DM the persistent `EditorView` via `open_post_publish_editor` and audit-log a `search_opened_editor` event with `post_id`, original query, and funnel source.
+
 ### `src/models.py`
 
 Classes:
@@ -2706,6 +2769,69 @@ Functions:
 - `configure_logging(project_root, level=None)`
 
 These are covered in [Helpers](#helpers).
+
+### `src/search.py`
+
+Public seam: `search.search_for_posts` is the single entry point that the
+Discord bot (`DiscordBot.render_picker`) calls for every `/search` invocation.
+
+Constants:
+
+- `FUZZY_BASE_THRESHOLD = 0.55` (default acceptance; "Match loosely" reruns at this).
+- `FUZZY_LOOSE_THRESHOLD = 0.30` (acceptance after the "Match loosely" button).
+- `RESULT_CAP = 9` (matches returned and shown in the picker's `StringSelect`).
+- `LAST_SYNCED_AT_KEY = "wordpress_post_cache.last_synced_at"` (read from `service_state` to decide staleness; written by `Publisher._save_post_cache_validation_state`).
+- `WORDPRESS_CACHE_MAX_AGE_HOURS = 24` (staleness cut-off).
+
+Data classes:
+
+- `SearchMatch(post_id, title, artists, link, score)` — one ranked result.
+- `SearchOutcome(matches, source, fell_back_to_live)` — return value of `search_for_posts`.
+
+Pure helpers:
+
+- `_normalize_query(query)` — tokenise, lowercase via `utils.normalize_text`, dedupe, return a list. Empty/whitespace-only input returns `[]`.
+- `_haystack(post)` — return `normalized_title + " " + " ".join(normalized_artists)`. Used as the per-post haystack during scoring.
+- `_score_token(token, hay)` — substring pass-through returns `1.0`; otherwise `rapidfuzz.fuzz.WRatio(token, hay) / 100.0`.
+- `_is_cache_stale(db, now)` — synchronous check of whether the local `wordpress_post_cache` has been refreshed within the staleness window.
+
+Public API:
+
+- `rank_matches(posts, query, threshold=FUZZY_BASE_THRESHOLD)` — AND-token score every post; sort by score DESC then newest WP ID DESC; cap at `RESULT_CAP`. Pure function.
+- `WordPressClientLike` — `Protocol`: only depends on `async def get_posts(**params)`.
+- `_RawPostProxy.__init__(payload)` — duck-type adapter for live WP REST post dicts.
+- `search_live(wordpress_client, query, threshold)` — call `wp.get_posts(search=query, per_page=100)` and re-feed the response through `rank_matches`.
+- `search_for_posts(db, wordpress_client, query, *, threshold, force_source=None)` — the single seam. Returns `SearchOutcome`. Reads `db.get_wordpress_posts()` and `db.get_service_state(LAST_SYNCED_AT_KEY)`; auto-routes to live when the cache is empty, stale, or `force_source == "live"`.
+
+### `src/search_view.py`
+
+View-only module that constructs the `SearchPickerView` and the picker embed.
+
+Constants:
+
+- `CUSTOM_ID_PREFIX = "search"` — namespacing for every button/select custom_id (≤ 100-char Discord ceiling).
+- `EMBED_PREVIEW_ROWS = 3` — top-3 preview rows in the picker embed.
+- `SELECT_LABEL_LIMIT = 100`, `SELECT_DESC_LIMIT = 100` — Discord `StringSelect` limits.
+- `VIEW_TIMEOUT_SECONDS = 900` (15 min) — falls within Discord's idle limit.
+
+Data shapes:
+
+- `PickerRequest(query, threshold, source, nonce)` — enough state to resubmit a `/search` from a picker button. `nonce` is a per-picker UUID prefix; isolates two concurrent `/search` invocations from colliding on the same button custom_id.
+- `SearchDispatcher` — `Protocol`: only `async def render_picker(query, threshold, *, force_source=None)` and `async def open_editor_for_post(interaction, post_id, request)`. Implemented by `DiscordBot`.
+- `PickerRender(embed, view)` — one render unit.
+
+Helpers:
+
+- `_clip(text, limit)` — truncate with `…`.
+- `_threshold_label(threshold)` — readable footer label.
+- `_new_nonce()` — short UUID hex.
+
+Public API:
+
+- `format_picker_embed(query, matches, *, source, fell_back_to_live, threshold)` — build the picker embed. Pure function.
+- `SearchPickerView.__init__(dispatcher, request, matches)` — construct the View: `StringSelect` of up to 9 post IDs plus four buttons ("Search again", "Match loosely", "Search live", "Done"). All custom_ids are namespaced by `CUSTOM_ID_PREFIX` and tagged with a per-view nonce.
+- `SearchPickerView._make_button(label, *, row, on_click, nonce)` — internal factory.
+- `SearchPickerView._rerun_cache(interaction)` / `_rerun_loose(interaction)` / `_rerun_live(interaction)` / `_done(interaction)` — discord.py callback handlers; all bound via `btn.callback = ...` with the `(self, interaction)` signature required by the discord.py 2.x contract.
 
 ### `scripts/migrate.py`
 
