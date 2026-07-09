@@ -87,6 +87,8 @@ SPOTIFY_BLOG_TRACKER_FILL_SCF=1
 - `/current` - Show current playback status
 - `/random` - Pick a random unposted album from your saved Spotify library, with a re-roll button
 - `/service` - Show service status
+- `/search query:str` - Fuzzy search cached WordPress posts; pick one to open the persistent metadata editor in your DM
+- `/editor post_id:int` - Open the metadata editor against a known WordPress post ID
 
 ## SCF Editor
 

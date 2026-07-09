@@ -16,6 +16,7 @@ from database import Database
 from wordpress_client import WordPressClient
 from models import PublishResult, Release
 from lastfm_client import LastFMClient, pick_mood_tags
+from search import LAST_SYNCED_AT_KEY as POST_CACHE_LAST_SYNCED_AT_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +317,10 @@ class Publisher:
 
         await self.db.save_service_state(POST_CACHE_TOTAL_KEY, posts_result.x_wp_total)
         await self.db.save_service_state(POST_CACHE_FIRST_PAGE_HASH_KEY, posts_result.first_page_hash)
+        await self.db.save_service_state(
+            POST_CACHE_LAST_SYNCED_AT_KEY,
+            datetime.now().isoformat(timespec="seconds"),
+        )
 
     async def _count_listen_index(self, release: Release) -> int:
         """Return the listen-count to write to SCF (matches + 1 for the new post)."""

@@ -17,6 +17,18 @@ from tracker import Tracker
 from models import PublishResult, Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost, SavedLibraryAlbum
 from inprogress import INPROGRESS_PAGE_SIZE, InProgressPage, build_inprogress_page, get_next_unlistened_track
 from editor_view import EditorView, open_pre_publish_editor, open_post_publish_editor
+from search import (
+    FUZZY_BASE_THRESHOLD,
+    FUZZY_LOOSE_THRESHOLD,
+    rank_matches,
+    search_live,
+)
+from search_view import (
+    PickerRender,
+    PickerRequest,
+    SearchPickerView,
+    format_picker_embed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -376,6 +388,16 @@ class DiscordBot:
         @self.tree.command(name="random", description="Pick a random unposted saved-library album")
         async def random(interaction: discord.Interaction):
             await self._handle_random(interaction)
+
+        @self.tree.command(name="search", description="Fuzzy search cached WordPress posts and open the metadata editor")
+        @app_commands.describe(query="Search terms (e.g. 'pink floyd moon')")
+        async def search(interaction: discord.Interaction, query: str):
+            await self._handle_search(interaction, query)
+
+        @self.tree.command(name="editor", description="Open the metadata editor against a known WordPress post ID")
+        @app_commands.describe(post_id="WordPress post ID (numeric)")
+        async def editor(interaction: discord.Interaction, post_id: int):
+            await self._handle_editor(interaction, post_id)
 
         @self.bot.event
         async def on_ready():
@@ -1616,3 +1638,167 @@ class DiscordBot:
                 f"❌ Error fetching status: {str(e)[:100]}",
                 ephemeral=True
             )
+
+    # --- /search and /editor ---------------------------------------------
+
+    async def _handle_search(self, interaction: discord.Interaction, query: str) -> None:
+        """Handle ``/search``: fuzzy search the WP cache and DM the editor on pick."""
+        if not self._check_authorized(interaction.user.id):
+            await interaction.response.send_message(
+                "❌ You are not authorized to use this command.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            render = await self.render_cache_picker(query, FUZZY_BASE_THRESHOLD)
+            await interaction.followup.send(embed=render.embed, view=render.view)
+        except Exception as e:
+            logger.error(f"Error in /search: {e}")
+            await interaction.followup.send(
+                f"❌ Error searching: {str(e)[:100]}",
+                ephemeral=True,
+            )
+
+    async def _handle_editor(self, interaction: discord.Interaction, post_id: int) -> None:
+        """Handle ``/editor``: open the editor against a known WP post ID."""
+        if not self._check_authorized(interaction.user.id):
+            await interaction.response.send_message(
+                "❌ You are not authorized to use this command.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self.open_editor_for_post(
+                interaction,
+                post_id,
+                PickerRequest(query=f"editor:{post_id}", threshold=FUZZY_BASE_THRESHOLD, source="cache"),
+            )
+        except Exception as e:
+            logger.error(f"Error in /editor: {e}")
+            await interaction.followup.send(
+                f"❌ Error opening editor: {str(e)[:100]}",
+                ephemeral=True,
+            )
+
+    async def render_cache_picker(self, query: str, threshold: float) -> PickerRender:
+        """Score cached posts; build a ``PickerRender`` (embed + view)."""
+        posts = await self.db.get_wordpress_posts()
+        matches = rank_matches(posts, query or "", threshold=threshold)
+        fell_back = bool((query or "").strip()) and await self._cache_is_stale_or_empty()
+        return PickerRender(
+            embed=format_picker_embed(
+                (query or "").strip(), matches,
+                source="cache", fell_back_to_live=fell_back, threshold=threshold,
+            ),
+            view=SearchPickerView(
+                dispatcher=self,
+                request=PickerRequest(query=query or "", threshold=threshold, source="cache"),
+                matches=matches,
+            ),
+        )
+
+    async def render_live_picker(self, query: str, threshold: float) -> PickerRender:
+        """Hit WP ``search=`` and rank; build a ``PickerRender``."""
+        try:
+            matches = await search_live(self.tracker.publisher.wordpress, query, threshold=threshold)
+        except Exception as e:
+            logger.error(f"Live WP search failed: {e}")
+            matches = []
+        return PickerRender(
+            embed=format_picker_embed(
+                query, matches,
+                source="live", fell_back_to_live=True, threshold=threshold,
+            ),
+            view=SearchPickerView(
+                dispatcher=self,
+                request=PickerRequest(query=query, threshold=threshold, source="live"),
+                matches=matches,
+            ),
+        )
+
+    async def _cache_is_stale_or_empty(self) -> bool:
+        """True when the WP cache is empty or hasn't been refreshed for >24h."""
+        try:
+            posts = await self.db.get_wordpress_posts()
+        except Exception:
+            return True
+        if not posts:
+            return True
+        try:
+            from search import LAST_SYNCED_AT_KEY, WORDPRESS_CACHE_MAX_AGE_HOURS
+            from datetime import datetime, timedelta
+            raw = await self.db.get_service_state(LAST_SYNCED_AT_KEY)
+            if not raw:
+                return True
+            last = datetime.fromisoformat(raw)
+            return (datetime.now() - last) > timedelta(hours=WORDPRESS_CACHE_MAX_AGE_HOURS)
+        except Exception:
+            return False
+
+    async def open_editor_for_post(
+        self,
+        interaction: discord.Interaction,
+        post_id: int,
+        request: PickerRequest,
+    ) -> None:
+        """DM the persistent editor against the chosen WP post; audit + reply."""
+        # Title resolution: cache first, fall back to live GET.
+        title = None
+        try:
+            cached = await self.db.get_wordpress_posts()
+            match = next((p for p in cached if p.id == post_id), None)
+            if match is not None:
+                title = match.title
+        except Exception:
+            match = None
+
+        if title is None:
+            try:
+                url = f"{self.tracker.publisher.wordpress.api_url}/posts/{post_id}"
+                response = await self.tracker.publisher.wordpress.client.get(url)
+                response.raise_for_status()
+                title_obj = response.json().get("title") or {}
+                title = title_obj.get("rendered", f"post {post_id}") if isinstance(title_obj, dict) else str(title_obj)
+            except Exception as e:
+                logger.warning(f"/editor title fetch failed for post {post_id}: {e}")
+                title = f"post {post_id}"
+
+        try:
+            initial_acf = await self.tracker.publisher.wordpress.get_post_acf(post_id)
+
+            async def _deliver(view: EditorView, embed: discord.Embed) -> None:
+                await self._send_dm(
+                    content=f"Post-publish editor opened for **{title}**",
+                    embed=embed,
+                    view=view,
+                )
+
+            await open_post_publish_editor(
+                publisher=self.tracker.publisher,
+                wordpress_client=self.tracker.publisher.wordpress,
+                post_id=post_id,
+                release_title=title,
+                initial_acf=initial_acf,
+                on_open=_deliver,
+            )
+        except Exception as e:
+            logger.error(f"Failed to open editor for post {post_id}: {e}")
+            await interaction.followup.send(
+                f"❌ Failed to open editor for post {post_id}: {str(e)[:100]}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"✅ Editor opened in your DMs for **{title}** (post #{post_id}).",
+            ephemeral=True,
+        )
+        try:
+            await self.db.log_audit_event(
+                "search_opened_editor",
+                {"post_id": post_id, "query": request.query, "source": request.source},
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record search_opened_editor audit: {e}")

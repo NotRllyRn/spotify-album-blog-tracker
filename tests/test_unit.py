@@ -83,6 +83,7 @@ try:
     from publisher import (
         Publisher,
         POST_CACHE_FIRST_PAGE_HASH_KEY,
+        POST_CACHE_LAST_SYNCED_AT_KEY,
         POST_CACHE_TOTAL_KEY,
         format_discord_content_for_wordpress,
         _coerce_spotify_release_date,
@@ -94,6 +95,7 @@ except ModuleNotFoundError:
     WordPressClient = None
     WordPressPostsResult = None
     POST_CACHE_FIRST_PAGE_HASH_KEY = None
+    POST_CACHE_LAST_SYNCED_AT_KEY = None
     POST_CACHE_TOTAL_KEY = None
     format_discord_content_for_wordpress = None
     _coerce_spotify_release_date = None
@@ -2153,6 +2155,11 @@ class TestPublisherPostCacheRefresh(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.saved_posts[0].artists, ["Artist Name"])
         self.assertEqual(db.saved_state[POST_CACHE_TOTAL_KEY], "1")
         self.assertEqual(db.saved_state[POST_CACHE_FIRST_PAGE_HASH_KEY], "hash-1")
+        # Slice 5: staleness signal.
+        self.assertIn(POST_CACHE_LAST_SYNCED_AT_KEY, db.saved_state)
+        # Treated as ISO datetime when read back.
+        from datetime import datetime as _dt
+        _dt.fromisoformat(db.saved_state[POST_CACHE_LAST_SYNCED_AT_KEY])
 
     def test_discord_content_formatter_builds_safe_wordpress_paragraphs(self):
         formatted = format_discord_content_for_wordpress(
@@ -3462,6 +3469,470 @@ class TestEditorStateStaysFreshAcrossNavigation(unittest.IsolatedAsyncioTestCase
         click_embed = click_inter.response.edit_message.await_args.kwargs['embed']
         booleans_field = next(f.value for f in click_embed.fields if f.name == 'Booleans')
         self.assertIn('favorite: ✅', booleans_field)
+
+
+# --- Fuzzy WordPress search -------------------------------------------------
+
+try:
+    from search import (
+        FUZZY_BASE_THRESHOLD,
+        FUZZY_LOOSE_THRESHOLD,
+        RESULT_CAP,
+        SearchMatch,
+        rank_matches,
+        search_live,
+    )
+except ModuleNotFoundError:
+    rank_matches = None
+    search_live = None
+    FUZZY_BASE_THRESHOLD = 0.55
+    FUZZY_LOOSE_THRESHOLD = 0.30
+    RESULT_CAP = 9
+    SearchMatch = None
+
+
+def _wp_post(post_id, title, artists=(), link=""):
+    """Helper to mint a WordPressPost-shaped object for scoring tests."""
+    from utils import normalize_text, normalize_artist_list  # noqa: E402
+    from models import WordPressPost  # noqa: E402
+    return WordPressPost(
+        id=post_id,
+        title=title,
+        normalized_title=normalize_text(title),
+        artists=list(artists),
+        normalized_artists=normalize_artist_list(list(artists)),
+        link=link or f"https://example.com/?p={post_id}",
+    )
+
+
+@unittest.skipUnless(rank_matches is not None, "search.py not importable")
+class TestSearchScoring(unittest.TestCase):
+    """Specs user stories 1-7, 23: scoring, AND semantics, threshold, ranking, normalization."""
+
+    def setUp(self):
+        self.posts = [
+            _wp_post(101, "Pink Floyd – The Dark Side of the Moon", ["Pink Floyd"]),
+            _wp_post(102, "Pink Floyd – A Saucerful of Secrets", ["Pink Floyd"]),
+            _wp_post(103, "Dark Tranquillity – Character", ["Dark Tranquillity"]),
+            _wp_post(104, "P!nk – Funhouse", ["P!nk"]),
+        ]
+
+    def test_empty_query_returns_no_matches(self):
+        self.assertEqual(rank_matches(self.posts, ""), [])
+        self.assertEqual(rank_matches(self.posts, "   "), [])
+
+    def test_single_token_substring_match(self):
+        """Spec story 1."""
+        matches = rank_matches(self.posts, "moon")
+        self.assertEqual([m.post_id for m in matches], [101])
+
+    def test_multi_token_substring_match(self):
+        """Query tokens all match the same post via different fields."""
+        matches = rank_matches(self.posts, "pink floyd moon")
+        self.assertEqual([m.post_id for m in matches], [101])
+
+    def test_typo_falls_back_to_fuzzy(self):
+        """Spec story 3: a transposed letter still meets threshold via fuzzy.",
+        """
+        matches = rank_matches(self.posts, "dark sidee")
+        self.assertEqual([m.post_id for m in matches], [101])
+
+    def test_and_semantics_rejects_when_one_token_missing(self):
+        """Spec story 5: 'dark' matches both Pink Floyd and Dark Tranquillity, but
+        'floyd' only matches Pink Floyd; the AND query should drop Dark Tranquillity."""
+        matches = rank_matches(self.posts, "dark floyd")
+        self.assertNotIn(103, [m.post_id for m in matches])
+        self.assertIn(101, [m.post_id for m in matches])
+
+    def test_threshold_0_55_rejects_loose_match(self):
+        """At base threshold, a near-miss token shouldn't pull in unrelated posts."""
+        matches = rank_matches(self.posts, "dark tranquil moon", threshold=FUZZY_BASE_THRESHOLD)
+        # No post should match: 103 is "dark tranquil..." but moon isn't there.
+        self.assertEqual(matches, [])
+
+    def test_threshold_0_30_admits_more(self):
+        """Looser threshold lets near-misses through."""
+        matches = rank_matches(self.posts, "dark tranquil", threshold=FUZZY_LOOSE_THRESHOLD)
+        self.assertTrue(any(m.post_id == 103 for m in matches))
+
+    def test_score_recorded_on_match(self):
+        matches = rank_matches(self.posts, "moon")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].score, 1.0)  # pure substring → score 1.0
+
+    def test_cap_at_9(self):
+        """Spec story 6."""
+        many = [_wp_post(i, "Bulk Album Long Distinctive Token", ["Bulk Artist"]) for i in range(2000, 2020)]
+        matches = rank_matches(many, "bulk")
+        self.assertEqual(len(matches), RESULT_CAP)
+        self.assertEqual(len(matches), 9)
+
+    def test_tiebreaker_newest_first(self):
+        """Spec story 7: equal scores break via wp_id DESC."""
+        posts = [
+            _wp_post(101, "Pink Floyd – Dark Side"),
+            _wp_post(150, "Pink Floyd – Wish You Were Here"),
+            _wp_post(99, "Pink Floyd – Animals"),
+        ]
+        matches = rank_matches(posts, "pink floyd")
+        ids = [m.post_id for m in matches]
+        # All three match, sorted by score then newest first.
+        self.assertEqual(ids, sorted(ids, reverse=True))
+
+    def test_unicode_normalization(self):
+        """Spec story 23."""
+        posts = [_wp_post(7, "Jvke – this is what ____ feels like", ["jvke"])]
+        matches = rank_matches(posts, "JVKE")
+        self.assertEqual([m.post_id for m in matches], [7])
+
+    def test_empty_title_post_does_not_crash(self):
+        posts = [_wp_post(0, "", []), _wp_post(1, "Real Post", ["Artist"])]
+        matches = rank_matches(posts, "real")
+        self.assertEqual([m.post_id for m in matches], [1])
+
+    def test_score_matches_via_artist_field(self):
+        posts = [
+            _wp_post(1, "Untitled", ["Pink Floyd"]),
+            _wp_post(2, "Untitled", ["Beatles"]),
+        ]
+        matches = rank_matches(posts, "pink floyd")
+        self.assertEqual([m.post_id for m in matches], [1])
+
+
+@unittest.skipUnless(rank_matches is not None, "search.py not importable")
+class TestSearchLiveRanking(unittest.IsolatedAsyncioTestCase):
+    """Spec user stories 11: live WP search uses the cache ladder for ranking."""
+
+    async def test_live_search_calls_wp_with_search_kwarg_and_ranks(self):
+        from unittest.mock import AsyncMock
+        from types import SimpleNamespace
+
+        fake_result = SimpleNamespace(posts=[
+            {"id": 1, "title": {"rendered": "Pink Floyd – Dark Side of the Moon"}, "link": "https://x/dsotm"},
+            {"id": 2, "title": {"rendered": "Pink Floyd – Animals"}, "link": "https://x/animals"},
+            {"id": 3, "title": {"rendered": "Dark Tranquillity – Character"}, "link": "https://x/dt"},
+        ])
+        client = AsyncMock()
+        client.get_posts = AsyncMock(return_value=fake_result)
+
+        matches = await search_live(client, "pink floyd moon")
+
+        client.get_posts.assert_awaited_once()
+        kwargs = client.get_posts.await_args.kwargs
+        self.assertEqual(kwargs.get("search"), "pink floyd moon")
+        self.assertEqual(kwargs.get("per_page"), 100)
+        self.assertEqual([m.post_id for m in matches], [1])
+
+    async def test_live_search_empty_response_returns_no_matches(self):
+        from unittest.mock import AsyncMock
+        client = AsyncMock()
+        client.get_posts = AsyncMock(return_value=None)
+        matches = await search_live(client, "anything")
+        self.assertEqual(matches, [])
+
+
+# --- Search picker UI ------------------------------------------------------
+
+try:
+    from search_view import (
+        EMBED_PREVIEW_ROWS,
+        PickerRequest,
+        SearchPickerView,
+        SELECT_DESC_LIMIT,
+        SELECT_LABEL_LIMIT,
+        format_picker_embed,
+    )
+except ModuleNotFoundError:
+    SearchPickerView = None
+    format_picker_embed = None
+    PickerRequest = None
+
+import discord  # noqa: E402  -- needed for isinstance checks in picker tests
+
+
+@unittest.skipUnless(format_picker_embed is not None, "search_view.py not importable")
+class TestFormatPickerEmbed(unittest.TestCase):
+    def _match(self, post_id, title, link="https://x"):
+        from search import SearchMatch  # noqa: E402
+        return SearchMatch(post_id=post_id, title=title, artists=[], link=link or "", score=0.9)
+
+    def test_empty_query_shows_no_matches_and_threshold_footer(self):
+        embed = format_picker_embed(
+            query="noresult", matches=[],
+            source="cache", fell_back_to_live=False, threshold=0.55,
+        )
+        self.assertIn("Search: noresult", embed.title)
+        self.assertIn("No matches", embed.description)
+        self.assertIn("0.55", embed.footer.text)
+
+    def test_matches_render_three_line_preview(self):
+        matches = [self._match(i, f"Album {i}", link=f"https://x/{i}") for i in (1, 2, 3, 4)]
+        embed = format_picker_embed(
+            query="album", matches=matches,
+            source="cache", fell_back_to_live=False, threshold=0.55,
+        )
+        # Up to EMBED_PREVIEW_ROWS rows in the embed body.
+        rows = [
+            line for line in embed.description.splitlines()
+            if line.startswith("1. ") or line.startswith("2. ") or line.startswith("3. ")
+        ]
+        self.assertEqual(len(rows), EMBED_PREVIEW_ROWS)
+
+    def test_fallback_banner_when_live(self):
+        embed = format_picker_embed(
+            query="foo", matches=[], source="live",
+            fell_back_to_live=True, threshold=0.30,
+        )
+        self.assertIn("⚠️", embed.description)
+        self.assertIn("live WordPress", embed.description)
+        self.assertIn("0.30", embed.footer.text)
+
+
+@unittest.skipUnless(SearchPickerView is not None, "search_view.py not importable")
+class TestSearchPickerView(unittest.IsolatedAsyncioTestCase):
+    """Spec user stories 8-12, 22: View button routing, cap, label truncation."""
+
+    def _make_dispatcher(self, *, cache_matches=None, live_matches=None):
+        from unittest.mock import AsyncMock
+
+        class _Dispatcher:
+            def __init__(self):
+                self.render_cache_picker = AsyncMock(return_value=None)
+                self.render_live_picker = AsyncMock(return_value=None)
+                self.open_editor_for_post = AsyncMock(return_value=None)
+
+        d = _Dispatcher()
+        # Default returns: re-rendered picker state.
+        from search import SearchMatch  # noqa: E402
+        from search_view import PickerRender  # noqa: E402
+
+        async def _cache_render(query, threshold):
+            matches = cache_matches or []
+            embed = format_picker_embed(query, matches, source="cache",
+                                        fell_back_to_live=False, threshold=threshold)
+            return PickerRender(
+                embed=embed,
+                view=SearchPickerView(
+                    dispatcher=d, request=PickerRequest(query=query, threshold=threshold, source="cache"),
+                    matches=matches,
+                ),
+            )
+
+        async def _live_render(query, threshold):
+            matches = live_matches or []
+            embed = format_picker_embed(query, matches, source="live",
+                                        fell_back_to_live=True, threshold=threshold)
+            return PickerRender(
+                embed=embed,
+                view=SearchPickerView(
+                    dispatcher=d, request=PickerRequest(query=query, threshold=threshold, source="live"),
+                    matches=matches,
+                ),
+            )
+
+        d.render_cache_picker.side_effect = _cache_render
+        d.render_live_picker.side_effect = _live_render
+        return d
+
+    def test_view_has_select_when_matches_non_empty(self):
+        from search import SearchMatch  # noqa: E402
+        matches = [SearchMatch(post_id=1, title="Album 1", artists=[], link="https://x/1", score=0.9)]
+        dispatcher = self._make_dispatcher(cache_matches=matches)
+        view = SearchPickerView(
+            dispatcher=dispatcher,
+            request=PickerRequest(query="album", threshold=0.55, source="cache"),
+            matches=matches,
+        )
+        selects = [c for c in view.children if isinstance(c, discord.ui.Select)]
+        self.assertEqual(len(selects), 1)
+        self.assertEqual(len(selects[0].options), 1)
+        self.assertEqual(selects[0].options[0].value, "1")
+
+    def test_view_omits_select_when_matches_empty(self):
+        dispatcher = self._make_dispatcher()
+        view = SearchPickerView(
+            dispatcher=dispatcher,
+            request=PickerRequest(query="missing", threshold=0.55, source="cache"),
+            matches=[],
+        )
+        selects = [c for c in view.children if isinstance(c, discord.ui.Select)]
+        self.assertEqual(selects, [])
+
+    def test_long_title_label_is_clipped(self):
+        from search import SearchMatch  # noqa: E402
+        long = "A" * 250
+        matches = [SearchMatch(post_id=1, title=long, artists=[], link="", score=0.9)]
+        dispatcher = self._make_dispatcher(cache_matches=matches)
+        view = SearchPickerView(
+            dispatcher=dispatcher,
+            request=PickerRequest(query="x", threshold=0.55, source="cache"),
+            matches=matches,
+        )
+        select = next(c for c in view.children if isinstance(c, discord.ui.Select))
+        self.assertLessEqual(len(select.options[0].label), SELECT_LABEL_LIMIT)
+        self.assertTrue(select.options[0].label.endswith("…"))
+
+    def test_select_capped_at_9(self):
+        """Spec story 6."""
+        from search import SearchMatch  # noqa: E402
+        matches = [SearchMatch(post_id=i, title=f"Album {i}", artists=[], link="", score=0.9) for i in range(20)]
+        dispatcher = self._make_dispatcher(cache_matches=matches[:9])
+        view = SearchPickerView(
+            dispatcher=dispatcher,
+            request=PickerRequest(query="a", threshold=0.55, source="cache"),
+            matches=matches,
+        )
+        select = next(c for c in view.children if isinstance(c, discord.ui.Select))
+        self.assertEqual(len(select.options), 9)
+
+    def _make_interaction(self):
+        response = type("R", (), {
+            "send_message": AsyncMock(), "send_modal": AsyncMock(),
+            "edit_message": AsyncMock(), "defer": AsyncMock(),
+            "is_done": Mock(return_value=False),
+        })()
+        return type("I", (), {
+            "response": response,
+            "edit_original_response": AsyncMock(),
+            "followup": type("F", (), {"send": AsyncMock()})(),
+            "message": type("M", (), {"id": "m1"})(),
+            "user": type("U", (), {"id": 123})(),
+        })()
+
+    async def test_pick_invokes_open_editor_with_post_id(self):
+        """Spec story 8."""
+        from search import SearchMatch  # noqa: E402
+        matches = [SearchMatch(post_id=42, title="X", artists=[], link="", score=0.9)]
+        dispatcher = self._make_dispatcher(cache_matches=matches)
+        view = SearchPickerView(
+            dispatcher=dispatcher,
+            request=PickerRequest(query="x", threshold=0.55, source="cache"),
+            matches=matches,
+        )
+        select = next(c for c in view.children if isinstance(c, discord.ui.Select))
+        select._values = ["42"]
+        interaction = self._make_interaction()
+        await select.callback(interaction)
+        dispatcher.open_editor_for_post.assert_awaited_once()
+        args, kwargs = dispatcher.open_editor_for_post.call_args
+        # Signature: open_editor_for_post(interaction, post_id, request)
+        self.assertEqual(args[1], 42)
+        self.assertEqual(args[2].query, "x")
+
+    async def test_search_again_re_renders_at_base_threshold(self):
+        """Spec story 10 / 12 (rerun)."""
+        from search import SearchMatch  # noqa: E402
+        matches = [SearchMatch(post_id=1, title="A", artists=[], link="", score=0.9)]
+        dispatcher = self._make_dispatcher(cache_matches=matches)
+        view = SearchPickerView(
+            dispatcher=dispatcher,
+            request=PickerRequest(query="a", threshold=0.30, source="cache"),
+            matches=matches,
+        )
+        # Locate the "Search again" button.
+        again_btn = next(c for c in view.children if getattr(c, "label", "") == "Search again")
+        await again_btn.callback(self._make_interaction())
+        dispatcher.render_cache_picker.assert_awaited_once()
+        # call_args: render_cache_picker(query, threshold) — positional.
+        args, _ = dispatcher.render_cache_picker.call_args
+        self.assertEqual(args[0], "a")
+        self.assertAlmostEqual(args[1], 0.55)
+
+    async def test_match_loosely_re_renders_at_0_30(self):
+        """Spec story 10."""
+        from search import SearchMatch  # noqa: E402
+        matches = [SearchMatch(post_id=1, title="A", artists=[], link="", score=0.9)]
+        dispatcher = self._make_dispatcher(cache_matches=matches)
+        view = SearchPickerView(
+            dispatcher=dispatcher,
+            request=PickerRequest(query="a", threshold=0.55, source="cache"),
+            matches=matches,
+        )
+        loose_btn = next(c for c in view.children if getattr(c, "label", "") == "Match loosely")
+        await loose_btn.callback(self._make_interaction())
+        dispatcher.render_cache_picker.assert_awaited_once()
+        args, _ = dispatcher.render_cache_picker.call_args
+        self.assertAlmostEqual(args[1], 0.30)
+
+    async def test_search_live_invokes_live_renderer(self):
+        """Spec story 11."""
+        from search import SearchMatch  # noqa: E402
+        matches = [SearchMatch(post_id=1, title="A", artists=[], link="", score=0.9)]
+        dispatcher = self._make_dispatcher(live_matches=matches)
+        view = SearchPickerView(
+            dispatcher=dispatcher,
+            request=PickerRequest(query="a", threshold=0.55, source="cache"),
+            matches=matches,
+        )
+        live_btn = next(c for c in view.children if getattr(c, "label", "") == "Search live")
+        await live_btn.callback(self._make_interaction())
+        dispatcher.render_live_picker.assert_awaited_once()
+
+
+@unittest.skipUnless(SearchPickerView is not None, "search_view.py not importable")
+class TestCacheStalenessSignal(unittest.IsolatedAsyncioTestCase):
+    """Spec stories 13-14: empty cache and stale cache auto-fall-back."""
+
+    async def test_empty_cache_is_stale(self):
+        """Spec story 13."""
+        from datetime import datetime, timedelta
+        from search import LAST_SYNCED_AT_KEY
+        from discord_bot import DiscordBot
+        from unittest.mock import AsyncMock
+
+        class FakeDb:
+            async def get_wordpress_posts(self):
+                return []
+            async def get_service_state(self, key):
+                return None
+
+        bot = DiscordBot.__new__(DiscordBot)
+        bot.db = FakeDb()
+        self.assertTrue(await bot._cache_is_stale_or_empty())
+
+    async def test_recent_cache_is_not_stale(self):
+        from datetime import datetime, timedelta
+        from search import LAST_SYNCED_AT_KEY, WORDPRESS_CACHE_MAX_AGE_HOURS
+
+        recent_iso = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+        from utils import normalize_text, normalize_artist_list  # noqa: E402
+        from models import WordPressPost  # noqa: E402
+        cached = [WordPressPost(id=1, title="x", normalized_title=normalize_text("x"),
+                                artists=[], normalized_artists=normalize_artist_list([]),
+                                link="https://x/1")]
+
+        class FakeDb:
+            async def get_wordpress_posts(self):
+                return cached
+            async def get_service_state(self, key):
+                return recent_iso
+
+        from discord_bot import DiscordBot
+        bot = DiscordBot.__new__(DiscordBot)
+        bot.db = FakeDb()
+        self.assertFalse(await bot._cache_is_stale_or_empty())
+
+    async def test_old_cache_is_stale(self):
+        from datetime import datetime, timedelta
+        from search import WORDPRESS_CACHE_MAX_AGE_HOURS
+
+        old_iso = (datetime.now() - timedelta(hours=WORDPRESS_CACHE_MAX_AGE_HOURS + 5)).isoformat(timespec="seconds")
+        from utils import normalize_text, normalize_artist_list  # noqa: E402
+        from models import WordPressPost  # noqa: E402
+        cached = [WordPressPost(id=1, title="x", normalized_title=normalize_text("x"),
+                                artists=[], normalized_artists=normalize_artist_list([]),
+                                link="https://x/1")]
+
+        class FakeDb:
+            async def get_wordpress_posts(self):
+                return cached
+            async def get_service_state(self, key):
+                return old_iso
+
+        from discord_bot import DiscordBot
+        bot = DiscordBot.__new__(DiscordBot)
+        bot.db = FakeDb()
+        self.assertTrue(await bot._cache_is_stale_or_empty())
 
 
 if __name__ == "__main__":
