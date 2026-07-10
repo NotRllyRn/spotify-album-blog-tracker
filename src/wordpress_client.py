@@ -161,6 +161,14 @@ class WordPressClient:
         response.raise_for_status()
         return (response.json().get("acf") or {})
 
+    async def get_post_content_raw(self, post_id: int) -> str:
+        """Fetch the live WP ``content.raw`` for a post so the editor can pre-fill the body modal."""
+        url = f"{self.api_url}/posts/{post_id}"
+        response = await self.client.get(url, params={"context": "edit", "_fields": "content"})
+        response.raise_for_status()
+        content = (response.json().get("content") or {})
+        return content.get("raw") or ""
+
     async def delete_post(self, post_id: int, force: bool = False) -> Dict[str, Any]:
         """Delete a post (move to trash if force=False)."""
         url = f"{self.api_url}/posts/{post_id}"

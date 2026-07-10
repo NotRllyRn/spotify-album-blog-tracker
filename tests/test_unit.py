@@ -114,10 +114,12 @@ try:
         EditorTracksView,
         PrePublishSink,
         PostPublishSink,
+        BodyModal,
         build_editor_embed,
         _project_field_to_scf,
         _coerce_field_for_scf,
         _tracks_from_acf,
+        _wp_html_to_modal_text,
     )
 except ModuleNotFoundError:
     EditorState = None
@@ -125,10 +127,12 @@ except ModuleNotFoundError:
     EditorTracksView = None
     PrePublishSink = None
     PostPublishSink = None
+    BodyModal = None
     build_editor_embed = None
     _project_field_to_scf = None
     _coerce_field_for_scf = None
     _tracks_from_acf = None
+    _wp_html_to_modal_text = None
 
 
 def make_release_for_test(spotify_id, title, last_seen, tracks=None):
@@ -3169,6 +3173,107 @@ class TestDynamicButtonCallbackSignatures(unittest.TestCase):
                 )
 
 
+@unittest.skipIf(BodyModal is None or _wp_html_to_modal_text is None, "editor_view helpers unavailable")
+class TestBodyModalPrefill(unittest.IsolatedAsyncioTestCase):
+    """The post-publish Body button must pre-fill the TextInput with the live WP ``content.raw``
+    so the user can edit iteratively instead of accidentally overwriting an existing body."""
+
+    @staticmethod
+    def _make_interaction():
+        response = type(
+            "FakeResponse", (),
+            {
+                "send_message": AsyncMock(),
+                "send_modal": AsyncMock(),
+                "edit_message": AsyncMock(),
+                "defer": AsyncMock(),
+                "is_done": Mock(return_value=False),
+            },
+        )()
+        return type(
+            "FakeInteraction", (),
+            {
+                "response": response,
+                "followup": type("FakeFollowup", (), {"send": AsyncMock()})(),
+                "message": type("FakeMessage", (), {"id": "m_body"})(),
+                "user": type("FakeUser", (), {"id": 1})(),
+            },
+        )()
+
+    @staticmethod
+    def _make_view(wordpress=None):
+        wordpress = wordpress or MagicMock()
+        sink = PostPublishSink(
+            publisher=MagicMock(),
+            wordpress_client=wordpress,
+            post_id=42,
+        )
+        sink.state = EditorState()
+        return EditorView(
+            sink=sink,
+            release_title="Album",
+            tracks_for_editor=lambda: [],
+        ), wordpress
+
+    def test_wp_html_to_modal_text_strips_tags_and_decodes_entities(self):
+        self.assertEqual(
+            _wp_html_to_modal_text("<p>Hello &amp; world</p>"),
+            "Hello & world",
+        )
+        self.assertEqual(
+            _wp_html_to_modal_text("<p>First</p><p>Second</p>"),
+            "First\n\nSecond",
+        )
+        # No triple newlines even when the source already contains them.
+        self.assertNotIn("\n\n\n", _wp_html_to_modal_text("<p>a</p>\n\n<p>b</p>"))
+        self.assertEqual(_wp_html_to_modal_text(""), "")
+
+    def test_body_modal_uses_supplied_default(self):
+        view, _ = self._make_view()
+        (text_input,) = view._build_body_modal(prefill="Hello world").children
+        self.assertEqual(text_input.default, "Hello world")
+
+    def test_body_modal_default_is_empty_when_no_prefill(self):
+        view, _ = self._make_view()
+        (text_input,) = view._build_body_modal().children
+        self.assertEqual(text_input.default, "")
+
+    async def test_open_body_modal_prefills_with_stripped_live_body(self):
+        view, wordpress = self._make_view()
+        wordpress.get_post_content_raw = AsyncMock(
+            return_value="<p>First paragraph</p>\n\n<p>Second &amp; more</p>"
+        )
+        interaction = self._make_interaction()
+
+        await view._open_body_modal(interaction)
+
+        wordpress.get_post_content_raw.assert_awaited_once_with(42)
+        modal = interaction.response.send_modal.await_args.args[0]
+        (text_input,) = modal.children
+        self.assertEqual(text_input.default, "First paragraph\n\nSecond & more")
+
+    async def test_open_body_modal_falls_back_to_empty_on_fetch_error(self):
+        view, wordpress = self._make_view()
+        wordpress.get_post_content_raw = AsyncMock(side_effect=RuntimeError("WP down"))
+        interaction = self._make_interaction()
+
+        await view._open_body_modal(interaction)
+        modal = interaction.response.send_modal.await_args.args[0]
+        (text_input,) = modal.children
+        self.assertEqual(text_input.default, "")
+
+    async def test_open_body_modal_does_not_block_on_missing_wordpress_attr(self):
+        view, _ = self._make_view()
+        view.sink.wordpress = None
+        view.sink.post_id = None
+        interaction = self._make_interaction()
+
+        await view._open_body_modal(interaction)
+        modal = interaction.response.send_modal.await_args.args[0]
+        (text_input,) = modal.children
+        self.assertEqual(text_input.default, "")
+
+
 @unittest.skipIf(EditorState is None, "editor_view module is not importable")
 class TestEditorViewRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
     """The EditorView itself, when wired to a PrePublishSink, must dispatch all
@@ -3883,12 +3988,11 @@ class TestSearchForPostsRouting(unittest.IsolatedAsyncioTestCase):
         )
 
     def _make_db(self, cached=None, last_synced_at_iso=None):
-        # ``get_service_state`` is sync (called inside ``_is_cache_stale``);
-        # ``get_wordpress_posts`` is async.
+        # ``get_service_state`` is async now (the helper awaits it).
         from unittest.mock import AsyncMock, Mock
         db = Mock()
         db.get_wordpress_posts = AsyncMock(return_value=cached or [])
-        db.get_service_state = Mock(return_value=last_synced_at_iso)
+        db.get_service_state = AsyncMock(return_value=last_synced_at_iso)
         return db
 
     def _make_wp_client(self, fake_result):

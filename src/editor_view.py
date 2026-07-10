@@ -12,7 +12,9 @@ is opened only when the field needs freeform input.
 """
 
 import asyncio
+import html
 import logging
+import re
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable, TYPE_CHECKING
@@ -606,11 +608,19 @@ class EditorView(discord.ui.View):
         raise ValueError(f"Unknown modal field: {name}")
 
     # The post-publish "Body" field reuses the existing PostContentModal shape.
-    def _build_body_modal(self) -> "BodyModal":
-        return BodyModal(self)
+    def _build_body_modal(self, prefill: str = "") -> "BodyModal":
+        return BodyModal(self, default=prefill)
 
     async def _open_body_modal(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(self._build_body_modal())
+        prefill = ""
+        wordpress = getattr(self.sink, "wordpress", None)
+        post_id = getattr(self.sink, "post_id", None)
+        if wordpress is not None and post_id is not None:
+            try:
+                prefill = _wp_html_to_modal_text(await wordpress.get_post_content_raw(post_id))
+            except Exception:
+                logger.exception("Failed to fetch live post body for editor prefill")
+        await interaction.response.send_modal(self._build_body_modal(prefill=prefill))
 
     # --- Top-level transitions -------------------------------------------
 
@@ -761,17 +771,37 @@ class EditorView(discord.ui.View):
 # the live acf-style update) -------------------------------------------------
 
 
+_BLOCK_TAG = re.compile(r"</?\s*(?:p|br|h[1-6]|li|ul|ol)\s*/?>", re.IGNORECASE)
+_TAG = re.compile(r"<[^>]+>")
+_BLANK_LINE = re.compile(r"\n{2,}")
+
+
+def _wp_html_to_modal_text(body: str) -> str:
+    """Convert WP ``content.raw`` HTML into plain text for modal prefill.
+
+    Mirrors the round-trip through :func:`publisher.format_discord_content_for_wp`
+    so what the user sees in the modal is approximately what they previously typed.
+    """
+    if not body:
+        return ""
+    text = _BLOCK_TAG.sub("\n\n", body)
+    text = _TAG.sub("", text)
+    text = html.unescape(text)
+    text = _BLANK_LINE.sub("\n\n", text.strip())
+    return text
+
+
 class BodyModal(discord.ui.Modal):
     """Modal that edits the WP post ``content`` field through the sink."""
 
-    def __init__(self, editor_view: "EditorView"):
+    def __init__(self, editor_view: "EditorView", *, default: str = ""):
         super().__init__(title="Post body", timeout=180)
         self.editor_view = editor_view
         body_input = discord.ui.TextInput(
             label="Post body",
             style=discord.TextStyle.paragraph,
             placeholder="Write the body to add to the WordPress post.",
-            default="",
+            default=default,
             max_length=4000,
         )
         self.add_item(body_input)

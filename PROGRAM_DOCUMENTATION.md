@@ -1382,6 +1382,14 @@ GET /wp/v2/posts/{post_id}?context=edit
 
 It returns the `acf` block of the live post, or `{}` if the post has no SCF fields yet. The post-publish editor calls this on every `snapshot()` to keep its embed in sync with the canonical values on WordPress.
 
+`WordPressClient.get_post_content_raw(post_id)` is the body counterpart used by the body button of the post-publish editor:
+
+```text
+GET /wp/v2/posts/{post_id}?context=edit&_fields=content
+```
+
+It returns `content.raw` (or `""` on miss). The editor strips HTML via `_wp_html_to_modal_text` before pre-filling the body modal, so the user sees the same paragraphs they previously typed rather than raw `<p>` markup.
+
 ### Trash/Undo
 
 `Publisher.trash_post(post_id)` calls:
@@ -1516,7 +1524,7 @@ SCF editor view: `EditorView`
 - `editor:bool:unreleased`: toggle the SCF `unreleased` flag inline.
 - `editor:modal:rating`: open a single-field modal for the SCF `music_rating` (integer 0-100).
 - `editor:modal:notes`: open a single-field paragraph modal for the SCF `music_notes` (max 4000).
-- `editor:modal:body`: open a single-field paragraph modal to replace the WP post `content` (post-publish only).
+- `editor:modal:body`: open a single-field paragraph modal that **pre-fills with the live WP `content.raw`** (HTML stripped back to plain text, paragraphs preserved) so the editor can replace rather than overwrite. Submitting routes through `Publisher.update_post_content`. Post-publish only.
 - `editor:open:tracks`: open the paginated track-highlight sub-view.
 - `editor:nav:resync` (post-publish only): re-read the live SCF from WP into the editor.
 - `editor:nav:refresh`: rebuild the embed from the current in-memory state.
@@ -1607,6 +1615,8 @@ Field-name bridge (used by `PostPublishSink.update_field`):
 - per-track `highlight` → single-row patch into `music_tracks` repeater.
 
 The publish pipeline (`Publisher._build_scf_payload`) re-reads `release.rating / favorite / notes / unreleased / track.highlight` so pre-publish edits ride along with the SCF auto-fill on publish, without any merge step.
+
+Body pre-fill helper (`_wp_html_to_modal_text`): strips `<p>`/`<br>`/`<li>`/`<ul>`/`<ol>`/heading tags back to `\n\n`, drops the remaining tags, decodes HTML entities, and collapses runs of blank lines. Behaviour is the semantic inverse of `Publisher.format_discord_content_for_wordpress`, so what the user types round-trips losslessly when they re-save the modal.
 
 ### Fuzzy WordPress Search
 

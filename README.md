@@ -97,7 +97,7 @@ Every Discord-published post can be edited through a persistent editor embed sen
 - **Pre-publish**: open from `/inprogress` → select a release → "Edit metadata". Edits land in the SQLite row and ride along with the publish flow (rating, favorite, notes, unreleased, per-track highlight).
 - **Post-publish**: open from the publish-confirmation embed's "Edit metadata" button. Edits PATCH the live WordPress `acf` block via `POST /wp/v2/posts/{id}`.
 
-Bool fields (`favorite`, `unreleased`) flip inline with one click. Number and long-text fields open a single-field modal. Per-track highlights live in a paginated sub-view. There is also a "Re-sync from WP" button to re-read SCF after manual WP edits, and a "Body" modal to replace the post body.
+Bool fields (`favorite`, `unreleased`) flip inline with one click. Number and long-text fields open a single-field modal. Per-track highlights live in a paginated sub-view. There is also a "Re-sync from WP" button to re-read SCF after manual WP edits, and a "Body" modal that **pre-fills with the current WP body** (HTML stripped back to plain text) so iterative edits replace rather than overwrite from scratch.
 
 ## SCF Auto-Fill
 
