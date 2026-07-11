@@ -33,3 +33,6 @@ Thumbs.db
 
 .old/
 .pi-subagents/
+
+# ignore data
+data/
