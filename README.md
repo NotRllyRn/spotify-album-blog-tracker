@@ -2,18 +2,6 @@
 
 A standalone Python service that monitors Spotify playback and automatically posts album releases to WordPress via REST API, with Discord bot control.
 
-## Status: ✅ IMPLEMENTATION COMPLETE
-
-The service is fully implemented and tested. It successfully:
-
-- ✅ Monitors Spotify playback in real-time
-- ✅ Classifies releases (Album/EP/Single/Compilation)
-- ✅ Publishes to WordPress with artwork and metadata
-- ✅ Prevents duplicate posts
-- ✅ Tracks saved Spotify library Albums/EPs as a listen-to list
-- ✅ Provides Discord bot control
-- ✅ Persists state in SQLite database
-
 ## Quick Start
 
 1. **Set up environment:**
