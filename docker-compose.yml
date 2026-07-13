@@ -5,6 +5,8 @@ services:
     env_file:
       - .env
     volumes:
+      # live editing
+      - .:/app
       - ./logs:/app/logs
       - ./data:/app/data
     restart: unless-stopped
