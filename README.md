@@ -136,4 +136,4 @@ Fix: reload your Discord client (`Ctrl+R` / `Cmd+R`, or fully quit and reopen). 
 
 ## License
 
-MIT
+CC BY-NC 4.0 license
