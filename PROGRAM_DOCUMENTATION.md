@@ -1194,7 +1194,7 @@ DELETE /wp-json/wp/v2/media/{media_id}
 9. When `Config.fill_scf_enabled` is true, fills the SCF `acf` block on the new post (see [SCF Auto-Fill](#scf-auto-fill)).
 10. Stores `wordpress_post_id` and `wordpress_media_id` on the release object.
 11. Forces a WordPress post-cache refresh.
-12. Returns a `PublishResult` with `post`, `scf_pending_tags`, and `listen_count` (see [Data Models](#data-models-and-state)).
+12. Returns a `PublishResult` with `post`, `scf_pending_tags`, `listen_count`, and `scf_attempted` (see [Data Models](#data-models-and-state)).
 
 Post data shape:
 
@@ -1213,8 +1213,8 @@ Post data shape:
 
 When the `SPOTIFY_BLOG_TRACKER_FILL_SCF=1` feature flag is set, every Discord-published release gets the same SCF `acf` block that `Wordpress-PostToAlbum-Script` writes for the rest of the blog. The fill happens in two steps on the new post, both of which are no-ops when the flag is off:
 
-1. `_build_scf_payload(release, listen_count, post)` serialises what's already in the in-memory `Release` (album metadata, track list, artwork URL, release date) plus one Last.fm call (`album.getinfo`) into the `acf` payload. It returns `(acf, fetch_status)` where `fetch_status["mood_tags"]` is `None` when Last.fm returned no usable tags and a list otherwise.
-2. `_fill_post_scf(post_id, acf_payload)` `POST /wp/v2/posts/{id}` with `{"acf": ...}`. SCF keeps any un-supplied meta intact on update.
+1. `_build_scf_payload(release, listen_count, post)` serialises what's already in the in-memory `Release` (album metadata, track list, artwork URL, release date) plus one Last.fm call (`album.getinfo`) into the `acf` payload. It returns `(acf, fetch_status)` where `fetch_status["mood_tags"]` is `None` when Last.fm returned no usable tags and a list otherwise. Unset numeric fields are omitted; for example, an unset `music_rating` is not sent as an SCF-invalid empty string.
+2. `_fill_post_scf(post_id, acf_payload)` sends `POST /wp/v2/posts/{id}` with `{"acf": ...}`, then reads the live ACF block back and verifies `music_tracks`, `spotify_album_id`, and `listen-count`. SCF keeps any un-supplied meta intact on update.
 
 #### Fields
 
@@ -1252,7 +1252,11 @@ LFM_TAG_BLOCKLIST = (
 
 #### Failure handling
 
-`_build_scf_payload` swallows Last.fm HTTP errors and returns an empty `tags` list, so a Last.fm outage can never block a publish. The publish itself always succeeds, even if `_fill_post_scf` raises: the publish path logs the SCF error, marks the post in the result with `scf_pending_tags = ["scf_error"]`, and the operator still gets the standard publish notification. The only field that can plausibly be missing is `music_mood_tags`; the embed surfaces that gap so it is visible instead of silent.
+`_build_scf_payload` swallows Last.fm HTTP errors and returns an empty `tags` list, so a Last.fm outage cannot block the core WordPress post. Missing mood tags are reported as `scf_pending_tags = ["mood_tags"]`.
+
+If the SCF request is rejected or its critical fields fail read-back verification, the already-created post is retained and `PublishResult.scf_pending_tags` contains `"scf_error"`. The Discord notification explicitly reports the partial failure instead of claiming auto-fill succeeded. Only failed notifications expose **Retry metadata**. It calls `Publisher.retry_post_scf`, which updates and verifies the existing post without calling `create_post`; the prompt stores the original listen count so a retry does not increment it. The action expires with the retained release data after 24 hours.
+
+`WordPressClient.update_post` logs only the WordPress error code, invalid parameter names/field paths, and submitted field names plus Python value types. Server-supplied messages and ACF values are not logged.
 
 ### Categories
 
@@ -1373,6 +1377,8 @@ to `WordPressClient.update_post`.
 ```
 
 This is a one-line wrapper over `WordPressClient.update_post`. SCF accepts partial `acf` dicts; included fields replace, omitted fields are untouched. The Discord post-publish editor (see `src/editor_view.py`) routes every field edit through this helper.
+
+`Publisher.retry_post_scf(release, post_id, listen_count)` is the safe recovery path for publish-time metadata failures. It fetches the existing post date and ACF block, rebuilds generated fields only, preserves curated metadata and existing track rows/highlights, writes missing generated fields, and performs the same critical-field verification. It never creates a WordPress post.
 
 `WordPressClient.get_post_acf(post_id)` is the read counterpart:
 
@@ -1567,15 +1573,16 @@ After successful WordPress publishing, `send_publish_notification(release, resul
 - artwork thumbnail
 - original post ID if relisten
 - `Listen count` (only when `result.listen_count > 1`)
-- `⚠️ SCF metadata` field (only when the SCF block wrote everything except mood tags)
+- `⚠️ SCF metadata` field when mood tags are unavailable or the SCF write failed
 
 The plain-text line above the embed reflects what was filled:
 
 - `The release has been published to WordPress and SCF metadata was auto-filled.` when mood tags landed.
 - `The release has been published to WordPress, but SCF mood tags could not be filled (Last.fm returned no tags).` when Last.fm had no usable tags for this release.
+- `The release was published to WordPress, but SCF metadata failed to save.` when WordPress rejects the ACF block or verification fails.
 - `The release has been published to WordPress.` when `SPOTIFY_BLOG_TRACKER_FILL_SCF` is off.
 
-It attaches the published-post actions view and saves a `PromptType.PROMPT_UNDO` prompt.
+It attaches the published-post actions view (`Edit metadata`, `Undo post`, and `Keep post`; `Retry metadata` is added only for `scf_error`) and saves a `PromptType.PROMPT_UNDO` prompt. Release-dependent recovery/undo expires with the retained release after 24 hours, while Edit metadata and Add content remain post-ID-based. The prompt stores `listen_count` for an idempotent metadata-only retry.
 
 ### Discord Presence
 
@@ -2291,7 +2298,11 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 `_fill_post_scf(self, post_id, acf_payload)`:
 
-- `POST /wp/v2/posts/{post_id}` with `{"acf": acf_payload}` so SCF picks up the new fields while leaving un-supplied meta intact.
+- `POST /wp/v2/posts/{post_id}` with `{"acf": acf_payload}`, then verifies `music_tracks`, `spotify_album_id`, and `listen-count` through a live ACF read.
+
+`retry_post_scf(self, release, post_id, listen_count)`:
+
+- Rebuilds and verifies generated SCF metadata on an existing post without creating another post, while preserving curated fields and existing track rows/highlights.
 
 ### `src/wordpress_client.py`
 
@@ -2322,7 +2333,11 @@ This catalog documents every class, function, and method in `main.py`, `scripts/
 
 `update_post(self, post_id, data)`:
 
-- Updates a WordPress post.
+- Updates a WordPress post. Failed responses log safe structural error details and payload field types before re-raising; response messages and field values are excluded.
+
+`get_post(self, post_id, **params)`:
+
+- Fetches one WordPress post; metadata retry uses it to recover the original post date.
 
 `delete_post(self, post_id, force=False)`:
 
@@ -2736,7 +2751,7 @@ Classes:
 - `SavedLibraryStats`
 - `SavedLibrarySyncResult`
 - `DiscordPrompt`
-- `PublishResult` (returned by `Publisher.publish_release`; fields: `post: dict`, `scf_pending_tags: list[str]`, `listen_count: int`)
+- `PublishResult` (returned by `Publisher.publish_release`; fields: `post: dict`, `scf_pending_tags: list[str]`, `listen_count: int`, `scf_attempted: bool`)
 
 These are covered in [Data Models And State](#data-models-and-state).
 
@@ -2974,13 +2989,14 @@ PYTHONPATH=src python3 -m unittest -v
 `TestPublisherSCFFill`:
 
 - Verifies `_build_scf_payload` uses only countable tracks, sums their durations, derives totals/averages/explicit-flag, and coerces release dates and post dates.
-- Verifies `_fill_post_scf` PATCHes the `acf` block on the new post.
+- Verifies `_fill_post_scf` writes the `acf` block and detects failed persistence through read-back verification.
 - Verifies `_count_listen_index` returns `matches + 1`.
-- Verifies the Real `publish_release` path with SCF enabled returns a `PublishResult`, calls `update_post`, marks mood-tags pending when Last.fm has no tags, marks `scf_error` when the SCF update raises, and is a no-op when the feature flag is off.
+- Verifies the real `publish_release` path returns a `PublishResult`, sends a live-schema-valid payload, marks mood tags or SCF failures pending, and is a no-op when the feature flag is off.
+- Verifies metadata retry updates the existing post without calling `create_post`.
 
 `TestPublishNotificationEmbed`:
 
-- Verifies the SCF auto-fill text appears when everything landed, the mood-tags-unavailable text appears when Last.fm had no tags, the corresponding `⚠️ SCF metadata` field is added in that case, and the `Listen count` field appears only when `result.listen_count > 1`.
+- Verifies success, missing mood tags, and total SCF failure are reported distinctly, and `Listen count` appears only when greater than one.
 
 ### Manual Documentation Verification
 

@@ -83,13 +83,22 @@ SPOTIFY_BLOG_TRACKER_FILL_SCF=1
 Every Discord-published post can be edited through a persistent editor embed sent to your DM. The editor supports both pre-publish and post-publish modes:
 
 - **Pre-publish**: open from `/inprogress` → select a release → "Edit metadata". Edits land in the SQLite row and ride along with the publish flow (rating, favorite, notes, unreleased, per-track highlight).
-- **Post-publish**: open from the publish-confirmation embed's "Edit metadata" button. Edits PATCH the live WordPress `acf` block via `POST /wp/v2/posts/{id}`.
+- **Post-publish**: open from the publish-confirmation embed's "Edit metadata" button. Edits PATCH the live WordPress `acf` block via `POST /wp/v2/posts/{id}`. After an auto-fill failure, "Retry metadata" re-runs only the SCF write and never creates another post.
 
 Bool fields (`favorite`, `unreleased`) flip inline with one click. Number and long-text fields open a single-field modal. Per-track highlights live in a paginated sub-view. There is also a "Re-sync from WP" button to re-read SCF after manual WP edits, and a "Body" modal that **pre-fills with the current WP body** (HTML stripped back to plain text) so iterative edits replace rather than overwrite from scratch.
 
 ## SCF Auto-Fill
 
-When `SPOTIFY_BLOG_TRACKER_FILL_SCF=1`, every Discord-published release is backfilled with the same SCF `acf` block that the `Wordpress-PostToAlbum-Script` writes for the rest of the blog: `music_tracks`, `music_length_ms`, `spotify_album_id`, `spotify_album_url`, `music_release_date`, `music_listened_at`, `lastfm_release_id`, `music_total_tracks`, `music_avg_track_ms`, `music_explicit`, `music_mood_tags`, and `listen-count`. Spotify data is reused from the in-memory `Release`; mood tags and the MusicBrainz release ID come from one Last.fm `album.getinfo` call. The publish notification surfaces a `Listen count` field when the value is greater than one and a `⚠️ SCF metadata` warning if Last.fm returned no mood tags.
+When `SPOTIFY_BLOG_TRACKER_FILL_SCF=1`, every Discord-published release is backfilled with the same SCF `acf` block that the `Wordpress-PostToAlbum-Script` writes for the rest of the blog: `music_tracks`, `music_length_ms`, `spotify_album_id`, `spotify_album_url`, `music_release_date`, `music_listened_at`, `lastfm_release_id`, `music_total_tracks`, `music_avg_track_ms`, `music_explicit`, `music_mood_tags`, and `listen-count`. Spotify data is reused from the in-memory `Release`; mood tags and the MusicBrainz release ID come from one Last.fm `album.getinfo` call. Unset numeric values are omitted instead of being sent as invalid empty strings. After the write, the tracker re-reads and verifies `music_tracks`, `spotify_album_id`, and `listen-count`.
+
+The publish notification surfaces a `Listen count` field when the value is greater than one. Missing Last.fm tags produce a warning but do not invalidate the other metadata. A rejected or unverified SCF write produces an explicit failure warning and leaves the existing WordPress post available for the metadata-only retry action.
+
+### Troubleshooting SCF metadata
+
+- Check the service log for WordPress's REST error code, invalid parameter names/field paths, and submitted ACF field types. Response messages and submitted values are never logged.
+- Use **Retry metadata** on a failed publish notification within 24 hours, before the retained release data expires. This backfills generated fields on the existing post, preserves curated metadata and existing track highlights, and cannot create a duplicate.
+- Use **Edit metadata** for individual manual corrections.
+- A successful retry is followed by a live read-back verification; do not treat HTTP 200 alone as proof that SCF persisted the fields.
 
 ## WordPress Setup
 

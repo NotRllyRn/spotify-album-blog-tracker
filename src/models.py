@@ -160,3 +160,4 @@ class PublishResult:
     post: Dict[str, Any]
     scf_pending_tags: List[str]
     listen_count: int
+    scf_attempted: bool = True

@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 
 POST_CACHE_TOTAL_KEY = "wordpress_post_cache.x_wp_total"
 POST_CACHE_FIRST_PAGE_HASH_KEY = "wordpress_post_cache.first_page_hash"
+SCF_VERIFY_FIELDS = ("music_tracks", "spotify_album_id", "listen-count")
+SCF_AUTO_FIELDS = (
+    "music_tracks", "music_length_ms", "spotify_album_id", "spotify_album_url",
+    "music_release_date", "music_listened_at", "lastfm_release_id", "music_total_tracks",
+    "music_avg_track_ms", "music_explicit", "music_mood_tags", "listen-count",
+)
 
 
 def format_discord_content_for_wordpress(raw_content: str) -> str:
@@ -153,6 +159,7 @@ class Publisher:
                 post=post,
                 scf_pending_tags=scf_pending_tags,
                 listen_count=listen_count,
+                scf_attempted=self._fill_scf_enabled,
             )
 
         except Exception as e:
@@ -182,6 +189,27 @@ class Publisher:
         post = await self.wordpress.update_post(post_id, {"acf": partial_acf})
         logger.info("Updated SCF metadata for post %s: %s", post_id, sorted(partial_acf.keys()))
         return post
+
+    async def retry_post_scf(self, release: Release, post_id: int, listen_count: int) -> list[str]:
+        """Retry SCF metadata only; never create another WordPress post."""
+        post = await self.wordpress.get_post(post_id, context="edit", _fields="id,date,acf")
+        generated, fetch_status = await self._build_scf_payload(release, listen_count, post)
+        raw_acf = post.get("acf")
+        live_acf = raw_acf if isinstance(raw_acf, dict) else {}
+        identity_missing = live_acf.get("spotify_album_id") in (None, "")
+        acf_payload = {
+            field: generated[field]
+            for field in SCF_AUTO_FIELDS
+            if live_acf.get(field) in (None, "", [])
+            or (field == "music_explicit" and identity_missing)
+        }
+        if acf_payload:
+            await self._fill_post_scf(post_id, acf_payload)
+        mood_tags_missing = (
+            fetch_status.get("mood_tags") is None
+            and live_acf.get("music_mood_tags") in (None, "", [])
+        )
+        return ["mood_tags"] if mood_tags_missing else []
 
     async def _ensure_categories(self):
         """Ensure required categories exist."""
@@ -385,14 +413,23 @@ class Publisher:
             "music_explicit": any_explicit,
             "music_mood_tags": [{"mood": tag} for tag in mood_tags],
             "listen-count": listen_count,
-            "music_rating": release.rating if release.rating is not None else "",
             "music_favorite": release.favorite,
             "music_notes": release.notes or "",
             "unreleased": release.unreleased,
         }
+        if release.rating is not None:
+            acf["music_rating"] = release.rating
         return acf, fetch_status
 
     async def _fill_post_scf(self, post_id: int, acf_payload: Dict[str, Any]) -> None:
-        """PATCH a WordPress post with the SCF ``acf`` block."""
+        """Write SCF metadata and verify the critical fields persisted."""
         await self.wordpress.update_post(post_id, {"acf": acf_payload})
-        logger.info("Filled SCF metadata for post %s", post_id)
+        persisted = await self.wordpress.get_post_acf(post_id)
+        mismatches = [
+            field
+            for field in SCF_VERIFY_FIELDS
+            if field in acf_payload and persisted.get(field) != acf_payload[field]
+        ]
+        if mismatches:
+            raise RuntimeError(f"SCF verification failed for fields: {', '.join(mismatches)}")
+        logger.info("Filled and verified SCF metadata for post %s", post_id)

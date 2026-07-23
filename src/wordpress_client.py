@@ -15,6 +15,38 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 
+def _payload_type_summary(data: Dict[str, Any]) -> str:
+    acf = data.get("acf")
+    if isinstance(acf, dict):
+        return ", ".join(f"{field}={type(value).__name__}" for field, value in sorted(acf.items()))
+    return ", ".join(f"{field}={type(value).__name__}" for field, value in sorted(data.items()))
+
+
+def _response_error_summary(response: httpx.Response) -> Dict[str, Any]:
+    """Return actionable error structure without logging server-supplied messages."""
+    try:
+        body = response.json()
+    except ValueError:
+        return {"code": "non_json_response", "status": response.status_code}
+    if not isinstance(body, dict):
+        return {"code": "unexpected_response", "status": response.status_code}
+    data = body.get("data")
+    params = data.get("params") if isinstance(data, dict) else None
+    details = data.get("details") if isinstance(data, dict) else None
+    field_paths = []
+    if isinstance(details, dict):
+        field_paths = [
+            detail.get("data", {}).get("param")
+            for detail in details.values()
+            if isinstance(detail, dict) and isinstance(detail.get("data"), dict)
+        ]
+    return {
+        "code": body.get("code"),
+        "params": sorted(params) if isinstance(params, dict) else [],
+        "field_paths": [path for path in field_paths if path],
+    }
+
+
 @dataclass
 class WordPressPostsResult:
     posts: List[Dict[str, Any]]
@@ -132,7 +164,7 @@ class WordPressClient:
         ]):
             return False
 
-        if not x_wp_total.isdigit():
+        if x_wp_total is None or not x_wp_total.isdigit():
             return False
 
         return (
@@ -151,6 +183,19 @@ class WordPressClient:
         """Update a post."""
         url = f"{self.api_url}/posts/{post_id}"
         response = await self.client.post(url, json=data)
+        if not response.is_success:
+            logger.error(
+                "WordPress post %s update failed: %s; payload types: %s",
+                post_id,
+                _response_error_summary(response),
+                _payload_type_summary(data),
+            )
+        response.raise_for_status()
+        return response.json()
+
+    async def get_post(self, post_id: int, **params) -> Dict[str, Any]:
+        """Fetch one WordPress post."""
+        response = await self.client.get(f"{self.api_url}/posts/{post_id}", params=params)
         response.raise_for_status()
         return response.json()
 
@@ -210,7 +255,7 @@ class WordPressClient:
 
         if self._tag_cache_matches(x_wp_total, first_page_hash):
             logger.info("Using cached WordPress tags; X-WP-Total and first-page hash matched.")
-            return list(self._cached_tags)
+            return list(self._cached_tags or [])
 
         tags = list(first_page_tags)
         total_pages = self._parse_total_pages(response)
@@ -266,7 +311,7 @@ class WordPressClient:
         if not all([x_wp_total, first_page_hash, cached_x_wp_total, cached_first_page_hash]):
             return False
 
-        if not x_wp_total.isdigit():
+        if x_wp_total is None or not x_wp_total.isdigit():
             return False
 
         return (
@@ -348,7 +393,13 @@ class WordPressClient:
         """Upload media file."""
         url = f"{self.api_url}/media"
 
-        with open(file_path, "rb") as f:
+        try:
+            media_file = open(file_path, "rb")
+        except OSError:
+            logger.exception("Unable to open media file %s", file_path)
+            raise
+
+        with media_file as f:
             files = {"file": (file_path.name, f, "image/jpeg")}
             data = {"alt_text": alt_text} if alt_text else {}
 
