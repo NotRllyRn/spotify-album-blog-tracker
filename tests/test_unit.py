@@ -2497,8 +2497,8 @@ class TestPublisherSCFFill(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(acf["music_total_tracks"], 2)
         self.assertEqual(acf["music_avg_track_ms"], (180000 + 240000) // 2)
         self.assertTrue(acf["music_explicit"])
-        # Coerced release_date + d/m/Y.
-        self.assertEqual(acf["music_release_date"], "01/01/2024")
+        # Coerced release_date submitted as canonical ISO.
+        self.assertEqual(acf["music_release_date"], "2024-01-01")
         # Post date formatted as d/m/Y.
         self.assertEqual(acf["music_listened_at"], "15/03/2024")
         self.assertEqual(acf["spotify_album_id"], release.spotify_id)
@@ -2515,7 +2515,7 @@ class TestPublisherSCFFill(unittest.IsolatedAsyncioTestCase):
 
         acf, _ = await publisher._build_scf_payload(release, listen_count=1, post=post)
 
-        self.assertEqual(acf["music_release_date"], "01/01/2024")
+        self.assertEqual(acf["music_release_date"], "2024-01-01")
         self.assertEqual(acf["music_listened_at"], "31/12/2024")
 
     async def test_build_scf_payload_uses_lastfm_mbid_and_mood_tags(self):

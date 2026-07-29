@@ -1226,7 +1226,7 @@ All sources are Spotify (in-memory on the `Release`) or derived from Spotify dat
 | `music_length_ms` | number | `sum(t.duration_ms for t in countable_tracks)` |
 | `spotify_album_id` | text | `release.spotify_id` |
 | `spotify_album_url` | url | `https://open.spotify.com/album/{id}` |
-| `music_release_date` | date_picker | Spotify `release_date` (coerced YYYY/YYYY-MM to first-of-month, formatted `d/m/Y`) |
+| `music_release_date` | date_picker | Spotify `release_date` (coerced to full ISO `YYYY-MM-DD` for REST submission; SCF applies display formatting) |
 | `music_listened_at` | date_picker | the post's own `date` field (formatted `d/m/Y`) |
 | `lastfm_release_id` | text | Last.fm `album.getinfo` → `album.mbid` (empty if absent) |
 | `music_total_tracks` | number | `len(countable_tracks)` |

@@ -405,7 +405,7 @@ class Publisher:
             "music_length_ms": length_ms,
             "spotify_album_id": release.spotify_id,
             "spotify_album_url": f"https://open.spotify.com/album/{release.spotify_id}",
-            "music_release_date": _format_scf_date(_coerce_spotify_release_date(release.release_date)),
+            "music_release_date": _coerce_spotify_release_date(release.release_date),
             "music_listened_at": _format_scf_date(post.get("date")),
             "lastfm_release_id": album_info.get("mbid", "") if isinstance(album_info, dict) else "",
             "music_total_tracks": total_tracks,
