@@ -65,16 +65,16 @@ The exact module count may shrink where merging files is simpler. Avoid abstract
 
 - [x] Compare both current implementations and active SCF schema.
 - [x] Record behavior conflicts and shared invariants.
-- [ ] Commit this plan before implementation.
-- [ ] Capture baseline test commands and results in commit history.
+- [x] Commit this plan before implementation.
+- [x] Capture baseline test commands and results in commit history.
 
 **Gate:** Both original suites pass and the tracker worktree is clean after the plan commit.
 
 ### 1. Import a recoverable CLI snapshot
 
-- [ ] Copy the current CLI source, tests, active schema, and user-facing reference into a temporary `legacy/` snapshot.
+- [x] Copy the current CLI source, tests, active schema, and user-facing reference into a temporary `legacy/` snapshot.
 - [ ] Commit the snapshot before refactoring it.
-- [ ] Confirm the source CLI checkout remains untouched.
+- [x] Confirm the source CLI checkout remains untouched.
 
 **Gate:** The imported snapshot independently runs all 119 original tests.
 
