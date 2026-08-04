@@ -117,12 +117,12 @@ Extract in small, test-backed commits:
 
 ### 5. Prove interface parity
 
-- [ ] Add fixture-driven tests that run CLI and tracker adapters with identical inputs/provider fakes.
-- [ ] Assert identical managed ACF, category, and taxonomy intent.
-- [ ] Cover albums, EPs, singles, compilations, collaborations, relistens, partial dates, explicit tracks, missing MBIDs/tags, highlights, and editor-owned values.
-- [ ] Cover fill-only and overwrite-managed behavior.
-- [ ] Cover provider ambiguity/failure and no-partial-success behavior.
-- [ ] Run both complete suites together from one command.
+- [x] Add fixture-driven tests that run CLI and tracker adapters with identical inputs/provider fakes.
+- [x] Assert identical managed ACF, category, and taxonomy intent.
+- [x] Cover albums, EPs, singles, compilations, collaborations, relistens, partial dates, explicit tracks, missing MBIDs/tags, highlights, and editor-owned values.
+- [x] Cover fill-only and overwrite-managed behavior.
+- [x] Cover provider ambiguity/failure and no-partial-success behavior.
+- [x] Run both complete suites together from one command.
 
 **Gate:** The parity test compares final WordPress REST bodies, not merely intermediate models.
 
