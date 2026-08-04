@@ -625,34 +625,18 @@ class DiscordBot:
         if result.listen_count > 1:
             embed.add_field(name="Listen count", value=str(result.listen_count), inline=True)
 
-        if "scf_error" in result.scf_pending_tags:
+        if "metadata_error" in result.scf_pending_tags:
             embed.add_field(
-                name="⚠️ SCF metadata",
-                value="Auto-fill failed · use Retry metadata after checking the service log",
-                inline=False,
-            )
-        elif "mood_tags" in result.scf_pending_tags:
-            embed.add_field(
-                name="⚠️ SCF metadata",
-                value="Filled automatically · mood tags unavailable (Last.fm returned no tags for this release)",
+                name="⚠️ Metadata",
+                value="The shared metadata update could not be completed.",
                 inline=False,
             )
 
-        if "scf_error" in result.scf_pending_tags:
-            content = "The release was published to WordPress, but SCF metadata failed to save."
-        elif not result.scf_attempted:
-            content = "The release has been published to WordPress."
-        elif "mood_tags" in result.scf_pending_tags:
-            content = (
-                "The release has been published to WordPress, but SCF mood tags could not be filled "
-                "(Last.fm returned no tags)."
-            )
-        else:
-            content = (
-                "The release has been published to WordPress and SCF metadata was auto-filled."
-                if result.scf_pending_tags == [] and result.listen_count
-                else "The release has been published to WordPress."
-            )
+        content = (
+            "The release was published, but its metadata update failed."
+            if result.scf_pending_tags
+            else "The release was published and its metadata was filled automatically."
+        )
 
         view = None
         if release.wordpress_post_id:

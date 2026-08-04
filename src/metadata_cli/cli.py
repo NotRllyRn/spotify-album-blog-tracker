@@ -217,9 +217,11 @@ def load_env(path: str | None) -> dict[str, str]:
                 continue
             k, v = ln.split("=", 1)
             env[k.strip()] = v.strip().strip('"').strip("'")
-    for k in ("WORDPRESS_BASE_URL", "WORDPRESS_USERNAME", "WORDPRESS_APP_PASSWORD",
-              "LASTFM_API_KEY", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"):
+    for k in ("WORDPRESS_BASE_URL", "WORDPRESS_URL", "WORDPRESS_USERNAME",
+              "WORDPRESS_APP_PASSWORD", "LASTFM_API_KEY", "SPOTIFY_CLIENT_ID",
+              "SPOTIFY_CLIENT_SECRET"):
         env.setdefault(k, os.environ.get(k, ""))
+    env["WORDPRESS_BASE_URL"] = env["WORDPRESS_BASE_URL"] or env["WORDPRESS_URL"]
     return env
 
 

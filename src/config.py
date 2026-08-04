@@ -37,10 +37,14 @@ class Config:
 
         # Discord
         self.discord_bot_token = os.getenv("DISCORD_BOT_TOKEN")
-        self.discord_user_id = int(os.getenv("DISCORD_USER_ID"))
+        raw_discord_user_id = os.getenv("DISCORD_USER_ID")
+        try:
+            self.discord_user_id = int(raw_discord_user_id or "0")
+        except ValueError as exc:
+            raise ValueError("DISCORD_USER_ID must be an integer") from exc
 
-        # Last.fm: required when SCF auto-fill is on (default), so the mood-tag repeater
-        # can be backfilled. Set SPOTIFY_BLOG_TRACKER_FILL_SCF=0 to opt out.
+        # Shared metadata enrichment is on by default and requires Last.fm.
+        # Set SPOTIFY_BLOG_TRACKER_FILL_SCF=0 to opt out.
         self.lastfm_api_key = os.getenv("LASTFM_API_KEY")
         self.fill_scf_enabled = os.getenv("SPOTIFY_BLOG_TRACKER_FILL_SCF", "1") == "1"
 
@@ -77,8 +81,11 @@ class Config:
             'access_token': access_token,
             'refresh_token': refresh_token
         }
-        with open(self.token_file, 'w') as f:
-            json.dump(tokens, f)
+        try:
+            with open(self.token_file, 'w') as f:
+                json.dump(tokens, f)
+        except OSError as exc:
+            raise RuntimeError("Could not save Spotify tokens") from exc
 
     def _validate(self):
         """Validate required configuration."""

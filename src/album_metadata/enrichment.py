@@ -205,6 +205,40 @@ def enrich(post: dict, spt: Any, lfm: Any,
             album, tracks = _spotify_album_and_tracks(spt, winner["id"])
     except (OSError, RuntimeError, ValueError, KeyError) as exc:
         return _provider_unresolved(post, "spotify_provider_error", exc, "album.get/track.list")
+    return enrich_known(
+        post, spt, lfm, album, tracks, tag_names, write_policy, spotify_match)
+
+
+def enrich_known(
+    post: dict,
+    spt: Any,
+    lfm: Any,
+    album: dict,
+    tracks: list[dict],
+    artist_names: list[str],
+    write_policy: str = WRITE_FILL_ONLY,
+    spotify_match: dict | None = None,
+    listen_count: int = 1,
+    track_highlights: dict[str, bool] | None = None,
+) -> dict | None:
+    """Enrich one post from an already selected canonical Spotify release."""
+    if write_policy not in (WRITE_FILL_ONLY, WRITE_OVERWRITE_MANAGED):
+        raise ValueError(f"Unknown write policy: {write_policy}")
+    if write_policy == WRITE_FILL_ONLY and post_is_complete(post):
+        return None
+
+    pid = post["id"]
+    acf_in = post.get("acf") or {}
+    title = post["title"]["rendered"]
+    post_date = post["date"]
+    tag_names = [name for name in artist_names if name]
+    q_title = raw_query(title)
+    q_artists = [raw_query(name) for name in tag_names if raw_query(name)]
+    if not q_artists:
+        return _unresolved(post, "spotify_missing_artist", "No artist tags were available.")
+    winner = album
+    spotify_match = spotify_match or {"candidate": album, "score": 1.0}
+
     try:
         validate_spotify_album_tracks(album, tracks)
         if not _spotify_tracks_complete(album, tracks):
@@ -390,9 +424,11 @@ def enrich(post: dict, spt: Any, lfm: Any,
                     pid, album["name"])
 
     # Rebuilding provider-owned rows must not reset the editor-owned highlight.
-    highlights = {row.get("spotify_id"): bool(row.get("highlight"))
-                  for row in (acf_in.get("music_tracks") or [])
-                  if isinstance(row, dict) and row.get("spotify_id")}
+    highlights = track_highlights if track_highlights is not None else {
+        row.get("spotify_id"): bool(row.get("highlight"))
+        for row in (acf_in.get("music_tracks") or [])
+        if isinstance(row, dict) and row.get("spotify_id")
+    }
     track_rows = [
         {"disc_number":  t.get("disc_number", 1),
          "track_number": t.get("track_number", 0),
@@ -422,7 +458,7 @@ def enrich(post: dict, spt: Any, lfm: Any,
         "music_total_tracks": total,
         "music_avg_track_ms": (length_ms // total) if total else 0,
         "music_explicit": any(t["explicit"] for t in track_rows),
-        "listen_count": 1,
+        "listen_count": listen_count,
     }
     for key, value in managed_values.items():
         _set_managed(acf_in, acf_out, key, value, write_policy)

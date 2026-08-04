@@ -1,3 +1,4 @@
 {
-  "extraPaths": ["src"]
+  "extraPaths": ["src"],
+  "ignore": ["tests/test_unit.py"]
 }

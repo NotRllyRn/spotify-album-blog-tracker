@@ -6,16 +6,17 @@ import httpx
 import logging
 import re
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 from pathlib import Path
 import tempfile
 from html import escape
 
 from config import Config
 from database import Database
+from album_metadata.plans import materialize_body
 from wordpress_client import WordPressClient
 from models import PublishResult, Release
-from lastfm_client import LastFMClient, pick_mood_tags
+from tracker_metadata import TrackerMetadata
 from search import LAST_SYNCED_AT_KEY as POST_CACHE_LAST_SYNCED_AT_KEY
 
 logger = logging.getLogger(__name__)
@@ -50,53 +51,25 @@ def format_discord_content_for_wordpress(raw_content: str) -> str:
     return "\n\n".join(formatted_paragraphs)
 
 
-def _coerce_spotify_release_date(value: str) -> str:
-    """SCF rejects partial dates; expand ``YYYY`` / ``YYYY-MM`` to first-of-month."""
-    text = (value or "").strip()
-    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
-        try:
-            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    return text
-
-
-def _format_scf_date(value: Optional[str]) -> str:
-    """Render an ISO date (or empty) as ``d/m/Y`` for SCF ``date_picker`` fields."""
-    if not value:
-        return ""
-    text = value.strip()
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text, fmt).strftime("%d/%m/%Y")
-        except ValueError:
-            continue
-    try:
-        return datetime.fromisoformat(text).strftime("%d/%m/%Y")
-    except ValueError:
-        return text
-
-
 class Publisher:
     """Handles publishing releases to WordPress."""
 
-    # Class-level default so test code paths that bypass __init__ via __new__
-    # can still construct a publisher with SCF auto-fill disabled.
+    # Defaults keep test paths that bypass __init__ metadata-disabled.
     _fill_scf_enabled: bool = False
+    metadata: Optional[TrackerMetadata] = None
 
     def __init__(self, config: Config, db: Database):
         self.config = config
         self.db = db
         self.wordpress = WordPressClient(config)
-        self.lastfm = LastFMClient(getattr(config, "lastfm_api_key", None))
         self.category_cache: Dict[str, int] = {}
         self.tag_cache: Dict[str, int] = {}
         self._fill_scf_enabled = bool(getattr(config, "fill_scf_enabled", False))
+        self.metadata = TrackerMetadata(config) if self._fill_scf_enabled else None
 
     async def close(self):
         """Close WordPress client."""
         await self.wordpress.close()
-        await self.lastfm.close()
 
     async def publish_release(self, release: Release, as_relisten: bool = False) -> PublishResult:
         """Publish a release to WordPress and return a typed publish outcome."""
@@ -127,6 +100,8 @@ class Publisher:
                 "tags": tag_ids,
                 "featured_media": media_id if media_id else 0,
             }
+            if release.rating is not None or release.favorite or release.notes:
+                post_data["acf"] = TrackerMetadata.editor_acf(release)
 
             # Count existing matching posts BEFORE create_post so the count
             # does not double-count the about-to-be-created post.
@@ -140,15 +115,20 @@ class Publisher:
             release.published_at = None  # Will be set by tracker
 
             scf_pending_tags: list[str] = []
-            if self._fill_scf_enabled:
+            if self.metadata is not None:
                 try:
-                    acf_payload, fetch_status = await self._build_scf_payload(release, listen_count, post)
-                    await self._fill_post_scf(post["id"], acf_payload)
-                    if fetch_status.get("mood_tags") is None:
-                        scf_pending_tags.append("mood_tags")
-                except Exception as scf_error:
-                    logger.error(f"SCF auto-fill failed for post {post['id']}: {scf_error}")
-                    scf_pending_tags.append("scf_error")
+                    patch = await self.metadata.build_patch(
+                        release, post, tag_ids, category_ids, listen_count)
+                    taxonomies = patch["write"].get("taxonomies", {})
+                    term_ids = await self.wordpress.resolve_taxonomy_terms(taxonomies)
+                    body = materialize_body(patch["write"], term_ids)
+                    await self.wordpress.update_post(post["id"], body)
+                    logger.info("Filled shared metadata for post %s", post["id"])
+                except Exception as metadata_error:
+                    logger.error(
+                        "Metadata auto-fill failed for post %s: %s",
+                        post["id"], metadata_error)
+                    scf_pending_tags.append("metadata_error")
 
             try:
                 await self.refresh_post_cache(force=True)
@@ -363,73 +343,3 @@ class Publisher:
             and set(post.normalized_artists) == artists
         )
         return matches + 1
-
-    async def _build_scf_payload(
-        self,
-        release: Release,
-        listen_count: int,
-        post: Dict[str, Any],
-    ) -> Tuple[Dict[str, Any], Dict[str, Optional[list]]]:
-        """Build the SCF ``acf`` block and report which fields could not be filled."""
-        countable_tracks = [t for t in release.tracks if t.is_countable]
-        length_ms = sum(t.duration_ms for t in countable_tracks)
-        total_tracks = len(countable_tracks)
-        avg_track_ms = length_ms // total_tracks if total_tracks else 0
-        any_explicit = any(t.explicit for t in countable_tracks)
-
-        first_artist = release.artists[0].name if release.artists else ""
-        try:
-            album_info = await self.lastfm.album_getinfo(first_artist, release.title)
-        except Exception as error:
-            logger.warning("Last.fm lookup failed for %s - %s: %s", first_artist, release.title, error)
-            album_info = {}
-
-        mood_tags = pick_mood_tags(album_info)
-        fetch_status: Dict[str, Optional[list]] = {"mood_tags": mood_tags or None}
-
-        track_rows = [
-            {
-                "disc_number": t.disc_number,
-                "track_number": t.track_number,
-                "title": t.title,
-                "duration_ms": t.duration_ms,
-                "spotify_id": t.spotify_id,
-                "highlight": t.highlight,
-                "explicit": t.explicit,
-            }
-            for t in countable_tracks
-        ]
-
-        acf = {
-            "music_tracks": track_rows,
-            "music_length_ms": length_ms,
-            "spotify_album_id": release.spotify_id,
-            "spotify_album_url": f"https://open.spotify.com/album/{release.spotify_id}",
-            "music_release_date": _coerce_spotify_release_date(release.release_date),
-            "music_listened_at": _format_scf_date(post.get("date")),
-            "lastfm_release_id": album_info.get("mbid", "") if isinstance(album_info, dict) else "",
-            "music_total_tracks": total_tracks,
-            "music_avg_track_ms": avg_track_ms,
-            "music_explicit": any_explicit,
-            "music_mood_tags": [{"mood": tag} for tag in mood_tags],
-            "listen-count": listen_count,
-            "music_favorite": release.favorite,
-            "music_notes": release.notes or "",
-            "unreleased": release.unreleased,
-        }
-        if release.rating is not None:
-            acf["music_rating"] = release.rating
-        return acf, fetch_status
-
-    async def _fill_post_scf(self, post_id: int, acf_payload: Dict[str, Any]) -> None:
-        """Write SCF metadata and verify the critical fields persisted."""
-        await self.wordpress.update_post(post_id, {"acf": acf_payload})
-        persisted = await self.wordpress.get_post_acf(post_id)
-        mismatches = [
-            field
-            for field in SCF_VERIFY_FIELDS
-            if field in acf_payload and persisted.get(field) != acf_payload[field]
-        ]
-        if mismatches:
-            raise RuntimeError(f"SCF verification failed for fields: {', '.join(mismatches)}")
-        logger.info("Filled and verified SCF metadata for post %s", post_id)

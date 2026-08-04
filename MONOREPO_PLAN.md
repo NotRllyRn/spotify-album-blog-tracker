@@ -104,14 +104,14 @@ Extract in small, test-backed commits:
 
 ### 4. Add the tracker interface to the same engine
 
-- [ ] Add a known-Spotify-release entry path that skips discovery but shares Spotify validation, Last.fm matching, genre discovery, field computation, and write policy.
-- [ ] Refetch canonical Spotify album/tracks at publish time or supply equivalent validated data from the tracker adapter.
-- [ ] Convert the tracker `Release` editor state into protected existing values/highlight IDs.
-- [ ] Add async custom-taxonomy term listing/creation to the existing WordPress client.
-- [ ] Materialize taxonomy IDs through the shared payload function.
-- [ ] Replace tracker-only Last.fm and SCF payload code with the shared engine.
-- [ ] Keep metadata failure visible and prevent a silent “successful” incomplete publication.
-- [ ] Preserve post body, artwork, built-in artist tags, duplicate detection, relisten flow, post cache refresh, and Discord editor/navigation behavior.
+- [x] Add a known-Spotify-release entry path that skips discovery but shares Spotify validation, Last.fm matching, genre discovery, field computation, and write policy.
+- [x] Refetch canonical Spotify album/tracks at publish time or supply equivalent validated data from the tracker adapter.
+- [x] Convert the tracker `Release` editor state into protected existing values/highlight IDs.
+- [x] Add async custom-taxonomy term listing/creation to the existing WordPress client.
+- [x] Materialize taxonomy IDs through the shared payload function.
+- [x] Replace tracker-only Last.fm and SCF payload code with the shared engine.
+- [x] Keep metadata failure visible and prevent a silent “successful” incomplete publication.
+- [x] Preserve post body, artwork, built-in artist tags, duplicate detection, relisten flow, post cache refresh, and Discord editor/navigation behavior.
 
 **Gate:** No tracker module contains a second SCF field map or Last.fm matching algorithm.
 

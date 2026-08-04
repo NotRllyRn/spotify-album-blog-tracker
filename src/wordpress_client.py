@@ -10,6 +10,8 @@ from typing import List, Dict, Any, Optional
 from pathlib import Path
 import base64
 
+from album_metadata.common import match_key
+from album_metadata.schema import TAXONOMIES
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -164,7 +166,7 @@ class WordPressClient:
         ]):
             return False
 
-        if x_wp_total is None or not x_wp_total.isdigit():
+        if not isinstance(x_wp_total, str) or not x_wp_total.isdigit():
             return False
 
         return (
@@ -236,6 +238,64 @@ class WordPressClient:
         response.raise_for_status()
         return response.json()
 
+    async def resolve_taxonomy_terms(
+        self, wanted: Dict[str, List[str]]
+    ) -> Dict[str, Dict[str, int]]:
+        """Resolve every shared custom-taxonomy name before updating a post."""
+        unknown = set(wanted) - set(TAXONOMIES)
+        if unknown:
+            raise ValueError(f"Unknown taxonomies: {sorted(unknown)}")
+
+        resolved = {taxonomy: {} for taxonomy in TAXONOMIES}
+        for taxonomy in TAXONOMIES:
+            existing = await self._get_taxonomy_terms(taxonomy)
+            resolved[taxonomy] = {
+                match_key(row["name"]): row["id"] for row in existing
+            }
+            for name in wanted.get(taxonomy, []):
+                key = match_key(name)
+                if key not in resolved[taxonomy]:
+                    term = await self._create_taxonomy_term(taxonomy, name)
+                    resolved[taxonomy][key] = term["id"]
+        return resolved
+
+    async def _get_taxonomy_terms(self, taxonomy: str) -> List[Dict[str, Any]]:
+        rows = []
+        page = 1
+        while True:
+            response = await self.client.get(
+                f"{self.api_url}/{taxonomy}",
+                params={"per_page": 100, "page": page},
+            )
+            response.raise_for_status()
+            chunk = response.json()
+            if not isinstance(chunk, list):
+                raise ValueError(f"Unexpected {taxonomy} response")
+            rows.extend(chunk)
+            try:
+                total_pages = int(response.headers.get("X-WP-TotalPages", "1"))
+            except ValueError:
+                total_pages = 1
+            if page >= total_pages:
+                return rows
+            page += 1
+
+    async def _create_taxonomy_term(self, taxonomy: str, name: str) -> Dict[str, Any]:
+        response = await self.client.post(
+            f"{self.api_url}/{taxonomy}", json={"name": name})
+        try:
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 400:
+                try:
+                    term_id = exc.response.json().get("data", {}).get("term_id")
+                except ValueError:
+                    term_id = None
+                if term_id:
+                    return {"id": term_id, "name": name}
+            raise
+
     async def get_tags(self) -> List[Dict[str, Any]]:
         """Get all tags, reusing the in-memory cache when page-1 metadata matches."""
         per_page = 100
@@ -253,9 +313,10 @@ class WordPressClient:
         x_wp_total = response.headers.get("X-WP-Total")
         first_page_hash = hashlib.sha256(response.content).hexdigest()
 
-        if self._tag_cache_matches(x_wp_total, first_page_hash):
+        cached_tags = getattr(self, "_cached_tags", None)
+        if self._tag_cache_matches(x_wp_total, first_page_hash) and cached_tags is not None:
             logger.info("Using cached WordPress tags; X-WP-Total and first-page hash matched.")
-            return list(self._cached_tags or [])
+            return list(cached_tags)
 
         tags = list(first_page_tags)
         total_pages = self._parse_total_pages(response)
@@ -311,7 +372,7 @@ class WordPressClient:
         if not all([x_wp_total, first_page_hash, cached_x_wp_total, cached_first_page_hash]):
             return False
 
-        if x_wp_total is None or not x_wp_total.isdigit():
+        if not isinstance(x_wp_total, str) or not x_wp_total.isdigit():
             return False
 
         return (
@@ -394,12 +455,10 @@ class WordPressClient:
         url = f"{self.api_url}/media"
 
         try:
-            media_file = open(file_path, "rb")
-        except OSError:
-            logger.exception("Unable to open media file %s", file_path)
-            raise
-
-        with media_file as f:
+            file_handle = open(file_path, "rb")
+        except OSError as exc:
+            raise RuntimeError(f"Could not open media file: {file_path.name}") from exc
+        with file_handle as f:
             files = {"file": (file_path.name, f, "image/jpeg")}
             data = {"alt_text": alt_text} if alt_text else {}
 

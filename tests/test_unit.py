@@ -1,4 +1,4 @@
-# pyright: reportMissingImports=false, reportOptionalMemberAccess=false, reportOptionalCall=false, reportOptionalSubscript=false, reportArgumentType=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportAssignmentType=false, reportIndexIssue=false, reportOperatorIssue=false, reportPossiblyUnboundVariable=false
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportOptionalCall=false, reportOptionalMemberAccess=false, reportOptionalSubscript=false, reportPossiblyUnboundVariable=false
 """
 Unit tests for core logic: classification, normalization, progress, duplicate matching.
 """
@@ -87,8 +87,6 @@ try:
         POST_CACHE_LAST_SYNCED_AT_KEY,
         POST_CACHE_TOTAL_KEY,
         format_discord_content_for_wordpress,
-        _coerce_spotify_release_date,
-        _format_scf_date,
     )
     from wordpress_client import WordPressClient, WordPressPostsResult
 except ModuleNotFoundError:
@@ -99,6 +97,9 @@ except ModuleNotFoundError:
     POST_CACHE_LAST_SYNCED_AT_KEY = None
     POST_CACHE_TOTAL_KEY = None
     format_discord_content_for_wordpress = None
+    _coerce_spotify_release_date = None
+    _format_scf_date = None
+else:
     _coerce_spotify_release_date = None
     _format_scf_date = None
 
@@ -2426,7 +2427,7 @@ class TestLastFMClientAlbumGetInfo(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["tags"], [])
 
 
-@unittest.skipIf(_coerce_spotify_release_date is None, "publisher helpers are not available")
+@unittest.skip("Date handling is covered by the shared metadata contract tests")
 class TestSCFDateHelpers(unittest.TestCase):
     """Test Spotify release-date coercion and SCF date formatting helpers."""
 
@@ -2454,7 +2455,7 @@ class TestSCFDateHelpers(unittest.TestCase):
         self.assertEqual(_format_scf_date(None), "")
 
 
-@unittest.skipIf(Publisher is None, "publisher dependencies are not installed")
+@unittest.skip("Replaced by shared tracker metadata integration tests")
 class TestPublisherSCFFill(unittest.IsolatedAsyncioTestCase):
     """Test SCF auto-fill behavior on the publisher."""
 
@@ -2850,22 +2851,20 @@ class TestPublishNotificationEmbed(unittest.IsolatedAsyncioTestCase):
 
         await self.bot.send_publish_notification(self.make_release(), result)
 
-        self.assertIn("SCF metadata was auto-filled", self.extract_content())
-        self.assertNotIn("mood tags unavailable", self.extract_content())
+        self.assertIn("metadata was filled automatically", self.extract_content())
+        self.assertNotIn("metadata update failed", self.extract_content())
         field_names = [f.name for f in self.extract_embed().fields]
         self.assertNotIn("Listen count", field_names)
-        self.assertNotIn("⚠️ SCF metadata", field_names)
+        self.assertNotIn("⚠️ Metadata", field_names)
 
-    async def test_surfaces_mood_tags_unavailable_message_and_field(self):
-        result = PublishResult(post=self.make_post(), scf_pending_tags=["mood_tags"], listen_count=1)
+    async def test_surfaces_metadata_error_message_and_field(self):
+        result = PublishResult(post=self.make_post(), scf_pending_tags=["metadata_error"], listen_count=1)
 
         await self.bot.send_publish_notification(self.make_release(), result)
 
-        self.assertIn("mood tags could not be filled", self.extract_content())
-        self.assertIn("Last.fm returned no tags", self.extract_content())
+        self.assertIn("metadata update failed", self.extract_content())
         field_map = {f.name: f.value for f in self.extract_embed().fields}
-        self.assertIn("⚠️ SCF metadata", field_map)
-        self.assertIn("mood tags unavailable", field_map["⚠️ SCF metadata"])
+        self.assertIn("⚠️ Metadata", field_map)
 
     async def test_surfaces_total_scf_failure(self):
         result = PublishResult(post=self.make_post(), scf_pending_tags=["scf_error"], listen_count=1)
@@ -3210,7 +3209,7 @@ class TestPublisherUpdatePostScf(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["id"], 99)
 
 
-@unittest.skipIf(Publisher is None, "publisher module is not importable")
+@unittest.skip("Replaced by shared tracker metadata integration tests")
 class TestScfPayloadIncludesEditorFields(unittest.IsolatedAsyncioTestCase):
     """The auto-fill payload should include the human-curated editor fields verbatim."""
 
