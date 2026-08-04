@@ -65,3 +65,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 python3 -m compileall -q main.py post_to_album.py src tests
 docker compose config
 ```
+
+## License
+
+[CC BY-NC 4.0](LICENSE)

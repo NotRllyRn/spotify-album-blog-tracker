@@ -55,8 +55,7 @@ class TrackerMetadataAdapter:
             "artist": post.get("artist", []),
             "genre": post.get("genre", []),
             "release_type": post.get("release_type", []),
-            "acf": {},
-
+            "acf": post.get("acf") if isinstance(post.get("acf"), dict) else {},
         }
         if "modified" in post:
             source["modified"] = post["modified"]

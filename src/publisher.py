@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 POST_CACHE_TOTAL_KEY = "wordpress_post_cache.x_wp_total"
 POST_CACHE_FIRST_PAGE_HASH_KEY = "wordpress_post_cache.first_page_hash"
 UNRELEASED_CATEGORY = "Unreleased"
+METADATA_VERIFY_FIELDS = ("spotify_album_id", "music_tracks", "listen_count")
 
 
 def format_discord_content_for_wordpress(raw_content: str) -> str:
@@ -112,13 +113,8 @@ class Publisher:
             scf_pending_tags: list[str] = []
             if self.metadata is not None:
                 try:
-                    patch = await self.metadata.build_patch(
+                    await self._apply_shared_metadata(
                         release, post, tag_ids, category_ids, listen_count)
-                    taxonomies = patch["write"].get("taxonomies", {})
-                    term_ids = await self.wordpress.resolve_taxonomy_terms(taxonomies)
-                    body = materialize_body(patch["write"], term_ids)
-                    await self.wordpress.update_post(post["id"], body)
-                    logger.info("Filled shared metadata for post %s", post["id"])
                 except Exception as metadata_error:
                     logger.error(
                         "Metadata auto-fill failed for post %s: %s",
@@ -140,6 +136,43 @@ class Publisher:
         except Exception as e:
             logger.error(f"Error publishing release: {e}")
             raise
+
+    async def _apply_shared_metadata(
+        self,
+        release: Release,
+        post: Dict[str, Any],
+        tag_ids: list[int],
+        category_ids: list[int],
+        listen_count: int,
+    ) -> None:
+        if self.metadata is None:
+            raise RuntimeError("Metadata enrichment is disabled")
+        patch = await self.metadata.build_patch(
+            release, post, tag_ids, category_ids, listen_count)
+        taxonomies = patch["write"].get("taxonomies", {})
+        term_ids = await self.wordpress.resolve_taxonomy_terms(taxonomies)
+        body = materialize_body(patch["write"], term_ids)
+        await self.wordpress.update_post(post["id"], body)
+
+        acf = body.get("acf", {})
+        expected = {field: acf[field] for field in METADATA_VERIFY_FIELDS if field in acf}
+        if expected:
+            persisted = await self.wordpress.get_post_acf(post["id"])
+            mismatches = [field for field, value in expected.items() if persisted.get(field) != value]
+            if mismatches:
+                raise RuntimeError(
+                    "Metadata verification failed for fields: " + ", ".join(mismatches))
+        logger.info("Filled and verified shared metadata for post %s", post["id"])
+
+    async def retry_post_metadata(
+        self, release: Release, post_id: int, listen_count: int = 1
+    ) -> None:
+        """Retry missing managed metadata without creating another post."""
+        post = await self.wordpress.get_post(post_id, context="edit")
+        tag_ids = [value for value in post.get("tags", []) if type(value) is int]
+        category_ids = [value for value in post.get("categories", []) if type(value) is int]
+        await self._apply_shared_metadata(
+            release, post, tag_ids, category_ids, listen_count)
 
     async def trash_post(self, post_id: int) -> bool:
         """Move post to trash (undo)."""

@@ -9,7 +9,7 @@ from discord import app_commands
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, cast
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse, urlunparse
 
 from config import Config
@@ -61,11 +61,26 @@ def _clip_discord_text(value: str, limit: int) -> str:
     return value[:max(0, limit - 1)] + "…"
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
+def _progress_percent(progress: Any) -> int:
     try:
-        return int(value)
+        return int(progress * 100)
     except (TypeError, ValueError, OverflowError):
-        return default
+        return 0
+
+
+def _unix_timestamp(value: datetime) -> int:
+    try:
+        return int(value.timestamp())
+    except (TypeError, ValueError, OSError, OverflowError):
+        return 0
+
+
+def _json_object(raw: Optional[str]) -> dict:
+    try:
+        value = json.loads(raw or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 class PromptView(discord.ui.View):
     def __init__(self, discord_bot: "DiscordBot"):
@@ -215,7 +230,7 @@ class InProgressView(PromptView):
 
     def _build_option(self, release: Release, featured: bool = False) -> discord.SelectOption:
         artist_names = ", ".join([artist.name for artist in release.artists][:2]) or "Unknown"
-        progress_percent = _safe_int(release.progress * 100)
+        progress_percent = _progress_percent(release.progress)
         label_prefix = "Featured: " if featured else ""
         label = _clip_discord_text(f"{label_prefix}{release.title}", 100)
         description = _clip_discord_text(
@@ -394,10 +409,7 @@ class DiscordBot:
         self._setup_commands()
 
     def _publisher(self):
-        publisher = self.tracker.publisher
-        if publisher is None:
-            raise RuntimeError("Publisher is not configured")
-        return publisher
+        return self.tracker.publisher
 
     def _setup_commands(self):
         """Setup slash commands."""
@@ -547,7 +559,7 @@ class DiscordBot:
             description=f"{release.title} by {', '.join([a.name for a in release.artists])}",
             color=0x1DB954
         )
-        embed.add_field(name="Progress", value=f"{_safe_int(release.progress * 100)}%", inline=True)
+        embed.add_field(name="Progress", value=f"{_progress_percent(release.progress)}%", inline=True)
         embed.add_field(name="Release type", value=release.release_type.value, inline=True)
         embed.set_thumbnail(url=release.cover_url)
 
@@ -604,7 +616,7 @@ class DiscordBot:
         wordpress_link = self._get_public_wordpress_link(post.get("link") or post.get("guid", ""))
         embed.add_field(name="WordPress link", value=wordpress_link or "Unavailable", inline=False)
         embed.add_field(name="Release type", value=release.release_type.value, inline=True)
-        embed.add_field(name="Progress", value=f"{_safe_int(release.progress * 100)}%", inline=True)
+        embed.add_field(name="Progress", value=f"{_progress_percent(release.progress)}%", inline=True)
         embed.set_thumbnail(url=release.cover_url)
 
         if release.is_relisten and release.duplicate_post_id:
@@ -620,15 +632,17 @@ class DiscordBot:
                 inline=False,
             )
 
-        content = (
-            "The release was published, but its metadata update failed."
-            if result.scf_pending_tags
-            else "The release was published and its metadata was filled automatically."
-        )
+        if result.scf_pending_tags:
+            content = "The release was published, but its metadata update failed."
+        elif result.scf_attempted:
+            content = "The release was published and its metadata was filled automatically."
+        else:
+            content = "The release was published to WordPress."
 
         view = None
         if release.wordpress_post_id:
-            view = PublishedPostActionView(self, show_retry="scf_error" in result.scf_pending_tags)
+            view = PublishedPostActionView(
+                self, show_retry="metadata_error" in result.scf_pending_tags)
 
         message = await self._send_dm(
             content,
@@ -876,37 +890,23 @@ class DiscordBot:
         listen_count = context.get("listen_count", 1)
         if not isinstance(listen_count, int) or isinstance(listen_count, bool):
             listen_count = 1
-        pending = await self._publisher().retry_post_scf(release, post_id, listen_count)
-        mood_tags_missing = "mood_tags" in pending
-        notification = (
-            "The release has been published to WordPress, but SCF mood tags could not be filled "
-            "(Last.fm returned no tags)."
-            if mood_tags_missing
-            else "The release has been published to WordPress and SCF metadata was auto-filled."
-        )
+        await self._publisher().retry_post_metadata(release, post_id, listen_count)
         edit_message = getattr(interaction.message, "edit", None)
         if edit_message:
-            kwargs = {"content": notification, "view": PublishedPostActionView(self)}
+            kwargs = {
+                "content": "The release was published and its metadata was filled automatically.",
+                "view": PublishedPostActionView(self),
+            }
             embeds = getattr(interaction.message, "embeds", [])
             if embeds:
                 embed = embeds[0]
                 for index in reversed(range(len(embed.fields))):
-                    if embed.fields[index].name == "⚠️ SCF metadata":
+                    if embed.fields[index].name == "⚠️ Metadata":
                         embed.remove_field(index)
-                if mood_tags_missing:
-                    embed.add_field(
-                        name="⚠️ SCF metadata",
-                        value="Filled automatically · mood tags unavailable (Last.fm returned no tags for this release)",
-                        inline=False,
-                    )
                 kwargs["embed"] = embed
             await edit_message(**kwargs)
-        response = (
-            "✅ SCF metadata was filled and verified; mood tags remain unavailable."
-            if mood_tags_missing
-            else "✅ SCF metadata was filled and verified."
-        )
-        await self._send_prompt_action_response(interaction, response)
+        await self._send_prompt_action_response(
+            interaction, "✅ Metadata was filled and verified.")
 
     async def _handle_75_publish(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
         await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.ACCEPTED.value)
@@ -1115,7 +1115,7 @@ class DiscordBot:
         )
         embed.add_field(name="Release", value=release.title, inline=False)
         embed.add_field(name="Artists", value=", ".join([a.name for a in release.artists][:5]) or "Unknown", inline=False)
-        embed.add_field(name="Progress", value=f"{_safe_int(release.progress * 100)}%", inline=True)
+        embed.add_field(name="Progress", value=f"{_progress_percent(release.progress)}%", inline=True)
 
         await interaction.response.send_message(
             embed=embed,
@@ -1463,13 +1463,13 @@ class DiscordBot:
             f"Next: {next_track.title if next_track else 'None'}"
         ]
         if include_last_seen:
-            lines.append(f"Last tracked: <t:{_safe_int(release.last_seen.timestamp())}:R>")
+            lines.append(f"Last tracked: <t:{_unix_timestamp(release.last_seen)}:R>")
         return "\n".join(lines)
 
     def _get_release_progress_parts(self, release: Release) -> tuple[int, int, int]:
         listened = sum(1 for track in release.tracks if track.is_countable and track.listened)
         countable = sum(1 for track in release.tracks if track.is_countable)
-        progress_percent = _safe_int(release.progress * 100)
+        progress_percent = _progress_percent(release.progress)
         return listened, countable, progress_percent
 
     async def _handle_inprogress_page(self, interaction: discord.Interaction, page: int):
@@ -1652,7 +1652,7 @@ class DiscordBot:
             color=0x1DB954
         )
         embed.add_field(name="Release type", value=album.release_type.value, inline=True)
-        embed.add_field(name="Saved", value=f"<t:{_safe_int(album.added_at.timestamp())}:D>", inline=True)
+        embed.add_field(name="Saved", value=f"<t:{_unix_timestamp(album.added_at)}:D>", inline=True)
         embed.add_field(name="Spotify ID", value=album.spotify_id, inline=False)
         if album.spotify_url:
             embed.add_field(name="Spotify link", value=album.spotify_url, inline=False)

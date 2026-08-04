@@ -1004,10 +1004,21 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Post current content", labels)
 
-    def test_published_post_action_view_includes_edit_metadata(self):
-        labels = [child.label for child in PublishedPostActionView(self.bot).children]
+    async def test_published_post_action_view_retry_callback(self):
+        default_labels = [child.label for child in PublishedPostActionView(self.bot).children]
+        self.assertEqual(default_labels, ["Edit metadata", "Undo post", "Keep post"])
 
-        self.assertEqual(labels, ["Edit metadata", "Undo post", "Keep post"])
+        view = PublishedPostActionView(self.bot, show_retry=True)
+        self.assertEqual(len(view.children), 4)
+        self.assertTrue(all(child.row in (None, 0) for child in view.children))
+        retry = next(child for child in view.children if child.label == "Retry metadata")
+        self.bot.handle_prompt_action = AsyncMock()
+        interaction = self.make_interaction()
+
+        await retry.callback(interaction)
+
+        self.bot.handle_prompt_action.assert_awaited_once_with(
+            interaction, "retry_metadata")
 
     def test_relisten_approval_view_has_single_yes_action(self):
         labels = [child.label for child in RelistenApprovalPromptView(self.bot).children]
@@ -1142,26 +1153,26 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         db.get_release = AsyncMock(return_value=release)
         db.update_discord_prompt_state = AsyncMock()
         publisher = type("FakePublisher", (), {})()
-        publisher.retry_post_scf = AsyncMock(return_value=[])
+        publisher.retry_post_metadata = AsyncMock()
         self.bot.db = db
         self.bot.tracker = type("FakeTracker", (), {"publisher": publisher})()
         interaction = self.make_interaction(response_done=True)
         interaction.message.edit = AsyncMock()
         failure_embed = discord.Embed(title="Published")
-        failure_embed.add_field(name="⚠️ SCF metadata", value="Auto-fill failed")
+        failure_embed.add_field(name="⚠️ Metadata", value="Auto-fill failed")
         interaction.message.embeds = [failure_embed]
 
         await self.bot.handle_prompt_action(interaction, "retry_metadata")
 
-        publisher.retry_post_scf.assert_awaited_once_with(release, 321, 2)
+        publisher.retry_post_metadata.assert_awaited_once_with(release, 321, 2)
         edit_kwargs = interaction.message.edit.await_args.kwargs
         retry_view = edit_kwargs["view"]
         self.assertNotIn("Retry metadata", [child.label for child in retry_view.children])
-        self.assertIn("SCF metadata was auto-filled", edit_kwargs["content"])
-        self.assertNotIn("⚠️ SCF metadata", [field.name for field in edit_kwargs["embed"].fields])
+        self.assertIn("metadata was filled automatically", edit_kwargs["content"])
+        self.assertNotIn("⚠️ Metadata", [field.name for field in edit_kwargs["embed"].fields])
         db.update_discord_prompt_state.assert_not_awaited()
         interaction.followup.send.assert_awaited_once_with(
-            "✅ SCF metadata was filled and verified.", ephemeral=True
+            "✅ Metadata was filled and verified.", ephemeral=True
         )
 
     async def test_add_content_action_rejects_handled_prompt_without_modal(self):
@@ -2377,6 +2388,20 @@ class TestPublishNotificationEmbed(unittest.IsolatedAsyncioTestCase):
         self.assertIn("metadata update failed", self.extract_content())
         field_map = {f.name: f.value for f in self.extract_embed().fields}
         self.assertIn("⚠️ Metadata", field_map)
+        labels = [child.label for child in self.bot._send_dm.await_args.kwargs["view"].children]
+        self.assertIn("Retry metadata", labels)
+
+    async def test_disabled_metadata_does_not_claim_autofill(self):
+        result = PublishResult(
+            post=self.make_post(), scf_pending_tags=[], listen_count=1,
+            scf_attempted=False,
+        )
+
+        await self.bot.send_publish_notification(self.make_release(), result)
+
+        self.assertEqual(self.extract_content(), "The release was published to WordPress.")
+        labels = [child.label for child in self.bot._send_dm.await_args.kwargs["view"].children]
+        self.assertNotIn("Retry metadata", labels)
 
 @unittest.skipIf(EditorState is None, "editor_view module is not importable")
 class TestEditorStateProjection(unittest.TestCase):

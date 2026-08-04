@@ -139,6 +139,12 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(REMOVED_ACF_FIELDS & set(acf))
         self.assertEqual(patch["write"]["taxonomies"]["release_type"], ["Single"])
 
+    async def test_known_spotify_path_honors_live_fill_only_values(self):
+        post = {**self.post, "acf": {"spotify_title": "Keep this title"}}
+        patch = await self.adapter.build_patch(self.release, post, [7], [5], 1)
+
+        self.assertNotIn("spotify_title", patch["write"].get("acf", {}))
+
     async def test_cli_and_tracker_materialize_identical_managed_request_body(self):
         patch = await self.adapter.build_patch(self.release, self.post, [7], [5], 3)
         expected = materialize_body(patch["write"], term_ids())
@@ -167,7 +173,11 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
 
             async def update_post(self, post_id, body):
                 updates.append(body)
+                self.acf = body.get("acf", {})
                 return {"id": post_id}
+
+            async def get_post_acf(self, post_id):
+                return self.acf
 
         publisher: Any = Publisher.__new__(Publisher)
         publisher.wordpress = WordPressFake()
@@ -193,6 +203,50 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(result.scf_pending_tags, [])
         self.assertEqual(result.listen_count, 1)
+
+    async def test_retry_fills_missing_metadata_without_overwriting_live_values(self):
+        live_acf = {"spotify_title": "Keep this title"}
+        post = {**self.post, "tags": [7], "categories": [5], "acf": live_acf}
+        submitted = {}
+
+        class WordPressFake:
+            async def get_post(self, post_id, **params):
+                return post
+
+            async def resolve_taxonomy_terms(self, wanted):
+                return term_ids()
+
+            async def update_post(self, post_id, body):
+                submitted.update(body)
+                live_acf.update(body.get("acf", {}))
+                return {"id": post_id}
+
+            async def get_post_acf(self, post_id):
+                return live_acf
+
+        publisher: Any = Publisher.__new__(Publisher)
+        publisher.wordpress = WordPressFake()
+        publisher.metadata = self.adapter
+
+        await publisher.retry_post_metadata(self.release, 42)
+
+        self.assertNotIn("spotify_title", submitted["acf"])
+        self.assertEqual(live_acf["spotify_title"], "Keep this title")
+        self.assertEqual(live_acf["spotify_album_id"], "album-id")
+
+    async def test_metadata_verification_rejects_silently_dropped_fields(self):
+        patch = await self.adapter.build_patch(self.release, self.post, [7], [5], 1)
+        publisher: Any = Publisher.__new__(Publisher)
+        publisher.metadata = SimpleNamespace(build_patch=AsyncMock(return_value=patch))
+        publisher.wordpress = SimpleNamespace(
+            resolve_taxonomy_terms=AsyncMock(return_value=term_ids()),
+            update_post=AsyncMock(return_value={"id": 42}),
+            get_post_acf=AsyncMock(return_value={}),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "verification failed"):
+            await publisher._apply_shared_metadata(
+                self.release, self.post, [7], [5], 1)
 
     async def test_unreleased_publication_preserves_category_marker(self):
         self.release.unreleased = True
