@@ -8,10 +8,12 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 from typing import Any, cast
 
-import post_to_album as mod
+common_mod = importlib.import_module("album_metadata.common")
+providers_mod = importlib.import_module("album_metadata.providers")
 spotify_mod = importlib.import_module("album_metadata.spotify")
 lastfm_mod = importlib.import_module("album_metadata.lastfm")
 enrichment_mod = importlib.import_module("album_metadata.enrichment")
+cli_mod = importlib.import_module("metadata_cli.cli")
 
 
 SPOTIFY = {"name": "Blue - Remastered", "artists": [{"name": "Beyoncé"}]}
@@ -20,14 +22,14 @@ CANDIDATE = {"name": "Blue - Remastered", "artist": "Beyoncé"}
 
 class SearchAndMatchingTests(unittest.TestCase):
     def test_raw_and_comparison_preserve_edition_and_accents(self):
-        self.assertEqual(mod.raw_query(" A &amp; B - Deluxe "), "A & B - Deluxe")
-        self.assertEqual(mod.match_key("  CAFÉ\u0301  X "), mod.match_key("CAFÉ́ x"))
-        self.assertNotEqual(mod.match_key("Blue"), mod.match_key("Blue - Remastered"))
-        self.assertNotEqual(mod.match_key("Beyonce"), mod.match_key("Beyoncé"))
-        self.assertEqual(mod.match_key("X’s — Live"), mod.match_key("X's - Live"))
-        self.assertEqual(mod._release_title_similarity(
+        self.assertEqual(common_mod.raw_query(" A &amp; B - Deluxe "), "A & B - Deluxe")
+        self.assertEqual(common_mod.match_key("  CAFÉ\u0301  X "), common_mod.match_key("CAFÉ́ x"))
+        self.assertNotEqual(common_mod.match_key("Blue"), common_mod.match_key("Blue - Remastered"))
+        self.assertNotEqual(common_mod.match_key("Beyonce"), common_mod.match_key("Beyoncé"))
+        self.assertEqual(common_mod.match_key("X’s — Live"), common_mod.match_key("X's - Live"))
+        self.assertEqual(spotify_mod._release_title_similarity(
             "ĐỢI (Prod. RIO)", "ĐỢI (feat. WEAN) [SPECIAL VERSION]"), 1.0)
-        self.assertEqual(mod._release_title_similarity(
+        self.assertEqual(spotify_mod._release_title_similarity(
             "Walking On A Dream", "Walking On A Dream (Special Edition)"), 1.0)
 
     def test_spotify_ladder_order_dedup_and_raw_values(self):
@@ -37,7 +39,7 @@ class SearchAndMatchingTests(unittest.TestCase):
                 self.queries.append((q, limit))
                 return [{"id": "same"}]
         fake = Fake()
-        found = mod.search_ladder(fake, "A & B - EP", ["One", "Two"])
+        found = spotify_mod.search_ladder(fake, "A & B - EP", ["One", "Two"])
         self.assertEqual([q for q, _ in fake.queries], [
             'album:"A & B - EP" artist:"One"', "A & B - EP One Two"])
         self.assertEqual(len(found), 1)
@@ -52,11 +54,11 @@ class SearchAndMatchingTests(unittest.TestCase):
                 return self.first if len(self.queries) == 1 else [candidate]
 
         immediate = Fake([candidate])
-        self.assertEqual(mod.search_ladder(immediate, "Album", ["Artist"]), [candidate])
+        self.assertEqual(spotify_mod.search_ladder(immediate, "Album", ["Artist"]), [candidate])
         self.assertEqual(len(immediate.queries), 1)
 
         fallback = Fake([])
-        self.assertEqual(mod.search_ladder(fallback, "Album", ["Artist"]), [candidate])
+        self.assertEqual(spotify_mod.search_ladder(fallback, "Album", ["Artist"]), [candidate])
         self.assertEqual(len(fallback.queries), 2)
 
         class BroadFailure:
@@ -69,7 +71,7 @@ class SearchAndMatchingTests(unittest.TestCase):
                 ]
 
         ambiguous = BroadFailure()
-        found = mod.search_ladder(ambiguous, "Time", ["Artist"])
+        found = spotify_mod.search_ladder(ambiguous, "Time", ["Artist"])
         self.assertEqual(len(found), 2)
         self.assertEqual(len(ambiguous.queries), 2)
         self.assertNotIn("Time", ambiguous.queries)
@@ -78,7 +80,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         class Fake:
             def search_albums(self, q, limit=10): raise urllib.error.URLError("down")
         with self.assertRaises(urllib.error.URLError):
-            mod.search_ladder(Fake(), "Album", ["Artist"])
+            spotify_mod.search_ladder(Fake(), "Album", ["Artist"])
 
     def test_spotify_rejects_malformed_token_and_api_shapes(self):
         class Response:
@@ -90,17 +92,17 @@ class SearchAndMatchingTests(unittest.TestCase):
         for payload in ([], {}, {"access_token": ""}, {"access_token": 7}):
             with self.subTest(payload=payload), patch(
                     "urllib.request.urlopen", return_value=Response(payload)):
-                with self.assertRaises(mod.SpotifyProviderError):
-                    mod.Spotify("id", "secret")._ensure_token()
+                with self.assertRaises(providers_mod.SpotifyProviderError):
+                    spotify_mod.Spotify("id", "secret")._ensure_token()
 
-        spotify = mod.Spotify("id", "secret")
+        spotify = spotify_mod.Spotify("id", "secret")
         spotify._tok, spotify._exp = "token", float("inf")
         with patch("urllib.request.urlopen", return_value=Response([])):
-            with self.assertRaisesRegex(mod.SpotifyProviderError, "malformed"):
+            with self.assertRaisesRegex(providers_mod.SpotifyProviderError, "malformed"):
                 spotify._get("https://example.test")
 
     def test_spotify_search_distinguishes_empty_from_malformed_shapes(self):
-        spotify = mod.Spotify("id", "secret")
+        spotify = spotify_mod.Spotify("id", "secret")
         spotify._get = lambda url, operation=None: {"albums": {"items": []}}
         self.assertEqual(spotify.search_albums("Album"), [])
 
@@ -113,32 +115,32 @@ class SearchAndMatchingTests(unittest.TestCase):
         for payload in malformed:
             with self.subTest(payload=payload):
                 spotify._get = lambda url, operation=None, value=payload: value
-                with self.assertRaises(mod.SpotifyProviderError):
+                with self.assertRaises(providers_mod.SpotifyProviderError):
                     spotify.search_albums("Album")
 
     def test_enrich_maps_malformed_spotify_search_to_provider_error(self):
-        spotify = mod.Spotify("id", "secret")
+        spotify = spotify_mod.Spotify("id", "secret")
         spotify._get = lambda url, operation=None: {"albums": {"items": ["bad"]}}
         post = {"id": 1, "title": {"rendered": "Album"}, "date": "2020-01-01",
                 "tags": [7], "acf": {}}
-        result = cast(dict, mod.enrich(post, spotify, object(), {7: "Artist"}))
+        result = cast(dict, enrichment_mod.enrich(post, spotify, object(), {7: "Artist"}))
         self.assertEqual(result["diagnostics"][0]["code"], "spotify_provider_error")
 
     def test_inclusive_provider_score_gates(self):
         spotify_candidate = {"id": "s", "name": "x", "artists": [{"name": "y"}]}
         lastfm_candidate = {"name": "x", "artist": "y"}
         cases = [
-            (mod.choose_spotify_candidate, [spotify_candidate], "spotify_candidate_score",
-             {"score": mod.SPOTIFY_MIN_SCORE, "title_score": mod.SPOTIFY_MIN_TITLE,
-              "artist_score": mod.SPOTIFY_MIN_ARTIST, "candidate": spotify_candidate}),
-            (mod.choose_lastfm_candidate, [lastfm_candidate], "lastfm_candidate_score",
-             {"score": mod.LASTFM_MIN_SCORE, "title_score": mod.LASTFM_MIN_TITLE,
-              "artist_score": mod.LASTFM_MIN_ARTIST, "candidate": lastfm_candidate}),
+            (spotify_mod.choose_spotify_candidate, [spotify_candidate], "spotify_candidate_score",
+             {"score": spotify_mod.SPOTIFY_MIN_SCORE, "title_score": spotify_mod.SPOTIFY_MIN_TITLE,
+              "artist_score": spotify_mod.SPOTIFY_MIN_ARTIST, "candidate": spotify_candidate}),
+            (lastfm_mod.choose_lastfm_candidate, [lastfm_candidate], "lastfm_candidate_score",
+             {"score": lastfm_mod.LASTFM_MIN_SCORE, "title_score": lastfm_mod.LASTFM_MIN_TITLE,
+              "artist_score": lastfm_mod.LASTFM_MIN_ARTIST, "candidate": lastfm_candidate}),
         ]
         for chooser, candidates, scorer, boundary in cases:
             target = spotify_mod if scorer.startswith("spotify") else lastfm_mod
             with self.subTest(scorer=scorer), patch.object(target, scorer, return_value=boundary):
-                if chooser is mod.choose_spotify_candidate:
+                if chooser is spotify_mod.choose_spotify_candidate:
                     result = chooser(candidates, "not exact", ["artist"])
                 else:
                     result = chooser(SPOTIFY, candidates)
@@ -146,22 +148,22 @@ class SearchAndMatchingTests(unittest.TestCase):
 
         # Each gate independently rejects a value immediately below its inclusive boundary.
         for scorer, chooser_value, base, field in [
-            ("spotify_candidate_score", mod.choose_spotify_candidate,
+            ("spotify_candidate_score", spotify_mod.choose_spotify_candidate,
              {"score": 1, "title_score": 1, "artist_score": 1,
               "candidate": spotify_candidate}, field)
             for field in ("title_score", "artist_score", "score")
         ] + [
-            ("lastfm_candidate_score", mod.choose_lastfm_candidate,
+            ("lastfm_candidate_score", lastfm_mod.choose_lastfm_candidate,
              {"score": 1, "title_score": 1, "artist_score": 1,
               "candidate": lastfm_candidate}, field)
             for field in ("title_score", "artist_score", "score")
         ]:
-            threshold = getattr(mod, ("SPOTIFY" if scorer.startswith("spotify") else "LASTFM") +
+            target = spotify_mod if scorer.startswith("spotify") else lastfm_mod
+            threshold = getattr(target, ("SPOTIFY" if scorer.startswith("spotify") else "LASTFM") +
                                 "_MIN_" + {"title_score": "TITLE", "artist_score": "ARTIST",
                                             "score": "SCORE"}[field])
             row = {**base, field: threshold - .001}
             chooser: Any = chooser_value
-            target = spotify_mod if scorer.startswith("spotify") else lastfm_mod
             with self.subTest(scorer=scorer, field=field), patch.object(target, scorer, return_value=row):
                 result = (chooser([base["candidate"]], "not exact", ["artist"])
                           if scorer.startswith("spotify") else chooser(SPOTIFY, [base["candidate"]]))
@@ -169,20 +171,20 @@ class SearchAndMatchingTests(unittest.TestCase):
 
     def test_spotify_gates_missing_artist_and_ambiguity_boundary(self):
         c = {"id": "1", "name": "Album", "artists": [{"name": "Artist"}]}
-        self.assertEqual(mod.choose_spotify_candidate([c], "Album", [])["reason"],
+        self.assertEqual(spotify_mod.choose_spotify_candidate([c], "Album", [])["reason"],
                          "spotify_missing_artist")
         c2 = {**c, "id": "2"}
-        self.assertEqual(mod.choose_spotify_candidate([c, c2], "Album", ["Artist"])["reason"],
+        self.assertEqual(spotify_mod.choose_spotify_candidate([c, c2], "Album", ["Artist"])["reason"],
                          "spotify_ambiguous")
         edition = {**c, "id": "3", "name": "Album (Deluxe Edition)"}
-        exact = mod.choose_spotify_candidate([edition, c], "Album", ["Artist"])
+        exact = spotify_mod.choose_spotify_candidate([edition, c], "Album", ["Artist"])
         self.assertEqual(exact["candidate"], c)
         with patch.object(spotify_mod, "spotify_candidate_score", side_effect=[
             {"score": .87, "title_score": .9, "artist_score": .8, "candidate": c},
             {"score": .82, "title_score": .9, "artist_score": .8, "candidate": c2},
         ]):
             # Exactly .05 is allowed: ambiguity is strictly less than the gap.
-            self.assertEqual(mod.choose_spotify_candidate([c, c2], "x", ["y"])["candidate"], c)
+            self.assertEqual(spotify_mod.choose_spotify_candidate([c, c2], "x", ["y"])["candidate"], c)
 
     def test_release_type_evidence_requires_one_consistent_recognized_type(self):
         terms = {"Album": 30, "Single": 31, "Unknown": 32}
@@ -200,7 +202,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         ]
         for post, expected in cases:
             with self.subTest(post=post):
-                self.assertEqual(mod.expected_release_type(post, terms), expected)
+                self.assertEqual(spotify_mod.expected_release_type(post, terms), expected)
 
     def test_spotify_release_type_compatibility_boundaries(self):
         compatible = [
@@ -227,10 +229,10 @@ class SearchAndMatchingTests(unittest.TestCase):
         ]
         for candidate, expected in compatible:
             with self.subTest(candidate=candidate, expected=expected):
-                self.assertTrue(mod.spotify_release_type_compatible(candidate, expected))
+                self.assertTrue(spotify_mod.spotify_release_type_compatible(candidate, expected))
         for candidate, expected in incompatible:
             with self.subTest(candidate=candidate, expected=expected):
-                self.assertFalse(mod.spotify_release_type_compatible(candidate, expected))
+                self.assertFalse(spotify_mod.spotify_release_type_compatible(candidate, expected))
 
     def test_what_aloha_means_ambiguity_uses_unique_album_type(self):
         album = {"id": "7qy8taDfUOJtA5fNE7BdbJ", "name": "What Aloha Means",
@@ -239,9 +241,9 @@ class SearchAndMatchingTests(unittest.TestCase):
         single = {"id": "4iwq22kCYJDHN8HB57KZ6f", "name": "What Aloha Means",
                   "artists": [{"name": "Kolohe Kai"}], "album_type": "single",
                   "total_tracks": 1}
-        self.assertIs(mod.choose_spotify_candidate(
+        self.assertIs(spotify_mod.choose_spotify_candidate(
             [single, album], "What Aloha Means", ["Kolohe Kai"], "Album")["candidate"], album)
-        self.assertEqual(mod.choose_spotify_candidate(
+        self.assertEqual(spotify_mod.choose_spotify_candidate(
             [single, album], "What Aloha Means", ["Kolohe Kai"])["reason"], "spotify_ambiguous")
 
     def test_release_type_never_overrides_safe_text_or_non_unique_type(self):
@@ -252,13 +254,13 @@ class SearchAndMatchingTests(unittest.TestCase):
             {"score": .84, "title_score": .9, "artist_score": .9, "candidate": single},
         ]
         with patch.object(spotify_mod, "spotify_candidate_score", side_effect=rows):
-            self.assertIs(mod.choose_spotify_candidate(
+            self.assertIs(spotify_mod.choose_spotify_candidate(
                 [album, single], "x", ["y"], "Single")["candidate"], album)
         second_album = {"id": "album-2", "album_type": "album", "total_tracks": 12}
         with patch.object(spotify_mod, "spotify_candidate_score", side_effect=[
             {**rows[0], "candidate": album}, {**rows[0], "candidate": second_album},
         ]):
-            self.assertEqual(mod.choose_spotify_candidate(
+            self.assertEqual(spotify_mod.choose_spotify_candidate(
                 [album, second_album], "x", ["y"], "Album")["reason"], "spotify_ambiguous")
 
     def test_spotify_ambiguity_recovery_is_corroborated_and_order_independent(self):
@@ -292,19 +294,19 @@ class SearchAndMatchingTests(unittest.TestCase):
 
         old_id, new_id = "A" * 22, "B" * 22
         old, new = album(old_id, 1), album(new_id, 99)
-        rows = [mod.spotify_candidate_score(item, "Album (Deluxe)", ["Artist"])
+        rows = [spotify_mod.spotify_candidate_score(item, "Album (Deluxe)", ["Artist"])
                 for item in (new, old)]
         stored = tracks(old_id)
         post = {"acf": {"spotify_album_id": old_id, "music_tracks": [
             {"spotify_id": track["id"]} for track in stored]}}
-        result = mod.recover_spotify_ambiguity(
+        result = spotify_mod.recover_spotify_ambiguity(
             Spotify([old, new]), post, rows, "Album (Deluxe)", ["Artist"], None)
         self.assertEqual(result["candidate"]["id"], old_id)
         self.assertEqual(result["selection_evidence"], "existing_id_tracks")
 
         # Without corroboration, popularity is late and independent of input order.
         for ordered in (rows, list(reversed(rows))):
-            result = mod.recover_spotify_ambiguity(
+            result = spotify_mod.recover_spotify_ambiguity(
                 Spotify([old, new]), {"acf": {}}, ordered,
                 "Album (Deluxe)", ["Artist"], None)
             self.assertEqual(result["candidate"]["id"], new_id)
@@ -316,9 +318,9 @@ class SearchAndMatchingTests(unittest.TestCase):
         large_tracks = tracks(old_id, 51)
         large_post = {"acf": {"spotify_album_id": old_id, "music_tracks": [
             {"spotify_id": track["id"]} for track in large_tracks]}}
-        large_rows = [mod.spotify_candidate_score(item, "Album (Deluxe)", ["Artist"])
+        large_rows = [spotify_mod.spotify_candidate_score(item, "Album (Deluxe)", ["Artist"])
                       for item in (large, new)]
-        self.assertEqual(mod.recover_spotify_ambiguity(
+        self.assertEqual(spotify_mod.recover_spotify_ambiguity(
             Spotify([large, new]), large_post, large_rows,
             "Album (Deluxe)", ["Artist"], None)["selection_evidence"],
             "existing_id_tracks")
@@ -327,7 +329,7 @@ class SearchAndMatchingTests(unittest.TestCase):
             with self.subTest(stored_track_damage=len(damaged)):
                 bad_post = {"acf": {"spotify_album_id": old_id, "music_tracks": [
                     {"spotify_id": track["id"]} for track in damaged]}}
-                result = mod.recover_spotify_ambiguity(
+                result = spotify_mod.recover_spotify_ambiguity(
                     Spotify([large, new]), bad_post, large_rows,
                     "Album (Deluxe)", ["Artist"], None)
                 self.assertNotEqual(result.get("selection_evidence"), "existing_id_tracks")
@@ -349,12 +351,12 @@ class SearchAndMatchingTests(unittest.TestCase):
                                      ({"id": "B" * 22}, [track], False),
                                      ({"total_tracks": 2}, [track], False)):
             with self.subTest(changes=changes):
-                evidence = mod.spotify_full_evidence(
+                evidence = spotify_mod.spotify_full_evidence(
                     Spotify({**base, **changes}, rows), candidate)
                 self.assertIs(evidence["valid"], valid)
         for total in (True, "1"):
-            with self.subTest(total_tracks=total), self.assertRaises(mod.SpotifyProviderError):
-                mod.spotify_full_evidence(
+            with self.subTest(total_tracks=total), self.assertRaises(providers_mod.SpotifyProviderError):
+                spotify_mod.spotify_full_evidence(
                     Spotify({**base, "total_tracks": total}, [track]), candidate)
 
     def test_spotify_recovery_keeps_404_and_malformed_contenders_ambiguous(self):
@@ -364,14 +366,14 @@ class SearchAndMatchingTests(unittest.TestCase):
                     "external_urls": {"spotify": "https://spotify.test/" + album_id},
                     "popularity": 9}
         a, b = "A" * 22, "B" * 22
-        rows = [mod.spotify_candidate_score(album(key), "Album", ["Artist"])
+        rows = [spotify_mod.spotify_candidate_score(album(key), "Album", ["Artist"])
                 for key in (a, b)]
 
         class Spotify:
             def __init__(self, failure): self.failure = failure
             def album(self, album_id):
                 if album_id == a and self.failure == "404":
-                    raise mod.SpotifyProviderError(
+                    raise providers_mod.SpotifyProviderError(
                         "gone", failure_kind="http_status", http_status=404)
                 value = album(album_id)
                 if album_id == a and self.failure == "mismatch": value["id"] = b
@@ -384,17 +386,17 @@ class SearchAndMatchingTests(unittest.TestCase):
         stored = {"acf": {"spotify_album_id": a, "music_tracks": [{"spotify_id": a}]}}
         for failure in ("404", "mismatch"):
             with self.subTest(failure=failure):
-                result = mod.recover_spotify_ambiguity(
+                result = spotify_mod.recover_spotify_ambiguity(
                     Spotify(failure), stored, rows, "Album", ["Artist"], None)
                 self.assertEqual(result, {"candidate": None, "reason": "spotify_ambiguous"})
 
     def test_spotify_recovery_rejects_bad_stored_rows_and_unsafe_popularity(self):
-        self.assertIsNone(mod.stored_spotify_track_ids({"acf": {"music_tracks": []}}))
-        self.assertIsNone(mod.stored_spotify_track_ids({"acf": {"music_tracks": [
+        self.assertIsNone(spotify_mod.stored_spotify_track_ids({"acf": {"music_tracks": []}}))
+        self.assertIsNone(spotify_mod.stored_spotify_track_ids({"acf": {"music_tracks": [
             {"spotify_id": "short"}]}}))
-        self.assertIsNone(mod.stored_spotify_track_ids({"acf": {"music_tracks": [
+        self.assertIsNone(spotify_mod.stored_spotify_track_ids({"acf": {"music_tracks": [
             {"spotify_id": "A" * 22}, {}]}}))
-        self.assertIsNone(mod.stored_spotify_track_ids({"acf": {"music_tracks": [
+        self.assertIsNone(spotify_mod.stored_spotify_track_ids({"acf": {"music_tracks": [
             {"spotify_id": "A" * 22}, {"spotify_id": "A" * 22}]}}))
 
         def full(album_id, popularity, count=1):
@@ -418,18 +420,18 @@ class SearchAndMatchingTests(unittest.TestCase):
         a, b = "A" * 22, "B" * 22
         for popularities in ((7, 7), (7, "bad"), (True, 7)):
             values = {key: full(key, popularity) for key, popularity in zip((a, b), popularities)}
-            rows = [mod.spotify_candidate_score(values[key][0], "Album", ["Artist"])
+            rows = [spotify_mod.spotify_candidate_score(values[key][0], "Album", ["Artist"])
                     for key in (a, b)]
-            result = mod.recover_spotify_ambiguity(
+            result = spotify_mod.recover_spotify_ambiguity(
                 Spotify(values), {"acf": {}}, rows, "Album", ["Artist"], None)
             # Complete identical fingerprints (popularity excluded) use lexical ID only.
             self.assertEqual(result["candidate"]["id"], a)
             self.assertEqual(result["selection_evidence"], "equivalent_id")
 
         values = {a: full(a, 7, 1), b: full(b, 7, 2)}
-        rows = [mod.spotify_candidate_score(values[key][0], "Album", ["Artist"])
+        rows = [spotify_mod.spotify_candidate_score(values[key][0], "Album", ["Artist"])
                 for key in (a, b)]
-        result = mod.recover_spotify_ambiguity(
+        result = spotify_mod.recover_spotify_ambiguity(
             Spotify(values), {"acf": {}}, rows, "Album", ["Artist"], None)
         self.assertEqual(result["reason"], "spotify_ambiguous")
         self.assertIsNone(result["candidate"])
@@ -438,9 +440,9 @@ class SearchAndMatchingTests(unittest.TestCase):
         values = {a: full(a, 7, 7), b: full(b, 7, 1)}
         values[a][0]["is_playable"] = False
         values[b][0]["album_type"] = "single"
-        rows = [mod.spotify_candidate_score(values[key][0], "Album", ["Artist"])
+        rows = [spotify_mod.spotify_candidate_score(values[key][0], "Album", ["Artist"])
                 for key in (a, b)]
-        result = mod.recover_spotify_ambiguity(
+        result = spotify_mod.recover_spotify_ambiguity(
             Spotify(values), {"acf": {}}, rows, "Album", ["Artist"], "Album")
         self.assertEqual(result["reason"], "spotify_ambiguous")
 
@@ -450,7 +452,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         low = {"id": "A" * 22, "name": "Wrong", "artists": [{"name": "Other"}]}
         with patch.object(enrichment_mod, "search_ladder", return_value=[low]), \
                 patch.object(enrichment_mod, "recover_spotify_ambiguity") as recover:
-            result = cast(dict, mod.enrich(post, object(), object(), {7: "Artist"}))
+            result = cast(dict, enrichment_mod.enrich(post, object(), object(), {7: "Artist"}))
         self.assertEqual(result["diagnostics"][0]["code"], "spotify_catalog_unavailable")
         self.assertTrue(result["ignored"])
         recover.assert_not_called()
@@ -460,20 +462,20 @@ class SearchAndMatchingTests(unittest.TestCase):
         unresolved = {"candidate": None, "reason": "spotify_ambiguous"}
         with patch.object(enrichment_mod, "search_ladder", return_value=tied), \
                 patch.object(enrichment_mod, "recover_spotify_ambiguity", return_value=unresolved) as recover:
-            result = cast(dict, mod.enrich(post, object(), object(), {7: "Artist"}))
+            result = cast(dict, enrichment_mod.enrich(post, object(), object(), {7: "Artist"}))
         self.assertEqual(result["diagnostics"][0]["code"], "spotify_ambiguous")
         recover.assert_called_once()
 
     def test_spotify_recovery_fetch_failure_and_low_confidence_are_safe(self):
         album_id = "A" * 22
         candidate = {"id": album_id, "name": "Album", "artists": [{"name": "Artist"}]}
-        row = mod.spotify_candidate_score(candidate, "Album", ["Artist"])
+        row = spotify_mod.spotify_candidate_score(candidate, "Album", ["Artist"])
         class Broken:
             def album(self, album_id):
-                raise mod.SpotifyProviderError("down", failure_kind="network", retryable=True)
+                raise providers_mod.SpotifyProviderError("down", failure_kind="network", retryable=True)
             def all_tracks(self, album_id): raise AssertionError("not reached")
-        with self.assertRaises(mod.SpotifyProviderError):
-            mod.recover_spotify_ambiguity(
+        with self.assertRaises(providers_mod.SpotifyProviderError):
+            spotify_mod.recover_spotify_ambiguity(
                 Broken(), {"acf": {}}, [row], "Album", ["Artist"], None)
         for post_id, title, artist in ((2157, "Night of the Living Junkies", "Kendrick Lamar"),
                                        (1885, "Loveless", "my bloody valentine"),
@@ -482,7 +484,7 @@ class SearchAndMatchingTests(unittest.TestCase):
             with self.subTest(post_id=post_id):
                 bad = {"id": str(post_id) * 6, "name": title,
                        "artists": [{"name": "Wrong Artist"}]}
-                self.assertEqual(mod.choose_spotify_candidate(
+                self.assertEqual(spotify_mod.choose_spotify_candidate(
                     [bad], title, [artist])["reason"], "spotify_low_confidence")
 
     def test_spotify_album_reuses_embedded_tracks_and_follows_next_page(self):
@@ -490,7 +492,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         second_track = {"id": "two"}
         album = {"id": "aid", "tracks": {"items": [first_track],
                                              "next": "https://next.test"}}
-        spotify = mod.Spotify("id", "secret")
+        spotify = spotify_mod.Spotify("id", "secret")
         with patch.object(spotify, "_get", side_effect=[
                 album, {"items": [second_track], "next": None}]) as get:
             found_album, tracks = spotify.album_with_tracks("aid")
@@ -516,12 +518,12 @@ class SearchAndMatchingTests(unittest.TestCase):
             seen.append(req)
             return Response(b'{"error": 6, "message": "bad"}')
         with patch("urllib.request.urlopen", open_api):
-            with self.assertRaisesRegex(mod.LastFMProviderError, "API error 6"):
-                mod.LastFM("key")._get("album.search", album="x")
+            with self.assertRaisesRegex(providers_mod.LastFMProviderError, "API error 6"):
+                lastfm_mod.LastFM("key")._get("album.search", album="x")
         self.assertIn("wordpress-album-metadata-filler", seen[0].get_header("User-agent"))
         with patch("urllib.request.urlopen", return_value=Response(b"not json")):
-            with self.assertRaisesRegex(mod.LastFMProviderError, "malformed JSON"):
-                mod.LastFM("key")._get("album.search", album="x")
+            with self.assertRaisesRegex(providers_mod.LastFMProviderError, "malformed JSON"):
+                lastfm_mod.LastFM("key")._get("album.search", album="x")
 
     def test_provider_retry_recovers_502_and_timeouts(self):
         class Response:
@@ -532,7 +534,7 @@ class SearchAndMatchingTests(unittest.TestCase):
 
         errors = [urllib.error.HTTPError("secret-url", 502, "body", Message(), None)
                   for _ in range(2)]
-        spotify = mod.Spotify("id", "secret")
+        spotify = spotify_mod.Spotify("id", "secret")
         spotify._tok, spotify._exp = "token", float("inf")
         with patch("urllib.request.urlopen", side_effect=[*errors, Response({"ok": True})]) as opened, \
              patch("time.sleep") as sleep:
@@ -541,14 +543,14 @@ class SearchAndMatchingTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
         self.assertFalse(spotify._circuit.is_open)
 
-        spotify = mod.Spotify("id", "secret")
+        spotify = spotify_mod.Spotify("id", "secret")
         with patch("urllib.request.urlopen", side_effect=[TimeoutError(),
                                                           Response({"access_token": "token"})]), \
              patch("time.sleep") as sleep:
             self.assertEqual(spotify._ensure_token(), "token")
         sleep.assert_called_once_with(1)
 
-        lfm = mod.LastFM("key")
+        lfm = lastfm_mod.LastFM("key")
         with patch("urllib.request.urlopen", side_effect=[TimeoutError(), Response({"ok": True})]), \
              patch("time.sleep") as sleep:
             self.assertEqual(lfm._get("album.search", album="x"), {"ok": True})
@@ -560,11 +562,11 @@ class SearchAndMatchingTests(unittest.TestCase):
             def __exit__(self, _exc_type, _exc_value, _traceback): pass
             def read(self): raise ConnectionResetError("connection lost")
 
-        circuit = mod.ProviderCircuit("lastfm")
-        lfm = mod.LastFM("key", circuit)
+        circuit = providers_mod.ProviderCircuit("lastfm")
+        lfm = lastfm_mod.LastFM("key", circuit)
         with patch("urllib.request.urlopen", return_value=BrokenResponse()) as opened, \
              patch("time.sleep") as sleep:
-            with self.assertRaises(mod.LastFMProviderError) as caught:
+            with self.assertRaises(providers_mod.LastFMProviderError) as caught:
                 lfm._get("album.search", album="x")
         self.assertEqual(opened.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
@@ -577,7 +579,7 @@ class SearchAndMatchingTests(unittest.TestCase):
             with patch("urllib.request.urlopen",
                        side_effect=ConnectionAbortedError("connection lost")), \
                  patch("time.sleep"):
-                with self.assertRaises(mod.LastFMProviderError):
+                with self.assertRaises(providers_mod.LastFMProviderError):
                     lfm._get("album.search", album="x")
             self.assertEqual(circuit.consecutive_failures, expected_failures)
         self.assertTrue(circuit.is_open)
@@ -587,8 +589,8 @@ class SearchAndMatchingTests(unittest.TestCase):
                   for _ in range(3)]
         with patch("urllib.request.urlopen", side_effect=errors) as opened, \
              patch("time.sleep") as sleep:
-            with self.assertRaises(mod.LastFMProviderError) as caught:
-                mod.LastFM("key")._get("album.search", album="x")
+            with self.assertRaises(providers_mod.LastFMProviderError) as caught:
+                lastfm_mod.LastFM("key")._get("album.search", album="x")
         self.assertEqual(opened.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
         self.assertEqual(caught.exception.http_status, 503)
@@ -598,8 +600,8 @@ class SearchAndMatchingTests(unittest.TestCase):
         error = urllib.error.HTTPError("url", 400, "bad", Message(), None)
         with patch("urllib.request.urlopen", side_effect=error) as opened, \
              patch("time.sleep") as sleep:
-            with self.assertRaises(mod.LastFMProviderError) as caught:
-                mod.LastFM("key")._get("album.search", album="x")
+            with self.assertRaises(providers_mod.LastFMProviderError) as caught:
+                lastfm_mod.LastFM("key")._get("album.search", album="x")
         self.assertEqual(opened.call_count, 1)
         sleep.assert_not_called()
         self.assertFalse(caught.exception.retryable)
@@ -613,7 +615,7 @@ class SearchAndMatchingTests(unittest.TestCase):
 
         headers = Message(); headers["Retry-After"] = "99"
         error = urllib.error.HTTPError("url", 429, "bad", headers, None)
-        spotify = mod.Spotify("id", "secret")
+        spotify = spotify_mod.Spotify("id", "secret")
         spotify._tok, spotify._exp = "token", float("inf")
         with patch("urllib.request.urlopen", side_effect=[error, Response({"ok": True})]), \
              patch("time.sleep") as sleep:
@@ -621,7 +623,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         sleep.assert_called_once_with(99)
 
         unauthorized = urllib.error.HTTPError("url", 401, "bad", Message(), None)
-        spotify = mod.Spotify("id", "secret")
+        spotify = spotify_mod.Spotify("id", "secret")
         spotify._tok, spotify._exp = "old", float("inf")
         with patch("urllib.request.urlopen", side_effect=[
                 unauthorized, Response({"access_token": "new"}), Response({"ok": True})]) as opened, \
@@ -630,16 +632,16 @@ class SearchAndMatchingTests(unittest.TestCase):
         self.assertEqual(opened.call_count, 3)
         sleep.assert_not_called()
 
-        circuit = mod.ProviderCircuit("lastfm")
-        lfm = mod.LastFM("key", circuit)
+        circuit = providers_mod.ProviderCircuit("lastfm")
+        lfm = lastfm_mod.LastFM("key", circuit)
         errors = [urllib.error.HTTPError("secret-key-url", 502, "secret-body", Message(), None)
                   for _ in range(9)]
         with patch("urllib.request.urlopen", side_effect=errors) as opened, \
              patch("time.sleep"):
             for _ in range(3):
-                with self.assertRaises(mod.LastFMProviderError):
+                with self.assertRaises(providers_mod.LastFMProviderError):
                     lfm._get("album.search", album="x")
-            with self.assertRaises(mod.LastFMProviderError) as caught:
+            with self.assertRaises(providers_mod.LastFMProviderError) as caught:
                 lfm._get("album.search", album="x")
         self.assertEqual(opened.call_count, 9)
         self.assertEqual(caught.exception.failure_kind, "circuit_open")
@@ -654,10 +656,10 @@ class SearchAndMatchingTests(unittest.TestCase):
             def __exit__(self, _exc_type, _exc_value, _traceback): pass
             def read(self): return b'{"ok": true}'
 
-        spotify_circuit = mod.ProviderCircuit("spotify")
-        lastfm_circuit = mod.ProviderCircuit("lastfm")
+        spotify_circuit = providers_mod.ProviderCircuit("spotify")
+        lastfm_circuit = providers_mod.ProviderCircuit("lastfm")
         spotify_circuit.consecutive_failures = 2
-        spotify = mod.Spotify("id", "secret", spotify_circuit)
+        spotify = spotify_mod.Spotify("id", "secret", spotify_circuit)
         spotify._tok, spotify._exp = "token", float("inf")
         with patch("urllib.request.urlopen", return_value=Response()):
             self.assertEqual(spotify._get("https://example.test"), {"ok": True})
@@ -666,15 +668,15 @@ class SearchAndMatchingTests(unittest.TestCase):
 
         lastfm_circuit.is_open = True
         with patch("urllib.request.urlopen") as opened, self.assertRaises(
-                mod.LastFMProviderError) as caught:
-            mod.LastFM("key", lastfm_circuit)._get("album.search", album="x")
+                providers_mod.LastFMProviderError) as caught:
+            lastfm_mod.LastFM("key", lastfm_circuit)._get("album.search", album="x")
         opened.assert_not_called()
         self.assertEqual(caught.exception.attempts, 0)
         self.assertFalse(spotify_circuit.is_open)
 
         post = {"id": 1, "title": {"rendered": "Album"}}
         secret = "https://user:password@example.test/?api_key=secret"
-        row = mod._provider_unresolved(
+        row = enrichment_mod._provider_unresolved(
             post, "lastfm_provider_error", RuntimeError(secret), "album.search")
         self.assertNotIn(secret, json.dumps(row))
         self.assertEqual(row["diagnostics"][0]["details"]["failure_kind"], "unexpected")
@@ -683,11 +685,11 @@ class SearchAndMatchingTests(unittest.TestCase):
         headers = Message(); headers["Retry-After"] = "39851"
         body = io.BytesIO(b'{"error":{"status":429,"reason":"QUOTA_EXCEEDED"}}')
         error = urllib.error.HTTPError("secret-url", 429, "bad", headers, body)
-        spotify = mod.Spotify("id", "secret")
+        spotify = spotify_mod.Spotify("id", "secret")
         spotify._tok, spotify._exp = "token", float("inf")
         with patch("urllib.request.urlopen", side_effect=error) as opened, \
              patch("time.sleep") as sleep, patch("time.time", return_value=100.0):
-            with self.assertRaises(mod.SpotifyProviderError) as caught:
+            with self.assertRaises(providers_mod.SpotifyProviderError) as caught:
                 spotify._get("https://example.test", "album.get")
         self.assertEqual(opened.call_count, 1)
         sleep.assert_not_called()
@@ -699,7 +701,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         self.assertEqual(spotify._circuit.request_counts, {"album.get": 1})
 
         with patch("urllib.request.urlopen") as opened, self.assertRaises(
-                mod.SpotifyProviderError) as blocked:
+                providers_mod.SpotifyProviderError) as blocked:
             spotify._get("https://example.test", "album.get")
         opened.assert_not_called()
         self.assertEqual(blocked.exception.failure_kind, "circuit_open")
@@ -712,14 +714,14 @@ class SearchAndMatchingTests(unittest.TestCase):
 
         headers = Message(); headers["Retry-After"] = "not-an-integer"
         error = urllib.error.HTTPError("url", 429, "bad", headers, None)
-        lfm = mod.LastFM("key")
+        lfm = lastfm_mod.LastFM("key")
         with patch("urllib.request.urlopen", side_effect=[error, Response()]), \
              patch("time.sleep") as sleep:
             self.assertEqual(lfm._get("album.search", album="x"), {"ok": True})
         sleep.assert_called_once_with(1)
 
     def test_lastfm_search_empty_singleton_and_bad_shape(self):
-        lfm = mod.LastFM("key")
+        lfm = lastfm_mod.LastFM("key")
         lfm._get = lambda *a, **k: {"results": {"albummatches": {"album": []}}}
         self.assertEqual(lfm.album_search("x"), [])
         lfm._get = lambda *a, **k: {"results": {"albummatches": {}}}
@@ -747,14 +749,14 @@ class SearchAndMatchingTests(unittest.TestCase):
                 return [repeated, different_mbid, different_url]
 
         fake = Fake()
-        found = mod.search_lastfm_candidates(
+        found = lastfm_mod.search_lastfm_candidates(
             fake, {"name": "Palette", "artists": [{"name": "Didier Armeni"}]})
 
         self.assertEqual(fake.queries, [("Palette Didier Armeni", 10), ("Palette", 10)])
         self.assertEqual(found, [same, same, different_mbid, different_url])
 
     def test_getinfo_unwraps_and_uses_autocorrect_zero(self):
-        lfm = mod.LastFM("key")
+        lfm = lastfm_mod.LastFM("key")
         calls = []
         lfm._get = lambda method, **kw: calls.append((method, kw)) or {"album": {"name": "x"}}
         self.assertEqual(lfm.album_getinfo(artist="a", album="x"), {"name": "x"})
@@ -763,7 +765,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         self.assertEqual(calls[1][1], {"mbid": "id"})
 
     def test_top_tag_clients_use_provider_methods_and_unwrap_toptags(self):
-        lfm = mod.LastFM("key")
+        lfm = lastfm_mod.LastFM("key")
         calls = []
         lfm._get = lambda method, **kw: calls.append((method, kw)) or {
             "toptags": {"tag": [{"name": "Rock"}]}}
@@ -791,7 +793,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         )
         for info, selected, expected in mbid_cases:
             with self.subTest(info=info, selected=selected):
-                self.assertEqual(mod.resolve_lastfm_mbid(info, selected), expected)
+                self.assertEqual(lastfm_mod.resolve_lastfm_mbid(info, selected), expected)
 
         selected_url = "http://last.fm/selected"
         url_cases = (
@@ -803,47 +805,47 @@ class SearchAndMatchingTests(unittest.TestCase):
         )
         for info, selected, expected in url_cases:
             with self.subTest(info=info, selected=selected):
-                self.assertEqual(mod.resolve_lastfm_url(info, selected), expected)
+                self.assertEqual(lastfm_mod.resolve_lastfm_url(info, selected), expected)
 
     def test_lastfm_exact_and_mbid_ambiguity(self):
-        self.assertEqual(mod.choose_lastfm_candidate(SPOTIFY, [CANDIDATE])["reason"], "lastfm_exact")
+        self.assertEqual(lastfm_mod.choose_lastfm_candidate(SPOTIFY, [CANDIDATE])["reason"], "lastfm_exact")
         duplicate = dict(CANDIDATE)
-        self.assertEqual(mod.choose_lastfm_candidate(SPOTIFY, [CANDIDATE, duplicate])["reason"],
+        self.assertEqual(lastfm_mod.choose_lastfm_candidate(SPOTIFY, [CANDIDATE, duplicate])["reason"],
                          "lastfm_ambiguous_exact")
         mbid = "123e4567-e89b-12d3-a456-426614174000"
         pinned = {**CANDIDATE, "mbid": mbid}
-        self.assertEqual(mod.choose_lastfm_candidate(SPOTIFY, [pinned, duplicate])["candidate"], pinned)
+        self.assertEqual(lastfm_mod.choose_lastfm_candidate(SPOTIFY, [pinned, duplicate])["candidate"], pinned)
 
         spotify = {"name": "Album", "artists": [{"name": "alt-J"}]}
         hyphen_alias = {"name": "Album", "artist": "alt‐J", "mbid": "a" * 36}
         canonical = {"name": "Album", "artist": "alt-J", "mbid": "b" * 36}
-        chosen = mod.choose_lastfm_candidate(spotify, [hyphen_alias, canonical])
+        chosen = lastfm_mod.choose_lastfm_candidate(spotify, [hyphen_alias, canonical])
         self.assertEqual(chosen["candidate"], canonical)
         self.assertEqual(chosen["reason"], "lastfm_exact_punctuation")
 
     def test_lastfm_fuzzy_ambiguity_exact_boundary(self):
         candidates = [{"name": "a"}, {"name": "b"}]
-        for gap, reason in ((mod.LASTFM_MAX_TIE_GAP - .001, "lastfm_ambiguous"),
-                            (mod.LASTFM_MAX_TIE_GAP, "lastfm_fuzzy")):
+        for gap, reason in ((lastfm_mod.LASTFM_MAX_TIE_GAP - .001, "lastfm_ambiguous"),
+                            (lastfm_mod.LASTFM_MAX_TIE_GAP, "lastfm_fuzzy")):
             with self.subTest(gap=gap), patch.object(lastfm_mod, "lastfm_candidate_score", side_effect=[
                 {"score": .90, "title_score": .9, "artist_score": .9, "candidate": candidates[0]},
                 {"score": .90 - gap, "title_score": .9, "artist_score": .9,
                  "candidate": candidates[1]},
             ]):
-                result = mod.choose_lastfm_candidate(SPOTIFY, candidates)
+                result = lastfm_mod.choose_lastfm_candidate(SPOTIFY, candidates)
             self.assertEqual(result["reason"], reason)
 
     def test_validation_identity_tracks_and_boundaries(self):
         tracks = [{"name": "One"}, {"name": "Two"}, {"name": "Three"}, {"name": "Four"}, {"name": "Five"}]
         info = {**CANDIDATE, "tracks": {"track": []}}
-        self.assertTrue(mod.validate_lastfm_info(SPOTIFY, tracks, CANDIDATE, info)["accepted"])
+        self.assertTrue(lastfm_mod.validate_lastfm_info(SPOTIFY, tracks, CANDIDATE, info)["accepted"])
         info["tracks"] = {"track": [{"name": x} for x in ["One", "Two", "Three", "x", "y"]]}
-        self.assertTrue(mod.validate_lastfm_info(SPOTIFY, tracks, CANDIDATE, info)["accepted"])
+        self.assertTrue(lastfm_mod.validate_lastfm_info(SPOTIFY, tracks, CANDIDATE, info)["accepted"])
         info["tracks"] = {"track": [{"name": x} for x in ["One", "Two", "x", "y", "z"]]}
-        self.assertEqual(mod.validate_lastfm_info(SPOTIFY, tracks, CANDIDATE, info)["reason"],
+        self.assertEqual(lastfm_mod.validate_lastfm_info(SPOTIFY, tracks, CANDIDATE, info)["reason"],
                          "lastfm_track_contradiction")
         wrong = {**info, "artist": "Someone Else", "tracks": {}}
-        self.assertEqual(mod.validate_lastfm_info(SPOTIFY, tracks, CANDIDATE, wrong)["reason"],
+        self.assertEqual(lastfm_mod.validate_lastfm_info(SPOTIFY, tracks, CANDIDATE, wrong)["reason"],
                          "lastfm_identity_changed")
 
     def test_track_overlap_matches_provider_suffixes_without_stripping_them(self):
@@ -851,7 +853,7 @@ class SearchAndMatchingTests(unittest.TestCase):
                 "The Long Run", "New Kid in Town"]
         spotify = [{"name": f"{title} - Live; 1999 Remaster"} for title in base]
         info = {**CANDIDATE, "tracks": {"track": [{"name": title} for title in base]}}
-        result = mod.validate_lastfm_info(SPOTIFY, spotify, CANDIDATE, info)
+        result = lastfm_mod.validate_lastfm_info(SPOTIFY, spotify, CANDIDATE, info)
         self.assertTrue(result["accepted"])
         self.assertEqual(result["overlap"], 1.0)
 
@@ -863,23 +865,23 @@ class SearchAndMatchingTests(unittest.TestCase):
                     ("Part I", "Part II"), ("Chapter 1", "Chapter 10"))
         for titles in accepted:
             with self.subTest(titles=titles):
-                self.assertGreaterEqual(mod._track_similarity(*titles),
-                                        mod.LASTFM_MIN_TRACK_SIMILARITY)
+                self.assertGreaterEqual(lastfm_mod._track_similarity(*titles),
+                                        lastfm_mod.LASTFM_MIN_TRACK_SIMILARITY)
         for titles in rejected:
             with self.subTest(titles=titles):
-                self.assertLess(mod._track_similarity(*titles),
-                                mod.LASTFM_MIN_TRACK_SIMILARITY)
+                self.assertLess(lastfm_mod._track_similarity(*titles),
+                                lastfm_mod.LASTFM_MIN_TRACK_SIMILARITY)
 
     def test_track_similarity_handles_morse_and_balanced_quotes_only(self):
-        self.assertEqual(mod._track_similarity("･･－－－", "･･－－－"), 1.0)
-        self.assertEqual(mod._track_similarity("･･－－－", "･・－－－"), 0.0)
-        self.assertEqual(mod._track_similarity(
+        self.assertEqual(lastfm_mod._track_similarity("･･－－－", "･･－－－"), 1.0)
+        self.assertEqual(lastfm_mod._track_similarity("･･－－－", "･・－－－"), 0.0)
+        self.assertEqual(lastfm_mod._track_similarity(
             "How It’s Done", '"How It\'s Done" (Huntr/x: EJAE, Audrey Nuna, REI AMI)'), 1.0)
         for longer in ('"How It\'s Done (Huntr/x: EJAE)',
                        '"How It\'s Done" continuing',
                        '"Part II" (version)'):
             with self.subTest(longer=longer):
-                self.assertLess(mod._track_similarity("How It’s Done" if "Part" not in longer else "Part I",
+                self.assertLess(lastfm_mod._track_similarity("How It’s Done" if "Part" not in longer else "Part I",
                                                       longer), .90)
 
     def test_kpop_quoted_annotation_fixture_clears_only_release_gate(self):
@@ -887,8 +889,8 @@ class SearchAndMatchingTests(unittest.TestCase):
                  "Strategy", "Takedown", "Score Suite", "Love, Maybe", "Path", "Finale"]
         annotated = [f'"{title}" (Huntr/x: performer)' for title in bases[:9]] + [
             "Maybe Love", "길 Path", "Finale Korean"]
-        self.assertGreaterEqual(mod._track_overlap(bases, annotated), .60)
-        self.assertEqual(mod._track_match_count(bases, annotated), 9)
+        self.assertGreaterEqual(lastfm_mod._track_overlap(bases, annotated), .60)
+        self.assertEqual(lastfm_mod._track_match_count(bases, annotated), 9)
 
     def test_transliteration_alignment_requires_every_boundary(self):
         album = {"name": "WINK", "artists": [{"name": "Miki Matsubara"}]}
@@ -898,7 +900,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         native = latin[:4] + ["青！", "夢 (2024)", "風 - 2", "夜…", "月？", "空 #1"]
         tracks = [{"name": title} for title in latin]
         info = {**candidate, "tracks": {"track": [{"name": title} for title in native]}}
-        result = mod.validate_lastfm_info(album, tracks, candidate, info)
+        result = lastfm_mod.validate_lastfm_info(album, tracks, candidate, info)
         self.assertTrue(result["accepted"])
         self.assertEqual(result["reason"], "lastfm_transliteration_alignment")
         self.assertEqual(result["anchors"], 4)
@@ -913,7 +915,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         for left, right, row in negatives:
             with self.subTest(right=right, row=row):
                 detail = {**row, "tracks": {"track": [{"name": title} for title in right]}}
-                self.assertFalse(mod.validate_lastfm_info(
+                self.assertFalse(lastfm_mod.validate_lastfm_info(
                     album, [{"name": title} for title in left], candidate, detail)["accepted"])
 
     def test_known_track_contradictions_remain_rejected(self):
@@ -922,28 +924,28 @@ class SearchAndMatchingTests(unittest.TestCase):
         spotify = [{"name": name} for name in ["Toxicity"] + [f"Album {i}" for i in range(14)]]
         info = {**candidate, "tracks": {"track": [{"name": name} for name in
                                                     ["Toxicity", "Marmalade", "Metro"]]}}
-        result = mod.validate_lastfm_info(album, spotify, candidate, info)
+        result = lastfm_mod.validate_lastfm_info(album, spotify, candidate, info)
         self.assertFalse(result["accepted"])
         self.assertEqual((result["matched_tracks"], result["denominator"]), (1, 3))
         music = {"name": "MUSIC", "artists": [{"name": "Playboi Carti"}]}
         music_candidate = {"name": "MUSIC", "artist": "Playboi Carti"}
         stale = {**music_candidate, "tracks": {"track": [{"name": f"Stale {i}"}
                                                             for i in range(21)]}}
-        self.assertEqual(mod.validate_lastfm_info(
+        self.assertEqual(lastfm_mod.validate_lastfm_info(
             music, [{"name": f"Released {i}"} for i in range(30)], music_candidate,
             stale)["matched_tracks"], 0)
 
     def test_track_overlap_is_fuzzy_bounded_and_one_to_one(self):
-        self.assertEqual(mod._track_overlap(["One"], ["Someone"]), 0.0)
-        self.assertEqual(mod._track_overlap(["Blue Sky"], ["Red Moon"]), 0.0)
-        self.assertEqual(mod._track_overlap(["Song", "Song"], ["Song", "Other"]), 0.5)
-        for score, expected in ((mod.LASTFM_MIN_TRACK_SIMILARITY, 1.0),
-                                (mod.LASTFM_MIN_TRACK_SIMILARITY - .001, 0.0)):
+        self.assertEqual(lastfm_mod._track_overlap(["One"], ["Someone"]), 0.0)
+        self.assertEqual(lastfm_mod._track_overlap(["Blue Sky"], ["Red Moon"]), 0.0)
+        self.assertEqual(lastfm_mod._track_overlap(["Song", "Song"], ["Song", "Other"]), 0.5)
+        for score, expected in ((lastfm_mod.LASTFM_MIN_TRACK_SIMILARITY, 1.0),
+                                (lastfm_mod.LASTFM_MIN_TRACK_SIMILARITY - .001, 0.0)):
             with self.subTest(score=score), patch.object(lastfm_mod, "_track_similarity", return_value=score):
-                self.assertEqual(mod._track_overlap(["a"], ["b"]), expected)
+                self.assertEqual(lastfm_mod._track_overlap(["a"], ["b"]), expected)
         edges = {("a", "x"), ("a", "y"), ("b", "x")}
         with patch.object(lastfm_mod, "_track_similarity", side_effect=lambda a, b: float((a, b) in edges)):
-            self.assertEqual(mod._track_overlap(["a", "b"], ["x", "y"]), 1.0)
+            self.assertEqual(lastfm_mod._track_overlap(["a", "b"], ["x", "y"]), 1.0)
 
     def test_track_provider_labels_and_placeholders_are_non_contradictory(self):
         variants = (
@@ -956,14 +958,14 @@ class SearchAndMatchingTests(unittest.TestCase):
         )
         for left, right in variants:
             with self.subTest(left=left):
-                self.assertGreaterEqual(mod._track_similarity(left, right),
-                                        mod.LASTFM_MIN_TRACK_SIMILARITY)
+                self.assertGreaterEqual(lastfm_mod._track_similarity(left, right),
+                                        lastfm_mod.LASTFM_MIN_TRACK_SIMILARITY)
 
         spotify = {"name": "Album", "artists": [{"name": "Artist"}]}
         tracks = [{"name": "Known"}, {"name": "Second"}, {"name": "Third"}]
         info = {"name": "Album", "artist": "Artist", "tracks": {"track": [
             {"name": "Known"}, {"name": "Track 02"}, {"name": "Track 03"}]}}
-        validation = mod.validate_lastfm_info(spotify, tracks,
+        validation = lastfm_mod.validate_lastfm_info(spotify, tracks,
                                               {"name": "Album", "artist": "Artist"}, info)
         self.assertTrue(validation["accepted"])
         self.assertEqual((validation["matched_tracks"], validation["denominator"]), (1, 1))
@@ -971,8 +973,8 @@ class SearchAndMatchingTests(unittest.TestCase):
         restricted = {"id": "track", "name": "", "duration_ms": 0,
                       "explicit": False, "disc_number": 1, "track_number": 1,
                       "restrictions": {"reason": "market"}}
-        self.assertTrue(mod._spotify_tracks_market_restricted([restricted]))
-        self.assertFalse(mod._spotify_tracks_market_restricted([
+        self.assertTrue(spotify_mod._spotify_tracks_market_restricted([restricted]))
+        self.assertFalse(spotify_mod._spotify_tracks_market_restricted([
             {**restricted, "explicit": "false"}]))
 
     def test_combined_artist_lookup_and_primary_recovery(self):
@@ -985,7 +987,7 @@ class SearchAndMatchingTests(unittest.TestCase):
                 return {"name": "Album", "artist": artist,
                         "tracks": {"track": [{"name": "Song"}]}}
 
-        combined = mod.lookup_combined_lastfm(Fake(), spotify, tracks)
+        combined = lastfm_mod.lookup_combined_lastfm(Fake(), spotify, tracks)
         if combined is None:
             self.fail("combined artist lookup should validate")
         self.assertEqual(combined["candidate"]["artist"], "One & Two")
@@ -993,7 +995,7 @@ class SearchAndMatchingTests(unittest.TestCase):
 
         candidates = [{"name": "Album", "artist": "Two"},
                       {"name": "Album", "artist": "One"}]
-        recovered = mod.recover_lastfm_candidate(Fake(), spotify, tracks, candidates)
+        recovered = lastfm_mod.recover_lastfm_candidate(Fake(), spotify, tracks, candidates)
         self.assertEqual(recovered["candidate"]["artist"], "One")
 
     def test_stale_track_acceptance_requires_exact_non_eponymous_identity(self):
@@ -1001,24 +1003,24 @@ class SearchAndMatchingTests(unittest.TestCase):
         candidate = {"name": "Toxicity", "artist": "System Of A Down"}
         info = dict(candidate)
         contradiction = {"reason": "lastfm_track_contradiction"}
-        self.assertTrue(mod._accept_stale_lastfm_tracks(
+        self.assertTrue(lastfm_mod._accept_stale_lastfm_tracks(
             album, candidate, info, contradiction))
-        self.assertFalse(mod._accept_stale_lastfm_tracks(
+        self.assertFalse(lastfm_mod._accept_stale_lastfm_tracks(
             {"name": "Rita Lee", "artists": [{"name": "Rita Lee"}]},
             {"name": "Rita Lee", "artist": "Rita Lee"},
             {"name": "Rita Lee", "artist": "Rita Lee"}, contradiction))
-        self.assertFalse(mod._accept_stale_lastfm_tracks(
+        self.assertFalse(lastfm_mod._accept_stale_lastfm_tracks(
             album, candidate, {**info, "artist": "Other"}, contradiction))
 
     def test_track_match_count_is_duplicate_aware_at_boundary(self):
-        self.assertEqual(mod._track_match_count(["Song", "Song"], ["Song", "Other"]), 1)
+        self.assertEqual(lastfm_mod._track_match_count(["Song", "Song"], ["Song", "Other"]), 1)
         edges = {("a", "x"), ("a", "y"), ("b", "x")}
         with patch.object(lastfm_mod, "_track_similarity", side_effect=lambda a, b: float((a, b) in edges)):
-            self.assertEqual(mod._track_match_count(["a", "b"], ["x", "y"]), 2)
-        for score, expected in ((mod.LASTFM_MIN_TRACK_SIMILARITY, 1),
-                                (mod.LASTFM_MIN_TRACK_SIMILARITY - .001, 0)):
+            self.assertEqual(lastfm_mod._track_match_count(["a", "b"], ["x", "y"]), 2)
+        for score, expected in ((lastfm_mod.LASTFM_MIN_TRACK_SIMILARITY, 1),
+                                (lastfm_mod.LASTFM_MIN_TRACK_SIMILARITY - .001, 0)):
             with patch.object(lastfm_mod, "_track_similarity", return_value=score):
-                self.assertEqual(mod._track_match_count(["a"], ["b"]), expected)
+                self.assertEqual(lastfm_mod._track_match_count(["a"], ["b"]), expected)
 
     def test_lastfm_recovery_uses_full_spotify_coverage_and_exact_title(self):
         spotify = {"name": "White Pony (20th Anniversary Deluxe Edition)",
@@ -1034,13 +1036,13 @@ class SearchAndMatchingTests(unittest.TestCase):
                 return {**candidate, "tracks": {"track": [
                     {"name": f"Track {i}"} for i in names]}}
 
-        recovered = mod.recover_lastfm_candidate(Fake(), spotify, tracks, [explicit, exact])
+        recovered = lastfm_mod.recover_lastfm_candidate(Fake(), spotify, tracks, [explicit, exact])
         self.assertIs(recovered["candidate"], exact)
         self.assertEqual(recovered["validation"]["matched_tracks"], 22)
         subset = Fake().album_getinfo(artist="Deftones", album=explicit["name"], autocorrect=0)
-        self.assertEqual(mod._track_overlap(
+        self.assertEqual(lastfm_mod._track_overlap(
             [t["name"] for t in tracks], [t["name"] for t in subset["tracks"]["track"]]), 1.0)
-        self.assertAlmostEqual(mod.lastfm_recovery_validation(
+        self.assertAlmostEqual(lastfm_mod.lastfm_recovery_validation(
             spotify, tracks, explicit, subset)["spotify_track_coverage"], 2 / 22)
 
     def test_lastfm_recovery_rejects_partial_discs_and_identity_drift(self):
@@ -1056,11 +1058,11 @@ class SearchAndMatchingTests(unittest.TestCase):
                         "tracks": {"track": [{"name": f"Track {i}"}
                                                for i in range(start, start + 10)]}}
 
-        self.assertIsNone(mod.recover_lastfm_candidate(
+        self.assertIsNone(lastfm_mod.recover_lastfm_candidate(
             Fake(), spotify, tracks, candidates)["candidate"])
         drift = {"name": "Collector Edition", "artist": "Someone Else",
                  "tracks": {"track": [{"name": f"Track {i}"} for i in range(22)]}}
-        self.assertEqual(mod.lastfm_recovery_validation(
+        self.assertEqual(lastfm_mod.lastfm_recovery_validation(
             spotify, tracks, candidates[0], drift)["reason"], "lastfm_identity_changed")
 
     def test_lastfm_recovery_prefers_unique_exact_not_coverage_or_order(self):
@@ -1084,9 +1086,9 @@ class SearchAndMatchingTests(unittest.TestCase):
         outcomes = []
         for candidates in ([exact, alias], [alias, exact]):
             fake = Fake()
-            outcomes.append(mod.recover_lastfm_candidate(
+            outcomes.append(lastfm_mod.recover_lastfm_candidate(
                 fake, spotify, tracks, list(candidates))["candidate"]["name"])
-            self.assertEqual(fake.calls, sorted(fake.calls, key=mod.match_key))
+            self.assertEqual(fake.calls, sorted(fake.calls, key=common_mod.match_key))
         self.assertEqual(outcomes, [exact["name"], exact["name"]])
 
     def test_lastfm_recovery_exact_preference_uses_validated_detail_title(self):
@@ -1104,7 +1106,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         class Fake:
             def album_getinfo(self, **kwargs): return infos[kwargs["album"]]
 
-        recovered = mod.recover_lastfm_candidate(
+        recovered = lastfm_mod.recover_lastfm_candidate(
             Fake(), spotify, tracks, [exact_search, fuzzy_search])
         self.assertIs(recovered["candidate"], fuzzy_search)
         self.assertEqual(recovered["info"]["name"], spotify["name"])
@@ -1145,14 +1147,14 @@ class SearchAndMatchingTests(unittest.TestCase):
                 class Fake:
                     def album_getinfo(self, **kwargs): return info
 
-                result = mod.recover_lastfm_candidate(Fake(), spotify, tracks, [candidate])
+                result = lastfm_mod.recover_lastfm_candidate(Fake(), spotify, tracks, [candidate])
                 self.assertEqual(result["candidate"] is not None, should_recover)
                 (recovered_ids if result["candidate"] else residual_ids).add(post_id)
         self.assertEqual(recovered_ids, {2874, 2811, 2504, 2492, 2398, 2257, 2177,
                                          2068, 2017, 1560, 1485, 1443, 1277})
         self.assertEqual(residual_ids, {2786, 2769, 2752, 2365, 1801, 1539, 1497})
 
-        low = mod.choose_lastfm_candidate(
+        low = lastfm_mod.choose_lastfm_candidate(
             {"name": "Purple Friday", "artists": [{"name": "Artist"}]},
             [{"name": "Unrelated", "artist": "Someone Else"}])
         self.assertEqual(low["reason"], "lastfm_low_confidence")  # Post 1226 stays out.
@@ -1169,14 +1171,14 @@ class SearchAndMatchingTests(unittest.TestCase):
             def album_getinfo(self, **kwargs):
                 self.calls += 1
                 if self.fail and self.calls == 2:
-                    raise mod.LastFMProviderError("down", operation="album.getinfo")
+                    raise providers_mod.LastFMProviderError("down", operation="album.getinfo")
                 return {"name": "Album", "artist": "Artist",
                         "tracks": {"track": [{"name": "Song"}]}}
 
-        self.assertIsNone(mod.recover_lastfm_candidate(
+        self.assertIsNone(lastfm_mod.recover_lastfm_candidate(
             Fake(), spotify, tracks, [one, two])["candidate"])
-        with self.assertRaises(mod.LastFMProviderError):
-            mod.recover_lastfm_candidate(Fake(True), spotify, tracks, [one, two])
+        with self.assertRaises(providers_mod.LastFMProviderError):
+            lastfm_mod.recover_lastfm_candidate(Fake(True), spotify, tracks, [one, two])
 
         malformed = {**one, "name": "Album Alias", "mbid": "not-a-uuid"}
         calls = []
@@ -1184,28 +1186,28 @@ class SearchAndMatchingTests(unittest.TestCase):
             def album_getinfo(self, **kwargs):
                 calls.append(kwargs)
                 return {**malformed, "tracks": {"track": [{"name": "Song"}]}}
-        mod.recover_lastfm_candidate(LocatorFake(), spotify, tracks, [malformed])
+        lastfm_mod.recover_lastfm_candidate(LocatorFake(), spotify, tracks, [malformed])
         self.assertEqual(calls, [{"artist": "Artist", "album": "Album Alias",
                                   "autocorrect": 0}])
 
     def test_malformed_nonempty_lastfm_tracks_are_provider_errors(self):
         for tracks in ("bad", {"track": "bad"}, {"track": [{"name": "One"}, "bad"]}):
             with self.subTest(tracks=tracks), self.assertRaisesRegex(RuntimeError, "malformed"):
-                mod.validate_lastfm_info(SPOTIFY, [], CANDIDATE,
+                lastfm_mod.validate_lastfm_info(SPOTIFY, [], CANDIDATE,
                                          {**CANDIDATE, "tracks": tracks})
         for tracks in (None, {}, {"track": []}):
             with self.subTest(tracks=tracks):
-                self.assertTrue(mod.validate_lastfm_info(
+                self.assertTrue(lastfm_mod.validate_lastfm_info(
                     SPOTIFY, [], CANDIDATE, {**CANDIDATE, "tracks": tracks})["accepted"])
 
     def test_tags_reads_toptags_and_tags(self):
-        self.assertEqual(mod.pick_top_tags({"toptags": {"tag": {"name": "rock"}}}, 3, []), ["rock"])
-        self.assertEqual(mod.pick_top_tags({"tags": {"tag": "pop"}}, 3, []), ["pop"])
+        self.assertEqual(lastfm_mod.pick_top_tags({"toptags": {"tag": {"name": "rock"}}}, 3, []), ["rock"])
+        self.assertEqual(lastfm_mod.pick_top_tags({"tags": {"tag": "pop"}}, 3, []), ["pop"])
 
     def test_enrich_distinguishes_no_artist_provider_error_and_no_results(self):
         post = {"id": 1, "title": {"rendered": "Album"}, "date": "2020-01-01",
                 "tags": [], "acf": {}}
-        result = cast(dict, mod.enrich(post, object(), object(), {}))
+        result = cast(dict, enrichment_mod.enrich(post, object(), object(), {}))
         self.assertEqual(result["diagnostics"][0]["code"], "spotify_missing_artist")
 
         class Search:
@@ -1214,9 +1216,9 @@ class SearchAndMatchingTests(unittest.TestCase):
                 if self.error: raise urllib.error.URLError("down")
                 return []
         post["tags"] = [7]
-        result = cast(dict, mod.enrich(post, Search(error=True), object(), {7: "Artist"}))
+        result = cast(dict, enrichment_mod.enrich(post, Search(error=True), object(), {7: "Artist"}))
         self.assertEqual(result["diagnostics"][0]["code"], "spotify_provider_error")
-        result = cast(dict, mod.enrich(post, Search(), object(), {7: "Artist"}))
+        result = cast(dict, enrichment_mod.enrich(post, Search(), object(), {7: "Artist"}))
         self.assertEqual(result["diagnostics"][0]["code"], "spotify_catalog_unavailable")
         self.assertTrue(result["ignored"])
 
@@ -1233,14 +1235,14 @@ class SearchAndMatchingTests(unittest.TestCase):
         for rows in (multiple, zero):
             with self.subTest(rows=rows), patch.object(enrichment_mod, "search_ladder", return_value=rows), \
                     patch.object(enrichment_mod, "recover_spotify_ambiguity", return_value=unresolved):
-                result = cast(dict, mod.enrich(post, object(), object(), {7: "Artist"},
+                result = cast(dict, enrichment_mod.enrich(post, object(), object(), {7: "Artist"},
                                                release_type_terms={}))
                 self.assertEqual(result["diagnostics"][0]["code"], "spotify_ambiguous")
                 self.assertIn("full-release evidence", result["diagnostics"][0]["message"])
 
         with patch.object(enrichment_mod, "search_ladder", return_value=multiple), \
                 patch.object(enrichment_mod, "recover_spotify_ambiguity", return_value=unresolved):
-            result = cast(dict, mod.enrich(
+            result = cast(dict, enrichment_mod.enrich(
                 {**post, "categories": []}, object(), object(), {7: "Artist"},
                 release_type_terms={}))
         self.assertEqual(result["diagnostics"][0]["code"], "spotify_ambiguous")
@@ -1275,7 +1277,7 @@ class SearchAndMatchingTests(unittest.TestCase):
                 return {"toptags": {"tag": []}}
 
         lastfm = LastFmFake()
-        result = cast(dict, mod.enrich(post, SpotifyFake(), lastfm, {7: "Didier Armeni"}))
+        result = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), lastfm, {7: "Didier Armeni"}))
 
         self.assertIn("write", result)
         self.assertEqual(result["matches"]["lastfm"]["artist"], "Didier Armeni")
@@ -1310,7 +1312,7 @@ class SearchAndMatchingTests(unittest.TestCase):
             def artist_gettoptags(self, *args, **kwargs): return {}
 
         fake = LastFmFake()
-        result = cast(dict, mod.enrich(post, SpotifyFake(), fake, {7: "Artist"}))
+        result = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), fake, {7: "Artist"}))
         self.assertIn("write", result)
         self.assertEqual(len(fake.calls), 2)  # One GET per contender; no winner refetch.
         self.assertEqual(result["matches"]["lastfm"]["track_overlap"], 1.0)
@@ -1318,7 +1320,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         with patch.object(enrichment_mod, "recover_lastfm_candidate") as recover:
             with patch.object(enrichment_mod, "choose_lastfm_candidate", return_value={
                     "candidate": None, "reason": "lastfm_low_confidence"}):
-                low = cast(dict, mod.enrich(post, SpotifyFake(), LastFmFake(), {7: "Artist"}))
+                low = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), LastFmFake(), {7: "Artist"}))
             self.assertEqual(low["diagnostics"][0]["code"], "lastfm_catalog_unavailable")
             self.assertTrue(low["ignored"])
             recover.assert_not_called()
@@ -1367,17 +1369,17 @@ class SearchAndMatchingTests(unittest.TestCase):
                               "lastfm_provider_error"),
                              (LastFmFake(candidates=[]), "lastfm_catalog_unavailable")):
             with self.subTest(reason=reason):
-                result = cast(dict, mod.enrich(post, SpotifyFake(), fake, {7: "Artist"}))
+                result = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), fake, {7: "Artist"}))
                 self.assertEqual(result["diagnostics"][0]["code"], reason)
                 self.assertEqual(result.get("ignored", False),
                                  reason == "lastfm_catalog_unavailable")
 
         rejected = LastFmFake(info={**candidate, "artist": "Other", "tracks": {}})
-        result = cast(dict, mod.enrich(post, SpotifyFake(), rejected, {7: "Artist"}))
+        result = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), rejected, {7: "Artist"}))
         self.assertEqual(result["diagnostics"][0]["code"], "lastfm_identity_mismatch")
 
         fallback = LastFmFake()
-        body = cast(dict, mod.enrich(post, SpotifyFake(), fallback, {7: "Artist"}))
+        body = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), fallback, {7: "Artist"}))
         self.assertEqual(fallback.getinfo_calls, [{"artist": "Artist", "album": "Album", "autocorrect": 0}])
         self.assertNotIn("music_mood_tags", body["write"]["acf"])
         self.assertEqual(body["write"]["taxonomies"]["genre"], ["rock"])
@@ -1391,7 +1393,7 @@ class SearchAndMatchingTests(unittest.TestCase):
             info={**candidate, "mbid": "", "url": info_url, "tracks": {},
                   "toptags": {"tag": [{"name": "rock"}]}},
         )
-        caravelle = cast(dict, mod.enrich(post, SpotifyFake(), pinned, {7: "Artist"}))
+        caravelle = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), pinned, {7: "Artist"}))
         self.assertEqual(pinned.getinfo_calls, [{"mbid": mbid_candidate["mbid"]}])
         self.assertEqual(caravelle["write"]["acf"]["mbid"], mbid_candidate["mbid"])
         self.assertEqual(caravelle["write"]["acf"]["lastfm_url"], info_url)
@@ -1415,7 +1417,7 @@ class SearchAndMatchingTests(unittest.TestCase):
                         "toptags": {"tag": []}}
 
         recovered = FallbackFake()
-        recovered_body = cast(dict, mod.enrich(post, SpotifyFake(), recovered, {7: "Artist"}))
+        recovered_body = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), recovered, {7: "Artist"}))
         self.assertEqual(recovered.getinfo_calls, [
             {"mbid": mbid_candidate["mbid"]},
             {"artist": "Artist", "album": "Album", "autocorrect": 0}])
@@ -1424,7 +1426,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         self.assertEqual(recovered.toptags_calls, [
             {"artist": "Artist", "album": "Album", "autocorrect": 0}])
         for failed in (FallbackFake(alternate_valid=False), FallbackFake(alternate_error=True)):
-            unresolved = cast(dict, mod.enrich(post, SpotifyFake(), failed, {7: "Artist"}))
+            unresolved = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), failed, {7: "Artist"}))
             self.assertEqual(unresolved["diagnostics"][0]["code"], "lastfm_identity_mismatch")
             self.assertIn("selected='Album'", unresolved["diagnostics"][0]["message"])
             self.assertNotEqual(unresolved["diagnostics"][0]["code"], "lastfm_provider_error")
@@ -1432,12 +1434,12 @@ class SearchAndMatchingTests(unittest.TestCase):
         successful = LastFmFake(candidates=[mbid_candidate], info={
             **candidate, "tracks": {"track": [{"name": "Song"}]},
             "toptags": {"tag": []}})
-        mod.enrich(post, SpotifyFake(), successful, {7: "Artist"})
+        enrichment_mod.enrich(post, SpotifyFake(), successful, {7: "Artist"})
         self.assertEqual(successful.getinfo_calls, [{"mbid": mbid_candidate["mbid"]}])
         self.assertEqual(successful.toptags_calls, [{"mbid": mbid_candidate["mbid"]}])
 
         malformed = LastFmFake(info={**candidate, "tracks": {"track": ["bad"]}})
-        result = cast(dict, mod.enrich(post, SpotifyFake(), malformed, {7: "Artist"}))
+        result = cast(dict, enrichment_mod.enrich(post, SpotifyFake(), malformed, {7: "Artist"}))
         self.assertEqual(result["diagnostics"][0]["code"], "lastfm_provider_error")
 
         for track_name in (1, ["Song"], {"value": "Song"}):
@@ -1447,7 +1449,7 @@ class SearchAndMatchingTests(unittest.TestCase):
                 )
                 result = cast(
                     dict,
-                    mod.enrich(post, SpotifyFake(), malformed, {7: "Artist"}),
+                    enrichment_mod.enrich(post, SpotifyFake(), malformed, {7: "Artist"}),
                 )
                 diagnostic = result["diagnostics"][0]
                 self.assertEqual(diagnostic["code"], "lastfm_provider_error")
@@ -1460,13 +1462,13 @@ class SearchAndMatchingTests(unittest.TestCase):
                 })
 
     def test_cli_parser_and_fuzzy_missing_artist(self):
-        args = mod.build_parser().parse_args(["fuzzy", "Album"])
+        args = cli_mod.build_parser().parse_args(["fuzzy", "Album"])
         self.assertEqual(args.artists, [])
         class FakeSpotify:
             def __init__(self, *a): pass
             def search_albums(self, *a, **k): return []
-        with patch.object(mod, "Spotify", FakeSpotify), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(mod.cmd_fuzzy(args, {"SPOTIFY_CLIENT_ID": "", "SPOTIFY_CLIENT_SECRET": ""}), 0)
+        with patch.object(cli_mod, "Spotify", FakeSpotify), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cli_mod.cmd_fuzzy(args, {"SPOTIFY_CLIENT_ID": "", "SPOTIFY_CLIENT_SECRET": ""}), 0)
         self.assertIn("spotify_missing_artist", output.getvalue())
 
 

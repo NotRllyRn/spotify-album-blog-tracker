@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import tempfile
@@ -7,7 +8,12 @@ from pathlib import Path
 from unittest.mock import patch
 from typing import cast
 
-import post_to_album as mod
+
+common_mod = importlib.import_module("album_metadata.common")
+schema_mod = importlib.import_module("album_metadata.schema")
+enrichment_mod = importlib.import_module("album_metadata.enrichment")
+plans_mod = importlib.import_module("album_metadata.plans")
+cli_mod = importlib.import_module("metadata_cli.cli")
 
 
 class FakeSpotify:
@@ -77,7 +83,7 @@ class EndToEndWorkflowTests(unittest.TestCase):
             "acf": {"spotify_album_id": "keep-existing", "music_notes": "keep"},
         }
         spotify, lastfm = FakeSpotify(), FakeLastFM()
-        result = mod.enrich(post, spotify, lastfm, {9: "Beyoncé"})
+        result = enrichment_mod.enrich(post, spotify, lastfm, {9: "Beyoncé"})
         self.assertIsNotNone(result)
         result = cast(dict, result)
 
@@ -96,17 +102,17 @@ class EndToEndWorkflowTests(unittest.TestCase):
         self.assertEqual(result["write"]["categories"], [93, 200, 777, 6])
 
         plan = {"schema_version": 2, "generated_at": "2026-07-23T00:00:00Z",
-                "write_policy": mod.WRITE_FILL_ONLY, "patches": [result]}
+                "write_policy": schema_mod.WRITE_FILL_ONLY, "patches": [result]}
         with tempfile.TemporaryDirectory() as directory:
             plan_path = Path(directory) / "planned.json"
-            mod.write_json_atomic(plan_path, mod.validate_plan(plan))
+            common_mod.write_json_atomic(plan_path, plans_mod.validate_plan(plan))
             wp = FakeWordPress()
             env = {"WORDPRESS_BASE_URL": "https://invalid.example",
                    "WORDPRESS_USERNAME": "user", "WORDPRESS_APP_PASSWORD": "password"}
             args = Namespace(plan=str(plan_path), offset=0, limit=None, out_dir=directory)
-            with patch.object(mod, "WordPress", return_value=wp), \
+            with patch.object(cli_mod, "WordPress", return_value=wp), \
                  patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")):
-                self.assertEqual(mod.cmd_apply_plan(args, env), 0)
+                self.assertEqual(cli_mod.cmd_apply_plan(args, env), 0)
 
             expected_acf = dict(result["write"]["acf"])
             expected_acf.update({
@@ -138,17 +144,17 @@ class EndToEndWorkflowTests(unittest.TestCase):
                      "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "LASTFM_API_KEY"]
         for argv, required, command in cases:
             with self.subTest(argv=argv), patch.dict(os.environ, {}, clear=True), \
-                 patch.object(mod, "load_env", return_value={name: "" for name in all_names}), \
-                 patch.object(mod, command) as handler:
+                 patch.object(cli_mod, "load_env", return_value={name: "" for name in all_names}), \
+                 patch.object(cli_mod, command) as handler:
                 with self.assertRaisesRegex(SystemExit, ", ".join(required)):
-                    mod.main(argv)
+                    cli_mod.main(argv)
                 handler.assert_not_called()
 
             supplied = {name: "value" for name in required}
             with self.subTest(argv=argv, supplied=True), \
-                 patch.object(mod, "load_env", return_value=supplied), \
-                 patch.object(mod, command, return_value=0) as handler:
-                self.assertEqual(mod.main(argv), 0)
+                 patch.object(cli_mod, "load_env", return_value=supplied), \
+                 patch.object(cli_mod, command, return_value=0) as handler:
+                self.assertEqual(cli_mod.main(argv), 0)
                 handler.assert_called_once()
 
 

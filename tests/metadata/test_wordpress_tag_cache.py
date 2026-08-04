@@ -1,3 +1,4 @@
+import importlib
 import json
 import tempfile
 import time
@@ -6,12 +7,14 @@ import urllib.error
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import post_to_album as mod
 
 
+
+schema_mod = importlib.import_module("album_metadata.schema")
+wordpress_mod = importlib.import_module("metadata_cli.wordpress")
 class WordPressTagCacheTests(unittest.TestCase):
     def setUp(self):
-        self.wp = mod.WordPress("https://example.test", "user", "password")
+        self.wp = wordpress_mod.WordPress("https://example.test", "user", "password")
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.cache = Path(self.temp.name) / "tag-cache.json"
@@ -80,7 +83,7 @@ class WordPressTagCacheTests(unittest.TestCase):
                 self.assertEqual(len(calls), 4)
 
     def test_older_than_24_hours_refreshes_names(self):
-        self.write_cache(age=mod.TAG_CACHE_MAX_AGE + 1, tags={1: "Old"})
+        self.write_cache(age=schema_mod.TAG_CACHE_MAX_AGE + 1, tags={1: "Old"})
         tags = {1: "Renamed"}
         calls = []
         self.wp._req_get = lambda url: calls.append(url) or self.collection_response(tags, url)
@@ -127,7 +130,7 @@ class WordPressTagCacheTests(unittest.TestCase):
 
     def test_unstable_scan_falls_back_without_overwriting_valid_cache(self):
         cached = {1: "Cached"}
-        self.write_cache(age=mod.TAG_CACHE_MAX_AGE + 1, tags=cached)
+        self.write_cache(age=schema_mod.TAG_CACHE_MAX_AGE + 1, tags=cached)
         original = self.cache.read_text()
         highest_id = 2
 
@@ -156,7 +159,7 @@ class WordPressTagCacheTests(unittest.TestCase):
                 self.assertEqual(len(calls), 3)
 
     def test_valid_cache_is_safe_fallback_but_invalid_cache_is_not(self):
-        self.write_cache(age=mod.TAG_CACHE_MAX_AGE + 1, tags={1: "Cached"})
+        self.write_cache(age=schema_mod.TAG_CACHE_MAX_AGE + 1, tags={1: "Cached"})
         self.wp._req_get = lambda url: (_ for _ in ()).throw(urllib.error.URLError("down"))
         with self.assertLogs("post_to_album", level="WARNING") as logs:
             self.assertEqual(self.wp.list_tags({}, self.cache), {1: "Cached"})

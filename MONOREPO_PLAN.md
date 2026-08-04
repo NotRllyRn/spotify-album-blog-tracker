@@ -95,10 +95,10 @@ Extract in small, test-backed commits:
 - [x] Spotify client, search, scoring, ambiguity recovery, and evidence validation.
 - [x] Last.fm client, search, validation, recovery, and genre discovery.
 - [x] Shared enrichment and managed-write policy.
-- [ ] Plan/artifact validation and WordPress body materialization.
-- [ ] Synchronous WordPress batch adapter and CLI commands.
-- [ ] Replace the root script with a minimal entry point.
-- [ ] Move characterization tests under the monorepo test layout.
+- [x] Plan/artifact validation and WordPress body materialization.
+- [x] Synchronous WordPress batch adapter and CLI commands.
+- [x] Replace the root script with a minimal entry point.
+- [x] Move characterization tests under the monorepo test layout.
 
 **Gate:** All 119 imported tests pass unchanged in intent; CLI help and credential matrix remain compatible; generated fixture artifacts are equivalent.
 

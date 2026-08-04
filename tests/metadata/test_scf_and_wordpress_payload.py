@@ -5,8 +5,10 @@ import unittest
 from typing import cast
 from unittest.mock import patch
 
-import post_to_album as mod
 
+schema_mod = importlib.import_module("album_metadata.schema")
+lastfm_mod = importlib.import_module("album_metadata.lastfm")
+cli_mod = importlib.import_module("metadata_cli.cli")
 enrichment_mod = importlib.import_module("album_metadata.enrichment")
 
 
@@ -76,14 +78,14 @@ def make_post(**changes):
     return post
 
 
-def enrich(post, wp=None, write_policy=mod.WRITE_FILL_ONLY):
-    return cast(dict, mod.enrich(
+def enrich(post, wp=None, write_policy=schema_mod.WRITE_FILL_ONLY):
+    return cast(dict, enrichment_mod.enrich(
         post, SpotifyFake(), LastFmFake(), {7: "The Artist"}, write_policy))["write"]
 
 
 class PayloadTests(unittest.TestCase):
     def test_cli_overwrite_option_scope_and_help(self):
-        parser = mod.build_parser()
+        parser = cli_mod.build_parser()
         self.assertFalse(parser.parse_args(["run"]).overwrite_managed)
         self.assertTrue(parser.parse_args(["run", "--overwrite-managed"]).overwrite_managed)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -96,8 +98,8 @@ class PayloadTests(unittest.TestCase):
             self.assertIn(phrase, text)
 
     def test_approved_auto_fields_exactly(self):
-        self.assertNotIn("spotify_ambiguity_recovered", mod.DIAGNOSTIC_CODES)
-        self.assertEqual(mod.AUTO_FILLABLE_FIELDS, (
+        self.assertNotIn("spotify_ambiguity_recovered", schema_mod.DIAGNOSTIC_CODES)
+        self.assertEqual(schema_mod.AUTO_FILLABLE_FIELDS, (
             "spotify_title", "music_tracks", "music_length_ms",
             "spotify_album_id", "spotify_album_url", "music_release_date",
             "music_listened_at", "lastfm_url", "mbid", "music_total_tracks",
@@ -130,7 +132,7 @@ class PayloadTests(unittest.TestCase):
     def test_rebuilt_tracks_preserve_highlight_by_spotify_id(self):
         post = make_post(acf={"music_tracks": [
             {"spotify_id": "one", "highlight": True}]})
-        original = mod.is_field_present
+        original = enrichment_mod.is_field_present
 
         def destination_presence(field, value):
             # Simulate a schema adapter reporting this repeater as replaceable.
@@ -171,19 +173,19 @@ class PayloadTests(unittest.TestCase):
 
     def test_completion_requires_artist_and_release_type_not_genre(self):
         acf = {name: (False if name == "music_explicit" else 1)
-               for name in mod.AUTO_FILLABLE_FIELDS}
-        self.assertTrue(mod.post_is_complete(
+               for name in schema_mod.AUTO_FILLABLE_FIELDS}
+        self.assertTrue(enrichment_mod.post_is_complete(
             make_post(acf=acf, artist=[1], genre=[], release_type=[2])))
-        self.assertFalse(mod.post_is_complete(make_post(acf=acf, release_type=[2])))
-        self.assertFalse(mod.post_is_complete(make_post(acf=acf, artist=[1])))
+        self.assertFalse(enrichment_mod.post_is_complete(make_post(acf=acf, release_type=[2])))
+        self.assertFalse(enrichment_mod.post_is_complete(make_post(acf=acf, artist=[1])))
 
     def test_genre_filter_is_case_insensitive_deduped_ordered_and_capped(self):
         info = {"toptags": {"tag": ["Seen Live", "Artist", "Rock", "rock",
                                      "Pop", "Ambient", "Jazz"]}}
-        self.assertEqual(mod.pick_top_tags(info, 3, mod.LFM_BLOCKLIST, ["artist"]),
+        self.assertEqual(lastfm_mod.pick_top_tags(info, 3, schema_mod.LFM_BLOCKLIST, ["artist"]),
                          ["Rock", "Pop", "Ambient"])
-        self.assertEqual(mod.pick_top_tags({"toptags": {"tag": ["AOTY", "Artist"]}},
-                                           3, mod.LFM_BLOCKLIST, ["artist"]), [])
+        self.assertEqual(lastfm_mod.pick_top_tags({"toptags": {"tag": ["AOTY", "Artist"]}},
+                                           3, schema_mod.LFM_BLOCKLIST, ["artist"]), [])
 
     def test_embedded_album_tags_prevent_fallback_requests(self):
         class EmbeddedTags(LastFmFake):
@@ -193,7 +195,7 @@ class PayloadTests(unittest.TestCase):
             def artist_gettoptags(self, *args, **kwargs):
                 raise AssertionError("artist.getTopTags should not be called")
 
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(), SpotifyFake(), EmbeddedTags(), {7: "The Artist"}))
         self.assertEqual(result["write"]["taxonomies"]["genre"],
                          ["Rock", "Pop", "Ambient"])
@@ -213,7 +215,7 @@ class PayloadTests(unittest.TestCase):
                 raise AssertionError("artist.getTopTags should not be called")
 
         lfm = AlbumFallback()
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(), SpotifyFake(), lfm, {7: "The Artist"}))
         self.assertEqual(lfm.album_args, {
             "artist": "The Artist", "album": SpotifyFake.album_data["name"],
@@ -239,7 +241,7 @@ class PayloadTests(unittest.TestCase):
                 return {"toptags": {"tag": ["Seen Live", "Pop", "pop"]}}
 
         lfm = ArtistFallback()
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(), SpotifyFake(), lfm, {7: "The Artist"}))
         self.assertEqual(lfm.fallback_calls, [
             ("album", {"artist": "The Artist", "album": SpotifyFake.album_data["name"],
@@ -264,7 +266,7 @@ class PayloadTests(unittest.TestCase):
                 return {"toptags": {"tag": tags}}
 
         lfm = CanonicalArtistFallback()
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(), SpotifyFake(), lfm, {7: "The Artist"}))
         self.assertEqual(lfm.autocorrect, [0, 1])
         self.assertEqual(result["write"]["taxonomies"]["genre"], ["Hip-Hop", "rap"])
@@ -288,7 +290,7 @@ class PayloadTests(unittest.TestCase):
                 return {"toptags": {"tag": tags}}
 
         lfm = DisambiguatedArtist()
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(), SpotifyFake(), lfm, {7: "The Artist"}))
         self.assertEqual(lfm.calls, [
             ("The Artist (2)", 0), ("The Artist (2)", 1), ("The Artist", 0)])
@@ -310,7 +312,7 @@ class PayloadTests(unittest.TestCase):
                 return info
 
         spotify = SpotifyArtistGenres()
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(), spotify, EmptyLastFmTags(), {7: "The Artist"}))
         self.assertEqual(spotify.artist_id, "artist-id")
         self.assertEqual(result["write"]["taxonomies"]["genre"], ["indie pop", "Pop"])
@@ -328,7 +330,7 @@ class PayloadTests(unittest.TestCase):
             def artist_gettoptags(self, *args, **kwargs):
                 return {"toptags": {"tag": ["Pop"]}}
 
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(), SpotifyFake(), FailedAlbumTags(), {7: "The Artist"}))
         self.assertEqual(result["write"]["taxonomies"]["genre"], ["Pop"])
         self.assertNotIn("lastfm_provider_error",
@@ -347,7 +349,7 @@ class PayloadTests(unittest.TestCase):
             def artist_gettoptags(self, *args, **kwargs):
                 raise RuntimeError("optional artist tags failed")
 
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(), SpotifyFake(), FailedArtistTags(), {7: "The Artist"}))
         self.assertEqual(result["write"]["acf"]["spotify_album_id"], "album-id")
         self.assertNotIn("genre", result["write"]["taxonomies"])
@@ -355,9 +357,9 @@ class PayloadTests(unittest.TestCase):
 
     def test_managed_helper_rejects_unmanaged_keys_and_unknown_policy(self):
         with self.assertRaisesRegex(ValueError, "Unmanaged ACF key"):
-            mod._set_managed({}, {}, "music_rating", 5, mod.WRITE_OVERWRITE_MANAGED)
+            enrichment_mod._set_managed({}, {}, "music_rating", 5, schema_mod.WRITE_OVERWRITE_MANAGED)
         with self.assertRaisesRegex(ValueError, "Unknown write policy"):
-            mod._set_managed({}, {}, "spotify_title", "x", "surprise")
+            enrichment_mod._set_managed({}, {}, "spotify_title", "x", "surprise")
 
     def test_overwrite_rebuilds_managed_values_and_protects_editor_data(self):
         old_rows = [
@@ -371,12 +373,12 @@ class PayloadTests(unittest.TestCase):
                  "mbid": "old-mbid", "music_rating": 5,
                  "music_favorite": True, "music_notes": "keep"},
             artist=[90], genre=[91], release_type=[92], categories=[42, 5])
-        body = enrich(post, write_policy=mod.WRITE_OVERWRITE_MANAGED)
+        body = enrich(post, write_policy=schema_mod.WRITE_OVERWRITE_MANAGED)
         acf = body["acf"]
         self.assertEqual(acf["spotify_title"], SpotifyFake.album_data["name"])
         self.assertEqual([row["spotify_id"] for row in acf["music_tracks"]], ["one", "two"])
         self.assertEqual([row["highlight"] for row in acf["music_tracks"]], [True, False])
-        for key in mod.EDITOR_OWNED_ACF_FIELDS:
+        for key in schema_mod.EDITOR_OWNED_ACF_FIELDS:
             self.assertNotIn(key, acf)
         self.assertNotIn("lastfm_url", acf)
         self.assertNotIn("mbid", acf)
@@ -398,13 +400,13 @@ class PayloadTests(unittest.TestCase):
                 return {**super().album_getinfo(**kwargs),
                         "mbid": mbid, "url": lastfm_url}
 
-        existing: dict[str, object] = {name: 1 for name in mod.AUTO_FILLABLE_FIELDS}
+        existing: dict[str, object] = {name: 1 for name in schema_mod.AUTO_FILLABLE_FIELDS}
         existing["music_tracks"] = [{"spotify_id": "one", "highlight": True}]
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(acf=existing), SpotifyFake(), CompleteLastFm(),
-            {7: "The Artist"}, mod.WRITE_OVERWRITE_MANAGED))["write"]["acf"]
+            {7: "The Artist"}, schema_mod.WRITE_OVERWRITE_MANAGED))["write"]["acf"]
 
-        self.assertEqual(set(result), set(mod.AUTO_FILLABLE_FIELDS))
+        self.assertEqual(set(result), set(schema_mod.AUTO_FILLABLE_FIELDS))
         self.assertEqual(result["spotify_title"], SpotifyFake.album_data["name"])
         self.assertEqual(result["spotify_album_id"], "album-id")
         self.assertEqual(result["spotify_album_url"],
@@ -427,18 +429,18 @@ class PayloadTests(unittest.TestCase):
                 data = super().album_getinfo(**kwargs)
                 data["toptags"] = {"tag": ["AOTY", "The Artist"]}
                 return data
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(genre=[98]), SpotifyFake(), EmptyGenres(), {7: "The Artist"},
-            mod.WRITE_OVERWRITE_MANAGED))["write"]
+            schema_mod.WRITE_OVERWRITE_MANAGED))["write"]
         self.assertNotIn("genre", result["taxonomies"])
 
     def test_empty_spotify_tracks_are_unresolved_in_overwrite_mode(self):
         class EmptySpotify(SpotifyFake):
             tracks = []
 
-        result = cast(dict, mod.enrich(
+        result = cast(dict, enrichment_mod.enrich(
             make_post(), EmptySpotify(), LastFmFake(), {7: "The Artist"},
-            mod.WRITE_OVERWRITE_MANAGED))
+            schema_mod.WRITE_OVERWRITE_MANAGED))
         self.assertNotIn("write", result)
         self.assertEqual(result["diagnostics"], [{
             "code": "spotify_provider_error",
@@ -467,7 +469,7 @@ class PayloadTests(unittest.TestCase):
                     MalformedSpotify.tracks[0][field] = value
                 lfm = LastFmFake()
                 with patch.object(lfm, "album_search", wraps=lfm.album_search) as search:
-                    result = cast(dict, mod.enrich(
+                    result = cast(dict, enrichment_mod.enrich(
                         make_post(), MalformedSpotify(), lfm, {7: "The Artist"}))
                 search.assert_not_called()
                 self.assertNotIn("write", result)
@@ -479,16 +481,16 @@ class PayloadTests(unittest.TestCase):
                 self.assertFalse(diagnostic["details"]["retryable"])
 
     def test_complete_post_skips_only_in_fill_only_mode(self):
-        acf: dict[str, object] = {name: 1 for name in mod.AUTO_FILLABLE_FIELDS}
+        acf: dict[str, object] = {name: 1 for name in schema_mod.AUTO_FILLABLE_FIELDS}
         acf["music_explicit"] = False
         acf["music_tracks"] = [{"spotify_id": "one", "highlight": True}]
         post = make_post(acf=acf, artist=[1], release_type=[2])
         spt = SpotifyFake()
         with patch.object(spt, "search_albums", wraps=spt.search_albums) as search:
-            self.assertIsNone(mod.enrich(post, spt, LastFmFake(), {7: "The Artist"}))
+            self.assertIsNone(enrichment_mod.enrich(post, spt, LastFmFake(), {7: "The Artist"}))
             search.assert_not_called()
-            result = mod.enrich(post, spt, LastFmFake(), {7: "The Artist"},
-                                mod.WRITE_OVERWRITE_MANAGED)
+            result = enrichment_mod.enrich(post, spt, LastFmFake(), {7: "The Artist"},
+                                schema_mod.WRITE_OVERWRITE_MANAGED)
             self.assertIn("write", cast(dict, result))
             self.assertTrue(search.called)
 
@@ -499,7 +501,7 @@ class PayloadTests(unittest.TestCase):
                 data["toptags"] = {"tag": ["AOTY", "The Artist"]}
                 return data
         wp = WordPressFake()
-        body = cast(dict, mod.enrich(make_post(), SpotifyFake(), EmptyGenres(), {7: "The Artist"}))["write"]
+        body = cast(dict, enrichment_mod.enrich(make_post(), SpotifyFake(), EmptyGenres(), {7: "The Artist"}))["write"]
         self.assertNotIn("genre", body["taxonomies"])
         self.assertNotIn(("genre", "Unknown"), wp.resolved)
 
