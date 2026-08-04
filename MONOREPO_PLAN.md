@@ -94,7 +94,7 @@ Extract in small, test-backed commits:
 - [x] Provider error/retry/circuit infrastructure.
 - [x] Spotify client, search, scoring, ambiguity recovery, and evidence validation.
 - [x] Last.fm client, search, validation, recovery, and genre discovery.
-- [ ] Shared enrichment and managed-write policy.
+- [x] Shared enrichment and managed-write policy.
 - [ ] Plan/artifact validation and WordPress body materialization.
 - [ ] Synchronous WordPress batch adapter and CLI commands.
 - [ ] Replace the root script with a minimal entry point.

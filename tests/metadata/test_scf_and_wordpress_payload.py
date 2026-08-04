@@ -1,10 +1,13 @@
 import contextlib
+import importlib
 import io
 import unittest
 from typing import cast
 from unittest.mock import patch
 
 import post_to_album as mod
+
+enrichment_mod = importlib.import_module("album_metadata.enrichment")
 
 
 class SpotifyFake:
@@ -133,7 +136,7 @@ class PayloadTests(unittest.TestCase):
             # Simulate a schema adapter reporting this repeater as replaceable.
             return False if field == "music_tracks" else original(field, value)
 
-        with patch.object(mod, "is_field_present", side_effect=destination_presence):
+        with patch.object(enrichment_mod, "is_field_present", side_effect=destination_presence):
             rows = enrich(post)["acf"]["music_tracks"]
         self.assertTrue(rows[0]["highlight"])
         self.assertFalse(rows[1]["highlight"])

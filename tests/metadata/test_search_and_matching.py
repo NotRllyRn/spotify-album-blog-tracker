@@ -11,6 +11,7 @@ from typing import Any, cast
 import post_to_album as mod
 spotify_mod = importlib.import_module("album_metadata.spotify")
 lastfm_mod = importlib.import_module("album_metadata.lastfm")
+enrichment_mod = importlib.import_module("album_metadata.enrichment")
 
 
 SPOTIFY = {"name": "Blue - Remastered", "artists": [{"name": "Beyoncé"}]}
@@ -447,8 +448,8 @@ class SearchAndMatchingTests(unittest.TestCase):
         post = {"id": 1, "title": {"rendered": "Album"}, "date": "2020-01-01",
                 "tags": [7], "acf": {}}
         low = {"id": "A" * 22, "name": "Wrong", "artists": [{"name": "Other"}]}
-        with patch.object(mod, "search_ladder", return_value=[low]), \
-                patch.object(mod, "recover_spotify_ambiguity") as recover:
+        with patch.object(enrichment_mod, "search_ladder", return_value=[low]), \
+                patch.object(enrichment_mod, "recover_spotify_ambiguity") as recover:
             result = cast(dict, mod.enrich(post, object(), object(), {7: "Artist"}))
         self.assertEqual(result["diagnostics"][0]["code"], "spotify_catalog_unavailable")
         self.assertTrue(result["ignored"])
@@ -457,8 +458,8 @@ class SearchAndMatchingTests(unittest.TestCase):
         tied = [{"id": value * 22, "name": "Album", "artists": [{"name": "Artist"}]}
                 for value in ("A", "B")]
         unresolved = {"candidate": None, "reason": "spotify_ambiguous"}
-        with patch.object(mod, "search_ladder", return_value=tied), \
-                patch.object(mod, "recover_spotify_ambiguity", return_value=unresolved) as recover:
+        with patch.object(enrichment_mod, "search_ladder", return_value=tied), \
+                patch.object(enrichment_mod, "recover_spotify_ambiguity", return_value=unresolved) as recover:
             result = cast(dict, mod.enrich(post, object(), object(), {7: "Artist"}))
         self.assertEqual(result["diagnostics"][0]["code"], "spotify_ambiguous")
         recover.assert_called_once()
@@ -1230,15 +1231,15 @@ class SearchAndMatchingTests(unittest.TestCase):
         zero = [candidate("one", "single"), candidate("two", "single")]
         unresolved = {"candidate": None, "reason": "spotify_ambiguous"}
         for rows in (multiple, zero):
-            with self.subTest(rows=rows), patch.object(mod, "search_ladder", return_value=rows), \
-                    patch.object(mod, "recover_spotify_ambiguity", return_value=unresolved):
+            with self.subTest(rows=rows), patch.object(enrichment_mod, "search_ladder", return_value=rows), \
+                    patch.object(enrichment_mod, "recover_spotify_ambiguity", return_value=unresolved):
                 result = cast(dict, mod.enrich(post, object(), object(), {7: "Artist"},
                                                release_type_terms={}))
                 self.assertEqual(result["diagnostics"][0]["code"], "spotify_ambiguous")
                 self.assertIn("full-release evidence", result["diagnostics"][0]["message"])
 
-        with patch.object(mod, "search_ladder", return_value=multiple), \
-                patch.object(mod, "recover_spotify_ambiguity", return_value=unresolved):
+        with patch.object(enrichment_mod, "search_ladder", return_value=multiple), \
+                patch.object(enrichment_mod, "recover_spotify_ambiguity", return_value=unresolved):
             result = cast(dict, mod.enrich(
                 {**post, "categories": []}, object(), object(), {7: "Artist"},
                 release_type_terms={}))
@@ -1314,8 +1315,8 @@ class SearchAndMatchingTests(unittest.TestCase):
         self.assertEqual(len(fake.calls), 2)  # One GET per contender; no winner refetch.
         self.assertEqual(result["matches"]["lastfm"]["track_overlap"], 1.0)
 
-        with patch.object(mod, "recover_lastfm_candidate") as recover:
-            with patch.object(mod, "choose_lastfm_candidate", return_value={
+        with patch.object(enrichment_mod, "recover_lastfm_candidate") as recover:
+            with patch.object(enrichment_mod, "choose_lastfm_candidate", return_value={
                     "candidate": None, "reason": "lastfm_low_confidence"}):
                 low = cast(dict, mod.enrich(post, SpotifyFake(), LastFmFake(), {7: "Artist"}))
             self.assertEqual(low["diagnostics"][0]["code"], "lastfm_catalog_unavailable")
