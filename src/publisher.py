@@ -16,7 +16,7 @@ from database import Database
 from album_metadata.plans import materialize_body
 from wordpress_client import WordPressClient
 from models import PublishResult, Release
-from tracker_metadata import TrackerMetadata
+from tracker_metadata_adapter import TrackerMetadataAdapter  # pyright: ignore[reportMissingImports]
 from search import LAST_SYNCED_AT_KEY as POST_CACHE_LAST_SYNCED_AT_KEY
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class Publisher:
 
     # Defaults keep test paths that bypass __init__ metadata-disabled.
     _fill_scf_enabled: bool = False
-    metadata: Optional[TrackerMetadata] = None
+    metadata: Optional[TrackerMetadataAdapter] = None
 
     def __init__(self, config: Config, db: Database):
         self.config = config
@@ -60,7 +60,7 @@ class Publisher:
         self.category_cache: Dict[str, int] = {}
         self.tag_cache: Dict[str, int] = {}
         self._fill_scf_enabled = bool(getattr(config, "fill_scf_enabled", False))
-        self.metadata = TrackerMetadata(config) if self._fill_scf_enabled else None
+        self.metadata = TrackerMetadataAdapter(config) if self._fill_scf_enabled else None
 
     async def close(self):
         """Close WordPress client."""
@@ -97,7 +97,7 @@ class Publisher:
                 "featured_media": media_id if media_id else 0,
             }
             if release.rating is not None or release.favorite or release.notes:
-                post_data["acf"] = TrackerMetadata.editor_acf(release)
+                post_data["acf"] = TrackerMetadataAdapter.editor_acf(release)
 
             # The active metadata contract records one listen per post.
             listen_count = 1

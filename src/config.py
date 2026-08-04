@@ -2,6 +2,7 @@
 Configuration management.
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -64,25 +65,25 @@ class Config:
         """Load Spotify tokens from persistent file."""
         if self.token_file.exists():
             try:
-                import json
                 with open(self.token_file, 'r') as f:
                     tokens = json.load(f)
                 if not self.spotify_access_token:
                     self.spotify_access_token = tokens.get('access_token')
                 if not self.spotify_refresh_token:
                     self.spotify_refresh_token = tokens.get('refresh_token')
-            except Exception as e:
-                logger.warning("Could not load persisted tokens: %s", e)
+            except (OSError, json.JSONDecodeError, TypeError):
+                logger.warning("Could not load persisted Spotify token file")
 
     def save_tokens(self, access_token: str, refresh_token: str):
         """Save Spotify tokens to persistent file."""
-        import json
         tokens = {
             'access_token': access_token,
             'refresh_token': refresh_token
         }
         try:
-            with open(self.token_file, 'w') as f:
+            fd = os.open(self.token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.chmod(self.token_file, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(tokens, f)
         except OSError as exc:
             raise RuntimeError("Could not save Spotify tokens") from exc

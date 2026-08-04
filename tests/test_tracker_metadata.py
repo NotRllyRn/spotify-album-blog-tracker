@@ -14,7 +14,8 @@ from models import Artist, LifecycleStatus, Release, ReleaseType, Track, WordPre
 from publisher import Publisher
 from wordpress_client import WordPressClient
 
-TrackerMetadata = importlib.import_module("tracker_metadata").TrackerMetadata
+TrackerMetadataAdapter = importlib.import_module(
+    "tracker_metadata_adapter").TrackerMetadataAdapter
 
 
 class SpotifyFake:
@@ -119,7 +120,7 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         config = SimpleNamespace(
             spotify_client_id="id", spotify_client_secret="secret", lastfm_api_key="key")
-        self.adapter = TrackerMetadata(config, SpotifyFake(), LastFmFake())
+        self.adapter = TrackerMetadataAdapter(config, SpotifyFake(), LastFmFake())
         self.release = make_release()
         self.post = {
             "id": 42,
@@ -173,7 +174,7 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         publisher.category_cache = {"Single": 5}
         publisher.metadata = SimpleNamespace(
             build_patch=AsyncMock(return_value=patch),
-            editor_acf=TrackerMetadata.editor_acf,
+            editor_acf=TrackerMetadataAdapter.editor_acf,
         )
         publisher._fill_scf_enabled = True
         publisher._ensure_categories = AsyncMock()

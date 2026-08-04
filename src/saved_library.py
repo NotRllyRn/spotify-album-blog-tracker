@@ -50,7 +50,7 @@ class SavedLibraryService:
         last_full_audit = None if force else await self.db.get_service_state(SAVED_LIBRARY_LAST_FULL_AUDIT_AT_KEY)
 
         first_page = await self.spotify.get_saved_albums_page(limit=SAVED_LIBRARY_PAGE_LIMIT, offset=0)
-        current_total_value = int(first_page.get("total", 0) or 0)
+        current_total_value = self._parse_state_int(first_page.get("total")) or 0
         current_total = str(current_total_value)
         first_page_hash = self.compute_first_page_hash(first_page)
         snapshot_items = await self.db.get_saved_library_snapshot_items()
@@ -151,7 +151,7 @@ class SavedLibraryService:
         logger.info(message)
         return SavedLibrarySyncResult(
             skipped=False,
-            total_seen=int(current_total),
+            total_seen=self._parse_state_int(current_total) or 0,
             stored_total=len(incoming_albums),
             added_or_updated=len(incoming_albums),
             removed=removed_count,
@@ -507,10 +507,11 @@ class SavedLibraryService:
         except (TypeError, ValueError):
             return True
 
-    def _parse_state_int(self, value: Optional[str]) -> Optional[int]:
+    @staticmethod
+    def _parse_state_int(value: Any) -> Optional[int]:
         try:
             return int(value) if value is not None else None
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
     def compute_first_page_hash(self, page: Dict[str, Any]) -> str:
@@ -604,12 +605,13 @@ class SavedLibraryService:
 
     def _parse_total_tracks(self, album: Dict[str, Any]) -> Optional[int]:
         total_tracks = album.get("total_tracks")
-        if isinstance(total_tracks, int):
+        if type(total_tracks) is int:
             return total_tracks
-
+        if not isinstance(total_tracks, str):
+            return None
         try:
             return int(total_tracks)
-        except (TypeError, ValueError):
+        except ValueError:
             return None
 
     def _get_complete_embedded_tracks(

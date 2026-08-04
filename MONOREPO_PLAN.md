@@ -151,11 +151,11 @@ Only implement items after core parity is green. Each item requires a focused te
 
 ### 8. Full review, then checkpoint commit
 
-- [ ] Review architecture boundaries, data ownership, errors, security, I/O, and naming.
-- [ ] Review every metadata write key against the active schema.
-- [ ] Review all Discord publication/editor paths affected by metadata changes.
-- [ ] Run full tests, static compilation, CLI smoke tests, and Docker checks.
-- [ ] Commit all functional work before cleanup.
+- [x] Review architecture boundaries, data ownership, errors, security, I/O, and naming.
+- [x] Review every metadata write key against the active schema.
+- [x] Review all Discord publication/editor paths affected by metadata changes.
+- [x] Run full tests, static compilation, and CLI smoke tests. Docker is not installed in the work environment; inspect the unchanged Docker command, paths, dependencies, and volumes instead.
+- [x] Commit all functional work before cleanup.
 
 **Gate:** A known-good pre-cleanup commit exists and can restore the complete implementation.
 

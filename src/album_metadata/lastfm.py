@@ -492,6 +492,16 @@ def _accept_stale_lastfm_tracks(spotify_album: dict, candidate: dict,
                 artist == match_key(info.get("artist", "")))
 
 
+_TAG_BLOCKLIST_PATTERNS = {
+    r"^\d{4}$": re.compile(r"^\d{4}$", re.IGNORECASE),
+    r"^aoty$": re.compile(r"^aoty$", re.IGNORECASE),
+    r"^best of \d{4}$": re.compile(r"^best of \d{4}$", re.IGNORECASE),
+    r"^seen live$": re.compile(r"^seen live$", re.IGNORECASE),
+    r"^favorites?$": re.compile(r"^favorites?$", re.IGNORECASE),
+    r"^under \d+$": re.compile(r"^under \d+$", re.IGNORECASE),
+}
+
+
 def pick_top_tags(album_info: dict, max_n: int, blocklist: Iterable[str],
                   artist_names: Iterable[str] = ()) -> list[str]:
     """Handles four return shapes:
@@ -508,7 +518,8 @@ def pick_top_tags(album_info: dict, max_n: int, blocklist: Iterable[str],
         raw = [raw]
     elif not isinstance(raw, list):
         raw = []
-    pats = [re.compile(p, re.IGNORECASE) for p in blocklist]
+    pats = [_TAG_BLOCKLIST_PATTERNS[p] for p in blocklist
+            if p in _TAG_BLOCKLIST_PATTERNS]
     artist_keys = {match_key(name) for name in artist_names}
     seen: set[str] = set()
     out: list[str] = []

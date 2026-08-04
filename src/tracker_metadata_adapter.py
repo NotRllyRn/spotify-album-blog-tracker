@@ -13,7 +13,7 @@ class MetadataEnrichmentError(RuntimeError):
     """The shared engine could not safely produce a WordPress update."""
 
 
-class TrackerMetadata:
+class TrackerMetadataAdapter:
     """Adapt a tracked Spotify release to the provider-agnostic metadata engine."""
 
     def __init__(self, config: Any, spotify: Any = None, lastfm: Any = None):

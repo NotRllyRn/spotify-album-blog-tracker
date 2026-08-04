@@ -6,13 +6,16 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 
 from config import Config
 from database import Database
 from spotify_client import SpotifyClient
 from models import PlaybackState, Release, Track, Artist, ReleaseType, LifecycleStatus, PromptType, PromptState, DiscordPrompt
 from utils import normalize_text, normalize_artist_list, compute_release_type
+
+if TYPE_CHECKING:
+    from publisher import Publisher
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +24,17 @@ PUBLISHED_RELEASE_RETENTION = timedelta(hours=24)
 PUBLISHED_RELEASE_CLEANUP_INTERVAL = timedelta(minutes=5)
 
 class Tracker:
-    def __init__(self, config: Config, db: Database, publisher=None, discord_bot=None):
+    def __init__(
+        self,
+        config: Config,
+        db: Database,
+        publisher: Optional["Publisher"] = None,
+        discord_bot=None,
+    ):
         self.config = config
         self.db = db
         self.spotify = SpotifyClient(config)
-        self.publisher = publisher
+        self._publisher = publisher
         self.discord_bot = discord_bot
         self.running = False
 
@@ -35,6 +44,16 @@ class Tracker:
         self.idle_interval = 15
         self.backoff_interval = 60
         self._last_published_cleanup_at: Optional[datetime] = None
+
+    @property
+    def publisher(self) -> "Publisher":
+        if self._publisher is None:
+            raise RuntimeError("Tracker publisher is not configured")
+        return self._publisher
+
+    @publisher.setter
+    def publisher(self, value: Optional["Publisher"]) -> None:
+        self._publisher = value
 
     def set_discord_bot(self, discord_bot):
         self.discord_bot = discord_bot
@@ -72,7 +91,15 @@ class Tracker:
             await self._handle_non_qualifying(state)
             return
 
-        album_id = state.item["album"]["id"]
+        item = state.item
+        if item is None:
+            await self._handle_idle()
+            return
+        album = item.get("album")
+        album_id = album.get("id") if isinstance(album, dict) else None
+        if not isinstance(album_id, str) or not album_id:
+            await self._handle_non_qualifying(state)
+            return
         seen_at = datetime.now()
         release = await self.db.get_release(album_id)
         if await self._delete_published_release_if_expired(release, seen_at):
@@ -95,7 +122,7 @@ class Tracker:
         release.last_seen = seen_at
 
         # Match and mark track
-        track = self._match_track_to_release(release, state.item)
+        track = self._match_track_to_release(release, item)
 
         if track and not track.listened:
             await self._mark_track_listened(track, "playback")
@@ -427,7 +454,12 @@ class Tracker:
         if not prompt.release_id:
             return "unavailable"
 
-        context = json.loads(prompt.context_json or "{}")
+        try:
+            context = json.loads(prompt.context_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            context = {}
+        if not isinstance(context, dict):
+            context = {}
         duplicate_post_id = prompt.wordpress_post_id or context.get("duplicate_post_id")
         release = await self.db.get_release(prompt.release_id)
         if release is None:

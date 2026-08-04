@@ -7,6 +7,7 @@ wiring lives in ``src/discord_bot.py``; this file is intentionally
 View-only and has no Discord business logic.
 """
 
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import List, Protocol
@@ -14,6 +15,8 @@ from typing import List, Protocol
 import discord
 
 from search import FUZZY_BASE_THRESHOLD, FUZZY_LOOSE_THRESHOLD, RESULT_CAP, SearchMatch
+
+logger = logging.getLogger(__name__)
 
 
 # --- Constants --------------------------------------------------------------
@@ -203,5 +206,5 @@ class SearchPickerView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         try:
             await interaction.delete_original_response()
-        except Exception:
-            pass
+        except discord.HTTPException as error:
+            logger.debug("Could not delete search picker response: %s", error)

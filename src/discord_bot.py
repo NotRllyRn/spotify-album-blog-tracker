@@ -8,8 +8,8 @@ import discord
 from discord import app_commands
 import logging
 from dataclasses import dataclass
-from typing import Optional, List
-from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, List, cast
+from datetime import datetime
 from urllib.parse import urlparse, urlunparse
 
 from config import Config
@@ -61,27 +61,11 @@ def _clip_discord_text(value: str, limit: int) -> str:
     return value[:max(0, limit - 1)] + "…"
 
 
-def _progress_percent(progress: float) -> int:
+def _safe_int(value: Any, default: int = 0) -> int:
     try:
-        return int(progress * 100)
+        return int(value)
     except (TypeError, ValueError, OverflowError):
-        return 0
-
-
-def _unix_timestamp(value: datetime) -> int:
-    try:
-        return int(value.timestamp())
-    except (TypeError, ValueError, OSError, OverflowError):
-        return 0
-
-
-def _json_object(raw: Optional[str]) -> dict:
-    try:
-        value = json.loads(raw or "{}")
-    except (json.JSONDecodeError, TypeError):
-        return {}
-    return value if isinstance(value, dict) else {}
-
+        return default
 
 class PromptView(discord.ui.View):
     def __init__(self, discord_bot: "DiscordBot"):
@@ -231,7 +215,7 @@ class InProgressView(PromptView):
 
     def _build_option(self, release: Release, featured: bool = False) -> discord.SelectOption:
         artist_names = ", ".join([artist.name for artist in release.artists][:2]) or "Unknown"
-        progress_percent = _progress_percent(release.progress)
+        progress_percent = _safe_int(release.progress * 100)
         label_prefix = "Featured: " if featured else ""
         label = _clip_discord_text(f"{label_prefix}{release.title}", 100)
         description = _clip_discord_text(
@@ -347,8 +331,9 @@ class CurrentPlaybackActionView(PromptView):
         super().__init__(discord_bot)
         self.playback_state = playback_state
         for child in self.children:
-            if getattr(child, "custom_id", None) == "current_post_content":
-                setattr(child, "label", post_label)  # pyright: ignore[reportAttributeAccessIssue]
+            if (isinstance(child, discord.ui.Button) and
+                    child.custom_id == "current_post_content"):
+                child.label = post_label
 
     @discord.ui.button(
         label="Post current content",
@@ -481,7 +466,7 @@ class DiscordBot:
         """Start the Discord bot."""
         token = self.config.discord_bot_token
         if not token:
-            raise RuntimeError("Discord bot token is not configured")
+            raise RuntimeError("DISCORD_BOT_TOKEN is not configured")
         await self.bot.start(token)
 
     async def wait_until_ready(self):
@@ -506,9 +491,12 @@ class DiscordBot:
             user = await self._get_user()
             if user is None:
                 raise ValueError("Discord user not found")
-            if embed is None:
-                return await user.send(content=content, view=view) if view else await user.send(content)
-            return await user.send(content=content, embed=embed, view=view) if view else await user.send(content=content, embed=embed)
+            kwargs: Dict[str, Any] = {}
+            if embed is not None:
+                kwargs["embed"] = embed
+            if view is not None:
+                kwargs["view"] = view
+            return await user.send(content=content, **kwargs)
         except Exception as e:
             logger.error(f"Unable to send Discord DM: {e}")
             return None
@@ -549,8 +537,8 @@ class DiscordBot:
 
         try:
             await self.bot.change_presence(status=status, activity=activity)
-        except Exception:
-            pass
+        except Exception as error:
+            logger.debug("Discord presence update failed: %s", error)
 
     async def send_75_percent_prompt(self, release: Release) -> Optional[discord.Message]:
         """Send a 75% completion prompt to the authorized user."""
@@ -559,7 +547,7 @@ class DiscordBot:
             description=f"{release.title} by {', '.join([a.name for a in release.artists])}",
             color=0x1DB954
         )
-        embed.add_field(name="Progress", value=f"{_progress_percent(release.progress)}%", inline=True)
+        embed.add_field(name="Progress", value=f"{_safe_int(release.progress * 100)}%", inline=True)
         embed.add_field(name="Release type", value=release.release_type.value, inline=True)
         embed.set_thumbnail(url=release.cover_url)
 
@@ -616,7 +604,7 @@ class DiscordBot:
         wordpress_link = self._get_public_wordpress_link(post.get("link") or post.get("guid", ""))
         embed.add_field(name="WordPress link", value=wordpress_link or "Unavailable", inline=False)
         embed.add_field(name="Release type", value=release.release_type.value, inline=True)
-        embed.add_field(name="Progress", value=f"{_progress_percent(release.progress)}%", inline=True)
+        embed.add_field(name="Progress", value=f"{_safe_int(release.progress * 100)}%", inline=True)
         embed.set_thumbnail(url=release.cover_url)
 
         if release.is_relisten and release.duplicate_post_id:
@@ -684,10 +672,12 @@ class DiscordBot:
         if action not in ("add_content", "edit_metadata"):
             await interaction.response.defer(ephemeral=True)
 
-        if interaction.message is None:
-            await self._send_prompt_action_response(interaction, "⚠️ This prompt is no longer available.")
+        message = interaction.message
+        if message is None:
+            await self._send_prompt_action_response(
+                interaction, "⚠️ This action is not attached to a prompt message.")
             return
-        prompt = await self.db.get_discord_prompt(str(interaction.message.id))
+        prompt = await self.db.get_discord_prompt(str(message.id))
         if prompt is None:
             await self._send_prompt_action_response(
                 interaction,
@@ -728,14 +718,15 @@ class DiscordBot:
             )
             return
 
+        release_required = cast(Release, release)
         try:
             if prompt.prompt_type == PromptType.PROMPT_75_PERCENT.value:
                 if release is None:
                     raise RuntimeError("Release is required for this action")
                 if action == "publish_now":
-                    await self._handle_75_publish(interaction, release, prompt)
+                    await self._handle_75_publish(interaction, release_required, prompt)
                 elif action == "wait":
-                    await self._handle_75_wait(interaction, release, prompt)
+                    await self._handle_75_wait(interaction, release_required, prompt)
                 else:
                     await self._unknown_prompt_action(interaction)
             elif prompt.prompt_type == PromptType.PROMPT_RELISTEN_APPROVAL.value:
@@ -753,13 +744,9 @@ class DiscordBot:
                         raise RuntimeError("Release is required for this action")
                     await self._handle_retry_metadata(interaction, release, prompt)
                 elif action == "undo_post":
-                    if release is None:
-                        raise RuntimeError("Release is required for this action")
-                    await self._handle_undo_post(interaction, release, prompt)
+                    await self._handle_undo_post(interaction, release_required, prompt)
                 elif action == "keep_post":
-                    if release is None:
-                        raise RuntimeError("Release is required for this action")
-                    await self._handle_keep_post(interaction, release, prompt)
+                    await self._handle_keep_post(interaction, release_required, prompt)
                 else:
                     await self._unknown_prompt_action(interaction)
             else:
@@ -1128,7 +1115,7 @@ class DiscordBot:
         )
         embed.add_field(name="Release", value=release.title, inline=False)
         embed.add_field(name="Artists", value=", ".join([a.name for a in release.artists][:5]) or "Unknown", inline=False)
-        embed.add_field(name="Progress", value=f"{_progress_percent(release.progress)}%", inline=True)
+        embed.add_field(name="Progress", value=f"{_safe_int(release.progress * 100)}%", inline=True)
 
         await interaction.response.send_message(
             embed=embed,
@@ -1476,13 +1463,13 @@ class DiscordBot:
             f"Next: {next_track.title if next_track else 'None'}"
         ]
         if include_last_seen:
-            lines.append(f"Last tracked: <t:{_unix_timestamp(release.last_seen)}:R>")
+            lines.append(f"Last tracked: <t:{_safe_int(release.last_seen.timestamp())}:R>")
         return "\n".join(lines)
 
     def _get_release_progress_parts(self, release: Release) -> tuple[int, int, int]:
         listened = sum(1 for track in release.tracks if track.is_countable and track.listened)
         countable = sum(1 for track in release.tracks if track.is_countable)
-        progress_percent = _progress_percent(release.progress)
+        progress_percent = _safe_int(release.progress * 100)
         return listened, countable, progress_percent
 
     async def _handle_inprogress_page(self, interaction: discord.Interaction, page: int):
@@ -1665,7 +1652,7 @@ class DiscordBot:
             color=0x1DB954
         )
         embed.add_field(name="Release type", value=album.release_type.value, inline=True)
-        embed.add_field(name="Saved", value=f"<t:{_unix_timestamp(album.added_at)}:D>", inline=True)
+        embed.add_field(name="Saved", value=f"<t:{_safe_int(album.added_at.timestamp())}:D>", inline=True)
         embed.add_field(name="Spotify ID", value=album.spotify_id, inline=False)
         if album.spotify_url:
             embed.add_field(name="Spotify link", value=album.spotify_url, inline=False)

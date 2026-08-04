@@ -254,10 +254,9 @@ crashes startup either.)
 
 ## 5. Verification plan
 
-Run a manual `/current` confirm against a real listening session. Check
-the published post's `acf` block via `curl -u user:app
-$WORDPRESS_URL/wp-json/wp/v2/posts/<id>?context=edit`. Every field above
-should have its expected value, except `music_mood_tags` which can be
+Run a manual `/current` confirm against a real listening session. Check the published post's editable `acf` block through an authenticated
+WordPress REST client. Every field above should have its expected value,
+except `music_mood_tags` which can be
 empty if Last.fm had no tags.
 
 For the failure mode: temporarily set `LASTFM_API_KEY` to an invalid

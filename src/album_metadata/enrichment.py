@@ -321,8 +321,8 @@ def enrich_known(
             if alternate_validation["accepted"]:
                 info, validation = alternate, alternate_validation
                 lookup_fallback = original_validation
-        except (OSError, RuntimeError, ValueError):
-            pass
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.debug("Last.fm artist/title fallback failed: %s", exc)
     if not validation["accepted"] and not combined_attempted:
         try:
             combined_attempted = True
@@ -333,8 +333,8 @@ def enrich_known(
                                               combined["validation"])
                 collaboration_lookup = True
                 lookup_route, mbid = "combined artist/title", None
-        except (OSError, RuntimeError, ValueError):
-            pass
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.debug("Last.fm combined-artist fallback failed: %s", exc)
     stale_tracks = False
     if not validation["accepted"] and _accept_stale_lastfm_tracks(
             album, selected, info, validation):
@@ -380,8 +380,8 @@ def enrich_known(
                                                   album=info.get("name"), autocorrect=0))
             genre_names = pick_top_tags(
                 album_tags, max_n=3, blocklist=LFM_BLOCKLIST, artist_names=artist_names)
-        except (OSError, RuntimeError, ValueError):
-            pass
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.debug("Last.fm album-tag fallback failed: %s", exc)
     if not genre_names:
         tag_artists = list(dict.fromkeys(
             name for name in (info.get("artist"), selected.get("artist")) if name))

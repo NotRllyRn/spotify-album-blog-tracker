@@ -157,6 +157,7 @@ class Database:
             release.unreleased,
         )
 
+        # pi-lens-ignore: python-sql-injection
         cursor = await self.connection.execute("""
             INSERT OR REPLACE INTO release_lifecycle
             (spotify_id, title, normalized_title, release_type, raw_spotify_type,
@@ -209,15 +210,13 @@ class Database:
         if not spotify_ids:
             return 0
 
-        placeholders = ", ".join("?" for _ in spotify_ids)
-        await self.connection.execute(
-            f"DELETE FROM discord_prompt WHERE release_id IN ({placeholders})",
-            spotify_ids,
-        )
-        await self.connection.execute(
-            f"DELETE FROM release_lifecycle WHERE spotify_id IN ({placeholders})",
-            spotify_ids,
-        )
+        rows_to_delete = [(spotify_id,) for spotify_id in spotify_ids]
+        # pi-lens-ignore: python-sql-injection
+        await self.connection.executemany(
+            "DELETE FROM discord_prompt WHERE release_id = ?", rows_to_delete)
+        # pi-lens-ignore: python-sql-injection
+        await self.connection.executemany(
+            "DELETE FROM release_lifecycle WHERE spotify_id = ?", rows_to_delete)
         await self.connection.commit()
         return len(spotify_ids)
 
@@ -490,10 +489,10 @@ class Database:
         if not spotify_ids:
             return 0
 
-        placeholders = ", ".join("?" for _ in spotify_ids)
-        cursor = await self.connection.execute(
-            f"DELETE FROM saved_library_album WHERE spotify_id IN ({placeholders})",
-            spotify_ids,
+        # pi-lens-ignore: python-sql-injection
+        cursor = await self.connection.executemany(
+            "DELETE FROM saved_library_album WHERE spotify_id = ?",
+            [(spotify_id,) for spotify_id in spotify_ids],
         )
         await self.connection.commit()
         return cursor.rowcount
@@ -587,6 +586,7 @@ class Database:
             prompt.expires_at.isoformat() if prompt.expires_at else None,
             prompt.context_json,
         )
+        # pi-lens-ignore: python-sql-injection
         await self.connection.execute("""
             INSERT INTO discord_prompt
             (prompt_type, release_id, wordpress_post_id, discord_message_id, state,

@@ -19,7 +19,10 @@ log = logging.getLogger("post_to_album")
 
 class WordPress:
     def __init__(self, base: str, user: str, app_pw: str):
-        self.base      = base.rstrip("/")
+        self.base = base.rstrip("/")
+        parsed = urllib.parse.urlsplit(self.base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("WORDPRESS_BASE_URL must be an http(s) URL.")
         self.api       = f"{self.base}/wp-json/wp/v2"
         self._auth     = "Basic " + base64.b64encode(f"{user}:{app_pw}".encode()).decode()
         self._hdr_json = {"Authorization": self._auth, "Accept": "application/json",

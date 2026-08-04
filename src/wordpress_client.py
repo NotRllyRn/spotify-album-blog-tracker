@@ -8,7 +8,6 @@ import hashlib
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from pathlib import Path
-import base64
 
 from album_metadata.common import match_key
 from album_metadata.schema import TAXONOMIES
@@ -65,15 +64,12 @@ class WordPressClient:
         self.api_url = f"{self.base_url}/wp-json/wp/v2"
         self.username = config.wordpress_username
         self.app_password = config.wordpress_app_password
-
-        # Basic auth header
-        auth_string = f"{self.username}:{self.app_password}"
-        auth_b64 = base64.b64encode(auth_string.encode()).decode()
-        self.auth_header = f"Basic {auth_b64}"
+        if not self.username or not self.app_password:
+            raise ValueError("WordPress credentials are not configured")
 
         self.client = httpx.AsyncClient(
+            auth=httpx.BasicAuth(self.username, self.app_password),
             headers={
-                "Authorization": self.auth_header,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
