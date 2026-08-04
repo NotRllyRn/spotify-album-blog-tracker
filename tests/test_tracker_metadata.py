@@ -155,16 +155,17 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.release.favorite = True
         self.release.notes = "Editorial notes"
         created, updates = {}, []
+        test_case = self
 
         class WordPressFake:
-            async def create_post(_, data):
+            async def create_post(self, data):
                 created.update(data)
-                return {**self.post, **data, "title": {"rendered": data["title"]}}
+                return {**test_case.post, **data, "title": {"rendered": data["title"]}}
 
-            async def resolve_taxonomy_terms(_, wanted):
+            async def resolve_taxonomy_terms(self, wanted):
                 return term_ids()
 
-            async def update_post(_, post_id, body):
+            async def update_post(self, post_id, body):
                 updates.append(body)
                 return {"id": post_id}
 
@@ -196,6 +197,7 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
     async def test_unreleased_publication_preserves_category_marker(self):
         self.release.unreleased = True
         created, updates = {}, []
+        test_case = self
 
         async def build_patch(release, post, tag_ids, category_ids, listen_count):
             self.assertEqual(category_ids, [5, 200])
@@ -203,14 +205,14 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
             return {"write": {"categories": [200, 5], "taxonomies": {}}}
 
         class WordPressFake:
-            async def create_post(_, data):
+            async def create_post(self, data):
                 created.update(data)
-                return {**self.post, **data, "title": {"rendered": data["title"]}}
+                return {**test_case.post, **data, "title": {"rendered": data["title"]}}
 
-            async def resolve_taxonomy_terms(_, wanted):
+            async def resolve_taxonomy_terms(self, wanted):
                 return term_ids()
 
-            async def update_post(_, post_id, body):
+            async def update_post(self, post_id, body):
                 updates.append(body)
                 return {"id": post_id}
 
@@ -231,9 +233,11 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updates, [{"categories": [200, 5]}])
 
     async def test_publisher_surfaces_metadata_failure_without_losing_post(self):
+        test_case = self
+
         class WordPressFake:
-            async def create_post(_, data):
-                return {**self.post, **data, "title": {"rendered": data["title"]}}
+            async def create_post(self, data):
+                return {**test_case.post, **data, "title": {"rendered": data["title"]}}
 
         publisher: Any = Publisher.__new__(Publisher)
         publisher.wordpress = WordPressFake()

@@ -1,5 +1,5 @@
 """
-Discord editor for the SCF fields exposed by plan-interactive-edit.
+Discord editor for the tracker-owned WordPress metadata fields.
 
 Provides a persistent ``EditorView`` plus ``EditorTracksView`` sub-view, with
 strategy-shaped ``EditorSink`` implementations that route edits to either the

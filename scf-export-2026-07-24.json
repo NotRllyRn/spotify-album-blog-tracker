@@ -551,7 +551,7 @@
         "ai_description": ""
     },
     {
-        "key": "taxonomy_6a2e14133fbe2",
+        "key": "taxonomy_artists",
         "title": "Artists",
         "menu_order": 0,
         "active": true,
@@ -627,7 +627,7 @@
         "ai_description": ""
     },
     {
-        "key": "taxonomy_6a2e10e652c78",
+        "key": "taxonomy_genres",
         "title": "Genres",
         "menu_order": 0,
         "active": true,
@@ -703,7 +703,7 @@
         "ai_description": ""
     },
     {
-        "key": "taxonomy_6a2e1436919d6",
+        "key": "taxonomy_release_types",
         "title": "Release Types",
         "menu_order": 0,
         "active": true,

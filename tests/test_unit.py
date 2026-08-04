@@ -104,12 +104,6 @@ else:
     _format_scf_date = None
 
 try:
-    from lastfm_client import LastFMClient, pick_mood_tags
-except ModuleNotFoundError:
-    LastFMClient = None
-    pick_mood_tags = None
-
-try:
     from editor_view import (
         EditorState,
         EditorView,
@@ -2322,488 +2316,6 @@ class TestDuplicateDetection(unittest.TestCase):
         self.assertTrue(match)
 
 
-@unittest.skipIf(pick_mood_tags is None, "lastfm client is not available")
-class TestLastFMMoodTags(unittest.TestCase):
-    """Test mood tag selection rules copied from the complement script."""
-
-    def test_pick_mood_tags_filters_blocklist_and_caps_three(self):
-        album_info = {
-            "mbid": "abc-123",
-            "tags": [
-                {"name": "rock"},
-                {"name": "2020"},
-                {"name": "aoty"},
-                {"name": "best of 2020"},
-                {"name": "seen live"},
-                {"name": "favorites"},
-                {"name": "favorite"},
-                {"name": "under 1000"},
-                {"name": "indie"},
-                {"name": "alternative"},
-            ],
-        }
-
-        tags = pick_mood_tags(album_info, max_n=3)
-
-        self.assertEqual(tags, ["rock", "indie", "alternative"])
-
-    def test_pick_mood_tags_handles_flat_string_tags(self):
-        tags = pick_mood_tags({"tags": ["rock", "2020", "indie"]}, max_n=3)
-        self.assertEqual(tags, ["rock", "indie"])
-
-    def test_pick_mood_tags_handles_empty_or_invalid_input(self):
-        self.assertEqual(pick_mood_tags({}), [])
-        self.assertEqual(pick_mood_tags({"tags": []}), [])
-        self.assertEqual(pick_mood_tags(None), [])
-
-    def test_pick_mood_tags_is_case_insensitive_for_blocklist(self):
-        tags = pick_mood_tags({"tags": [{"name": "AOTY"}, {"name": "Indie"}]}, max_n=3)
-        self.assertEqual(tags, ["Indie"])
-
-
-@unittest.skipIf(LastFMClient is None, "lastfm client is not available")
-class TestLastFMClientAlbumGetInfo(unittest.IsolatedAsyncioTestCase):
-    """Test LastFMClient.album_getinfo shape, error tolerance, and key gating."""
-
-    def make_client(self, api_key="valid-key"):
-        client = LastFMClient.__new__(LastFMClient)
-        client.api_key = api_key
-        return client
-
-    def make_response(self, payload):
-        import httpx as _httpx
-
-        return _httpx.Response(
-            200,
-            json=payload,
-            request=_httpx.Request("GET", "https://ws.audioscrobbler.com/2.0/"),
-        )
-
-    async def test_album_getinfo_returns_empty_dict_when_api_key_missing(self):
-        client = self.make_client(api_key=None)
-
-        result = await client.album_getinfo("Artist", "Album")
-
-        self.assertEqual(result, {})
-
-    async def test_album_getinfo_returns_empty_dict_for_blank_artist_or_album(self):
-        client = self.make_client(api_key=None)
-
-        self.assertEqual(await client.album_getinfo("", "Album"), {})
-        self.assertEqual(await client.album_getinfo("Artist", ""), {})
-
-    async def test_album_getinfo_extracts_mbid_and_tag_names(self):
-        client = self.make_client()
-        client.client = AsyncMock()
-        client.client.get = AsyncMock(return_value=self.make_response({
-            "album": {
-                "mbid": "mbid-uuid",
-                "tags": {"tag": [{"name": "rock"}, {"name": "indie"}]},
-            }
-        }))
-
-        result = await client.album_getinfo("Artist", "Album")
-
-        self.assertEqual(result["mbid"], "mbid-uuid")
-        self.assertEqual([t["name"] for t in result["tags"]], ["rock", "indie"])
-
-    async def test_album_getinfo_returns_empty_dict_on_http_error(self):
-        client = self.make_client()
-        client.client = AsyncMock()
-        client.client.get = AsyncMock(side_effect=Exception("network down"))
-
-        result = await client.album_getinfo("Artist", "Album")
-
-        self.assertEqual(result, {})
-
-    async def test_album_getinfo_handles_malformed_payload(self):
-        client = self.make_client()
-        client.client = AsyncMock()
-        client.client.get = AsyncMock(return_value=self.make_response({"unexpected": "shape"}))
-
-        result = await client.album_getinfo("Artist", "Album")
-
-        self.assertEqual(result["mbid"], "")
-        self.assertEqual(result["tags"], [])
-
-
-@unittest.skip("Date handling is covered by the shared metadata contract tests")
-class TestSCFDateHelpers(unittest.TestCase):
-    """Test Spotify release-date coercion and SCF date formatting helpers."""
-
-    def test_coerce_full_iso_date_passes_through(self):
-        self.assertEqual(_coerce_spotify_release_date("2024-03-15"), "2024-03-15")
-
-    def test_coerce_year_only_expands_to_first_of_year(self):
-        self.assertEqual(_coerce_spotify_release_date("2024"), "2024-01-01")
-
-    def test_coerce_year_month_expands_to_first_of_month(self):
-        self.assertEqual(_coerce_spotify_release_date("2024-03"), "2024-03-01")
-
-    def test_coerce_empty_or_invalid_returns_input(self):
-        self.assertEqual(_coerce_spotify_release_date(""), "")
-        self.assertEqual(_coerce_spotify_release_date("garbage"), "garbage")
-
-    def test_format_scf_date_renders_iso_as_dmy(self):
-        self.assertEqual(_format_scf_date("2024-03-15"), "15/03/2024")
-
-    def test_format_scf_date_renders_datetime_as_dmy(self):
-        self.assertEqual(_format_scf_date("2024-03-15T14:30:00"), "15/03/2024")
-
-    def test_format_scf_date_empty_returns_empty(self):
-        self.assertEqual(_format_scf_date(""), "")
-        self.assertEqual(_format_scf_date(None), "")
-
-
-@unittest.skip("Replaced by shared tracker metadata integration tests")
-class TestPublisherSCFFill(unittest.IsolatedAsyncioTestCase):
-    """Test SCF auto-fill behavior on the publisher."""
-
-    def make_release(self):
-        return make_release_for_test(
-            "album_scf",
-            "Album SCF",
-            datetime(2024, 1, 1, 12, 0, 0),
-            tracks=[
-                Track("t1", "Track 1", "track 1", 180000, 1, 1, True, False, explicit=False),
-                Track("t2", "Track 2", "track 2", 240000, 1, 2, True, False, explicit=True),
-                Track("t3", "Local", "local", 60000, 1, 3, False, False, explicit=False),
-            ],
-        )
-
-    def make_publisher(self, listen_count=1, lastfm_album_info=None):
-        publisher = Publisher.__new__(Publisher)
-        publisher.db = AsyncMock()
-        publisher.wordpress = MagicMock()
-        publisher.wordpress.update_post = AsyncMock()
-        publisher.lastfm = MagicMock()
-        publisher.lastfm.album_getinfo = AsyncMock(return_value=lastfm_album_info or {"mbid": "", "tags": []})
-        publisher.lastfm.close = AsyncMock()
-        publisher._count_listen_index = AsyncMock(return_value=listen_count)
-        publisher._fill_scf_enabled = True
-        return publisher
-
-    async def test_build_scf_payload_uses_countable_tracks_only(self):
-        publisher = self.make_publisher()
-        release = self.make_release()
-        post = {"id": 42, "date": "2024-03-15T14:30:00"}
-
-        acf, status = await publisher._build_scf_payload(release, listen_count=1, post=post)
-
-        # Only two tracks are countable (Local has is_countable=False).
-        self.assertEqual(len(acf["music_tracks"]), 2)
-        self.assertEqual([t["title"] for t in acf["music_tracks"]], ["Track 1", "Track 2"])
-        # Sum of countable durations.
-        self.assertEqual(acf["music_length_ms"], 180000 + 240000)
-        self.assertEqual(acf["music_total_tracks"], 2)
-        self.assertEqual(acf["music_avg_track_ms"], (180000 + 240000) // 2)
-        self.assertTrue(acf["music_explicit"])
-        # Coerced release_date submitted as canonical ISO.
-        self.assertEqual(acf["music_release_date"], "2024-01-01")
-        # Post date formatted as d/m/Y.
-        self.assertEqual(acf["music_listened_at"], "15/03/2024")
-        self.assertEqual(acf["spotify_album_id"], release.spotify_id)
-        self.assertEqual(acf["spotify_album_url"], f"https://open.spotify.com/album/{release.spotify_id}")
-        # Mood tags empty since the fake Last.fm returned no usable tags.
-        self.assertEqual(acf["music_mood_tags"], [])
-        self.assertIsNone(status["mood_tags"])
-
-    async def test_build_scf_payload_uses_year_only_release_date(self):
-        publisher = self.make_publisher()
-        release = self.make_release()
-        release.release_date = "2024"
-        post = {"id": 1, "date": "2024-12-31T23:59:00"}
-
-        acf, _ = await publisher._build_scf_payload(release, listen_count=1, post=post)
-
-        self.assertEqual(acf["music_release_date"], "2024-01-01")
-        self.assertEqual(acf["music_listened_at"], "31/12/2024")
-
-    async def test_build_scf_payload_uses_lastfm_mbid_and_mood_tags(self):
-        publisher = self.make_publisher(
-            lastfm_album_info={"mbid": "mbid-uuid", "tags": [{"name": "rock"}, {"name": "indie"}]}
-        )
-        release = self.make_release()
-        post = {"id": 1, "date": "2024-03-15T14:30:00"}
-
-        acf, status = await publisher._build_scf_payload(release, listen_count=2, post=post)
-
-        self.assertEqual(acf["lastfm_release_id"], "mbid-uuid")
-        self.assertEqual(acf["music_mood_tags"], [{"mood": "rock"}, {"mood": "indie"}])
-        self.assertEqual(acf["listen-count"], 2)
-        self.assertEqual(status["mood_tags"], ["rock", "indie"])
-
-    async def test_fill_post_scf_patches_acf_block(self):
-        publisher = self.make_publisher()
-        acf = {"music_tracks": [], "spotify_album_id": "album", "listen-count": 1}
-        publisher.wordpress.get_post_acf = AsyncMock(return_value=acf)
-
-        await publisher._fill_post_scf(99, acf)
-
-        publisher.wordpress.update_post.assert_awaited_once_with(99, {"acf": acf})
-        publisher.wordpress.get_post_acf.assert_awaited_once_with(99)
-
-    async def test_count_listen_index_returns_matches_plus_one(self):
-        class FakeDatabase:
-            def __init__(self, posts):
-                self._posts = posts
-
-            async def get_wordpress_posts(self):
-                return self._posts
-
-        posts = [
-            WordPressPost(
-                id=1, title="Album SCF", normalized_title=normalize_text("Album SCF"),
-                artists=["Artist"], normalized_artists=normalize_artist_list(["Artist"]),
-                link="https://example.com/1",
-            ),
-            WordPressPost(
-                id=2, title="Other", normalized_title=normalize_text("Other"),
-                artists=["Someone"], normalized_artists=normalize_artist_list(["Someone"]),
-                link="https://example.com/2",
-            ),
-            WordPressPost(
-                id=3, title="Album SCF (re-release)", normalized_title=normalize_text("Album SCF"),
-                artists=["Different"], normalized_artists=normalize_artist_list(["Different"]),
-                link="https://example.com/3",
-            ),
-        ]
-        publisher = Publisher.__new__(Publisher)
-        publisher.db = FakeDatabase(posts)
-        release = make_release_for_test("album_scf", "Album SCF", datetime(2024, 1, 1, 12, 0, 0))
-
-        count = await publisher._count_listen_index(release)
-
-        # Only post id=1 matches both title and artist set; +1 for the new post.
-        self.assertEqual(count, 2)
-
-    async def test_publish_release_with_scf_returns_publish_result_and_fills(self):
-        class FakeWordPress:
-            def __init__(self):
-                self.updated = None
-                self.create_calls = 0
-
-            async def create_post(self, data):
-                self.create_calls += 1
-                return {"id": 7, "date": "2024-03-15T14:30:00", **data}
-
-            async def update_post(self, post_id, data):
-                self.updated = (post_id, data)
-                return {"id": post_id, **data}
-
-            async def get_post_acf(self, post_id):
-                return self.updated[1]["acf"]
-
-        publisher = Publisher.__new__(Publisher)
-        publisher.config = type("C", (), {"lastfm_api_key": "k", "fill_scf_enabled": True})()
-        publisher.db = AsyncMock()
-        publisher.db.get_wordpress_posts = AsyncMock(return_value=[])
-        publisher.category_cache = {"Album": 1}
-        publisher.wordpress = FakeWordPress()
-        publisher.lastfm = MagicMock()
-        publisher.lastfm.album_getinfo = AsyncMock(return_value={"mbid": "m", "tags": [{"name": "rock"}]})
-        publisher.lastfm.close = AsyncMock()
-        publisher._ensure_categories = AsyncMock()
-        publisher._upload_artwork = AsyncMock(return_value=None)
-        publisher._resolve_tags = AsyncMock(return_value=[2])
-        publisher.refresh_post_cache = AsyncMock()
-        publisher._fill_scf_enabled = True
-
-        release = self.make_release()
-        result = await publisher.publish_release(release)
-
-        self.assertIsInstance(result, PublishResult)
-        self.assertEqual(result.post["id"], 7)
-        self.assertEqual(result.listen_count, 1)
-        self.assertEqual(result.scf_pending_tags, [])
-        # SCF fill wrote the acf block.
-        self.assertEqual(publisher.wordpress.updated[0], 7)
-        self.assertIn("acf", publisher.wordpress.updated[1])
-        self.assertEqual(publisher.wordpress.updated[1]["acf"]["listen-count"], 1)
-        # The about-to-be-created post was counted (cache was empty so matches=0 + 1 = 1).
-        publisher.refresh_post_cache.assert_awaited_once_with(force=True)
-
-    async def test_publish_release_marks_mood_tags_pending_when_lastfm_returns_no_tags(self):
-        class FakeWordPress:
-            async def create_post(self, data):
-                return {"id": 7, "title": {"rendered": data["title"]}, "date": "2024-03-15T14:30:00"}
-
-            async def update_post(self, post_id, data):
-                self.acf = data["acf"]
-                return {"id": post_id, **data}
-
-            async def get_post_acf(self, post_id):
-                return self.acf
-
-        publisher = Publisher.__new__(Publisher)
-        publisher.db = AsyncMock()
-        publisher.db.get_wordpress_posts = AsyncMock(return_value=[])
-        publisher.category_cache = {"Album": 1}
-        publisher.wordpress = FakeWordPress()
-        publisher.lastfm = MagicMock()
-        publisher.lastfm.album_getinfo = AsyncMock(return_value={"mbid": "", "tags": []})
-        publisher.lastfm.close = AsyncMock()
-        publisher._ensure_categories = AsyncMock()
-        publisher._upload_artwork = AsyncMock(return_value=None)
-        publisher._resolve_tags = AsyncMock(return_value=[2])
-        publisher.refresh_post_cache = AsyncMock()
-        publisher._fill_scf_enabled = True
-
-        release = self.make_release()
-        result = await publisher.publish_release(release)
-
-        self.assertEqual(result.scf_pending_tags, ["mood_tags"])
-
-    async def test_publish_release_marks_scf_error_when_write_does_not_persist(self):
-        publisher = self.make_publisher(lastfm_album_info={"mbid": "m", "tags": [{"name": "rock"}]})
-        publisher.category_cache = {"Album": 1}
-        publisher._ensure_categories = AsyncMock()
-        publisher._upload_artwork = AsyncMock(return_value=None)
-        publisher._resolve_tags = AsyncMock(return_value=[2])
-        publisher.refresh_post_cache = AsyncMock()
-        publisher.wordpress.create_post = AsyncMock(return_value={
-            "id": 7, "title": {"rendered": "Album SCF"}, "date": "2024-03-15T14:30:00"
-        })
-        publisher.wordpress.get_post_acf = AsyncMock(return_value={
-            "spotify_album_id": "", "music_tracks": None, "listen-count": ""
-        })
-
-        result = await publisher.publish_release(self.make_release())
-
-        self.assertIn("scf_error", result.scf_pending_tags)
-        publisher.wordpress.get_post_acf.assert_awaited_once_with(7)
-
-    async def test_retry_post_scf_updates_existing_post_without_creating_another(self):
-        publisher = self.make_publisher(lastfm_album_info={"mbid": "m", "tags": [{"name": "rock"}]})
-        publisher.wordpress.get_post = AsyncMock(return_value={
-            "id": 7,
-            "date": "2024-03-15T14:30:00",
-            "acf": {"music_rating": 88, "music_notes": "edited live", "music_favorite": True},
-        })
-        publisher.wordpress.create_post = AsyncMock()
-        expected = await publisher._build_scf_payload(
-            self.make_release(), listen_count=1, post={"date": "2024-03-15T14:30:00"}
-        )
-        publisher.wordpress.get_post_acf = AsyncMock(return_value=expected[0])
-
-        await publisher.retry_post_scf(self.make_release(), post_id=7, listen_count=1)
-
-        publisher.wordpress.create_post.assert_not_awaited()
-        publisher.wordpress.update_post.assert_awaited_once()
-        submitted = publisher.wordpress.update_post.await_args.args[1]["acf"]
-        self.assertNotIn("music_rating", submitted)
-        self.assertNotIn("music_notes", submitted)
-        self.assertNotIn("music_favorite", submitted)
-
-    async def test_retry_post_scf_preserves_existing_auto_metadata_and_highlights(self):
-        publisher = self.make_publisher(lastfm_album_info={"mbid": "m", "tags": []})
-        release = self.make_release()
-        generated, _ = await publisher._build_scf_payload(
-            release, listen_count=1, post={"date": "2024-03-15T14:30:00"}
-        )
-        live_acf = {
-            field: value
-            for field, value in generated.items()
-            if field not in ("music_rating", "music_favorite", "music_notes", "unreleased")
-        }
-        live_acf["music_tracks"][0]["highlight"] = True
-        live_acf["music_mood_tags"] = [{"mood": "jazz"}]
-        publisher.wordpress.get_post = AsyncMock(return_value={
-            "id": 7, "date": "2024-03-15T14:30:00", "acf": live_acf
-        })
-
-        pending = await publisher.retry_post_scf(release, post_id=7, listen_count=1)
-
-        publisher.wordpress.update_post.assert_not_awaited()
-        self.assertEqual(pending, [])
-        self.assertTrue(live_acf["music_tracks"][0]["highlight"])
-
-    async def test_retry_post_scf_preserves_existing_generated_values_without_tracks(self):
-        publisher = self.make_publisher(lastfm_album_info={"mbid": "m", "tags": [{"name": "rock"}]})
-        live_acf = {
-            "music_tracks": None,
-            "spotify_album_id": "",
-            "spotify_album_url": "https://custom.example/album",
-            "listen-count": 7,
-            "music_explicit": False,
-        }
-        publisher.wordpress.get_post = AsyncMock(return_value={
-            "id": 7, "date": "2024-03-15T14:30:00", "acf": live_acf
-        })
-        persisted = dict(live_acf)
-
-        async def update_post(post_id, data):
-            persisted.update(data["acf"])
-            return {"id": post_id, "acf": persisted}
-
-        publisher.wordpress.update_post = AsyncMock(side_effect=update_post)
-        publisher.wordpress.get_post_acf = AsyncMock(return_value=persisted)
-
-        await publisher.retry_post_scf(self.make_release(), post_id=7, listen_count=1)
-
-        submitted = publisher.wordpress.update_post.await_args.args[1]["acf"]
-        self.assertNotIn("spotify_album_url", submitted)
-        self.assertNotIn("listen-count", submitted)
-        self.assertEqual(persisted["spotify_album_url"], "https://custom.example/album")
-        self.assertEqual(persisted["listen-count"], 7)
-
-    async def test_publish_release_continues_when_scf_fill_raises(self):
-        class FakeWordPress:
-            async def create_post(self, data):
-                return {"id": 7, "title": {"rendered": data["title"]}, "date": "2024-03-15T14:30:00"}
-
-            async def update_post(self, post_id, data):
-                raise RuntimeError("scf endpoint down")
-
-        publisher = Publisher.__new__(Publisher)
-        publisher.db = AsyncMock()
-        publisher.db.get_wordpress_posts = AsyncMock(return_value=[])
-        publisher.category_cache = {"Album": 1}
-        publisher.wordpress = FakeWordPress()
-        publisher.lastfm = MagicMock()
-        publisher.lastfm.album_getinfo = AsyncMock(return_value={"mbid": "", "tags": []})
-        publisher.lastfm.close = AsyncMock()
-        publisher._ensure_categories = AsyncMock()
-        publisher._upload_artwork = AsyncMock(return_value=None)
-        publisher._resolve_tags = AsyncMock(return_value=[2])
-        publisher.refresh_post_cache = AsyncMock()
-        publisher._fill_scf_enabled = True
-
-        release = self.make_release()
-        result = await publisher.publish_release(release)
-
-        # Post was still created and returned; SCF failure is surfaced.
-        self.assertEqual(result.post["id"], 7)
-        self.assertIn("scf_error", result.scf_pending_tags)
-
-    async def test_publish_release_with_scf_disabled_skips_scf_path(self):
-        class FakeWordPress:
-            async def create_post(self, data):
-                return {"id": 7, "title": {"rendered": data["title"]}, "date": "2024-03-15T14:30:00"}
-
-            async def update_post(self, post_id, data):
-                raise AssertionError("update_post should not be called when SCF is disabled")
-
-        publisher = Publisher.__new__(Publisher)
-        publisher.db = AsyncMock()
-        publisher.category_cache = {"Album": 1}
-        publisher.wordpress = FakeWordPress()
-        publisher.lastfm = MagicMock()
-        publisher._ensure_categories = AsyncMock()
-        publisher._upload_artwork = AsyncMock(return_value=None)
-        publisher._resolve_tags = AsyncMock(return_value=[2])
-        publisher.refresh_post_cache = AsyncMock()
-        publisher._fill_scf_enabled = False
-
-        release = self.make_release()
-        result = await publisher.publish_release(release)
-
-        self.assertEqual(result.post["id"], 7)
-        self.assertEqual(result.scf_pending_tags, [])
-        self.assertEqual(result.listen_count, 1)
-        self.assertFalse(result.scf_attempted)
-
-
 @unittest.skipIf(DiscordBot is None, "discord bot dependencies are not installed")
 class TestPublishNotificationEmbed(unittest.IsolatedAsyncioTestCase):
     """Test send_publish_notification surface area after SCF auto-fill."""
@@ -2865,43 +2377,6 @@ class TestPublishNotificationEmbed(unittest.IsolatedAsyncioTestCase):
         self.assertIn("metadata update failed", self.extract_content())
         field_map = {f.name: f.value for f in self.extract_embed().fields}
         self.assertIn("⚠️ Metadata", field_map)
-
-    async def test_surfaces_total_scf_failure(self):
-        result = PublishResult(post=self.make_post(), scf_pending_tags=["scf_error"], listen_count=1)
-        release = self.make_release()
-        release.published_at = datetime(2024, 3, 15, 14, 30)
-
-        await self.bot.send_publish_notification(release, result)
-
-        self.assertIn("SCF metadata failed", self.extract_content())
-        field_map = {f.name: f.value for f in self.extract_embed().fields}
-        self.assertIn("⚠️ SCF metadata", field_map)
-        self.assertIn("Retry metadata", field_map["⚠️ SCF metadata"])
-        labels = [child.label for child in self.bot._send_dm.await_args.kwargs["view"].children]
-        self.assertIn("Retry metadata", labels)
-        prompt = self.bot.db.save_discord_prompt.await_args.args[0]
-        self.assertEqual(prompt.expires_at, release.published_at + timedelta(hours=24))
-        self.assertEqual(json.loads(prompt.context_json), {"listen_count": 1})
-
-    async def test_scf_disabled_does_not_claim_autofill_or_show_retry(self):
-        result = PublishResult(
-            post=self.make_post(), scf_pending_tags=[], listen_count=1, scf_attempted=False
-        )
-
-        await self.bot.send_publish_notification(self.make_release(), result)
-
-        self.assertEqual(self.extract_content(), "The release has been published to WordPress.")
-        labels = [child.label for child in self.bot._send_dm.await_args.kwargs["view"].children]
-        self.assertNotIn("Retry metadata", labels)
-
-    async def test_adds_listen_count_field_only_when_greater_than_one(self):
-        result = PublishResult(post=self.make_post(), scf_pending_tags=[], listen_count=3)
-
-        await self.bot.send_publish_notification(self.make_release(), result)
-
-        field_map = {f.name: f.value for f in self.extract_embed().fields}
-        self.assertEqual(field_map.get("Listen count"), "3")
-
 
 @unittest.skipIf(EditorState is None, "editor_view module is not importable")
 class TestEditorStateProjection(unittest.TestCase):
@@ -3220,72 +2695,6 @@ class TestPublisherUpdatePostScf(unittest.IsolatedAsyncioTestCase):
             99, {"acf": {"music_rating": 80, "music_favorite": True}}
         )
         self.assertEqual(result["id"], 99)
-
-
-@unittest.skip("Replaced by shared tracker metadata integration tests")
-class TestScfPayloadIncludesEditorFields(unittest.IsolatedAsyncioTestCase):
-    """The auto-fill payload should include the human-curated editor fields verbatim."""
-
-    def make_publisher(self, lastfm=None):
-        publisher = Publisher.__new__(Publisher)
-        publisher.db = MagicMock()
-        publisher.lastfm = MagicMock()
-        publisher.lastfm.album_getinfo = AsyncMock(return_value=lastfm or {"mbid": "", "tags": []})
-        return publisher
-
-    def make_release(self):
-        release = make_release_for_test("album_scf_editor", "Editor Album", datetime(2024, 1, 1))
-        release.rating = 91
-        release.favorite = True
-        release.notes = "Editorial notes"
-        release.unreleased = True
-        release.tracks[0].highlight = True
-        return release
-
-    async def test_editor_fields_and_track_highlight_propagate_into_acf(self):
-        publisher = self.make_publisher()
-        release = self.make_release()
-        post = {"id": 1, "date": "2024-03-15T14:30:00"}
-
-        acf, _ = await publisher._build_scf_payload(release, listen_count=2, post=post)
-
-        self.assertEqual(acf["music_rating"], 91)
-        self.assertTrue(acf["music_favorite"])
-        self.assertEqual(acf["music_notes"], "Editorial notes")
-        self.assertTrue(acf["unreleased"])
-        self.assertTrue(acf["music_tracks"][0]["highlight"])
-        self.assertEqual(acf["listen-count"], 2)
-
-    async def test_unset_numeric_editor_field_is_omitted(self):
-        publisher = self.make_publisher()
-        release = make_release_for_test("album_scf_default", "Default", datetime(2024, 1, 1))
-        post = {"id": 1, "date": "2024-03-15T14:30:00"}
-
-        acf, _ = await publisher._build_scf_payload(release, listen_count=1, post=post)
-
-        self.assertNotIn("music_rating", acf)
-        self.assertFalse(acf["music_favorite"])
-        self.assertEqual(acf["music_notes"], "")
-        self.assertFalse(acf["unreleased"])
-
-    async def test_default_payload_matches_live_scf_field_types(self):
-        publisher = self.make_publisher()
-        release = make_release_for_test("album_scf_schema", "Schema", datetime(2024, 1, 1))
-
-        acf, _ = await publisher._build_scf_payload(
-            release, listen_count=1, post={"date": "2024-03-15T14:30:00"}
-        )
-
-        field_types = {
-            "music_tracks": list, "music_length_ms": int, "spotify_album_id": str,
-            "spotify_album_url": str, "music_release_date": str, "music_listened_at": str,
-            "lastfm_release_id": str, "music_total_tracks": int, "music_avg_track_ms": int,
-            "music_explicit": bool, "music_mood_tags": list, "listen-count": int,
-            "music_favorite": bool, "music_notes": str, "unreleased": bool,
-        }
-        self.assertEqual(set(acf), set(field_types))
-        for field, expected_type in field_types.items():
-            self.assertIsInstance(acf[field], expected_type, field)
 
 
 @unittest.skipIf(DiscordBot is None, "discord bot dependencies are not installed")
@@ -3649,6 +3058,42 @@ class TestEditorViewRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
         # The new view is a tracks sub-view, not the editor itself.
         self.assertIsInstance(kwargs["view"], EditorTracksView)
 
+    async def test_remaining_pre_publish_buttons_dispatch(self):
+        db = MagicMock()
+        db.save_release = AsyncMock()
+        release = self.make_release()
+        sink = PrePublishSink(db=db, release=release)
+        view = EditorView(sink, release.title, lambda: list(release.tracks))
+        buttons = {child.custom_id: child for child in view.children}
+
+        toggle = self.make_interaction()
+        await buttons["editor:bool:unreleased"].callback(toggle)
+        self.assertTrue(release.unreleased)
+        for custom_id in ("editor:modal:rating", "editor:modal:notes"):
+            interaction = self.make_interaction()
+            await buttons[custom_id].callback(interaction)
+            interaction.response.send_modal.assert_awaited_once()
+        refresh = self.make_interaction()
+        await buttons["editor:nav:refresh"].callback(refresh)
+        refresh.response.edit_message.assert_awaited_once()
+
+    async def test_post_publish_resync_and_body_buttons_dispatch(self):
+        publisher = MagicMock()
+        publisher.get_post_unreleased = AsyncMock(return_value=False)
+        wordpress = MagicMock()
+        wordpress.get_post_acf = AsyncMock(return_value={})
+        wordpress.get_post_content_raw = AsyncMock(return_value="<p>Body</p>")
+        sink = PostPublishSink(publisher, wordpress, 42)
+        view = EditorView(sink, "Published Album", lambda: [])
+        buttons = {child.custom_id: child for child in view.children}
+
+        resync = self.make_interaction()
+        await buttons["editor:nav:resync"].callback(resync)
+        resync.response.edit_message.assert_awaited_once()
+        body = self.make_interaction()
+        await buttons["editor:modal:body"].callback(body)
+        body.response.send_modal.assert_awaited_once()
+
 
 @unittest.skipIf(EditorView is None, "editor_view module is not importable")
 class TestEditorTracksViewRowLayout(unittest.TestCase):
@@ -3721,6 +3166,52 @@ class TestEditorTracksViewRowLayout(unittest.TestCase):
         per_row = Counter(c.row for c in sub.children)
         for row, count in per_row.items():
             self.assertLessEqual(count, 5, f"row {row} has {count} components (>5)")
+
+
+@unittest.skipIf(EditorView is None, "editor_view module is not importable")
+class TestEditorTracksRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
+    def make_interaction(self):
+        return TestEditorViewRuntimeDispatch().make_interaction()
+
+    async def test_track_and_navigation_buttons_dispatch(self):
+        tracks = [
+            Track(
+                spotify_id=f"t{i}", title=f"Track {i}", normalized_title=f"track {i}",
+                duration_ms=1000, disc_number=1, track_number=i,
+                is_countable=True, listened=False, highlight=False,
+            )
+            for i in range(1, 7)
+        ]
+        release = make_release_for_test(
+            "album_track_dispatch", "Track Dispatch", datetime(2024, 1, 1),
+            tracks=tracks,
+        )
+        db = MagicMock()
+        db.save_release = AsyncMock()
+        sink = PrePublishSink(db, release)
+        editor = EditorView(sink, release.title, lambda: list(release.tracks))
+        first_page = EditorTracksView(editor, page=0)
+        first_buttons = {child.custom_id: child for child in first_page.children}
+
+        toggle = self.make_interaction()
+        await first_buttons["editor:track:t1:0"].callback(toggle)
+        self.assertTrue(release.tracks[0].highlight)
+        toggle.response.edit_message.assert_awaited_once()
+
+        next_page = self.make_interaction()
+        await first_buttons["editor:nav:tracks_next:0"].callback(next_page)
+        next_page.response.edit_message.assert_awaited_once()
+
+        second_page = EditorTracksView(editor, page=1)
+        second_buttons = {child.custom_id: child for child in second_page.children}
+        previous = self.make_interaction()
+        await second_buttons["editor:nav:tracks_prev:1"].callback(previous)
+        previous.response.edit_message.assert_awaited_once()
+
+        back = self.make_interaction()
+        await second_buttons["editor:nav:back_to_editor:1"].callback(back)
+        back.response.edit_message.assert_awaited_once()
+        self.assertIs(back.response.edit_message.await_args.kwargs["view"], editor)
 
 
 @unittest.skipIf(EditorView is None, "editor_view module is not importable")

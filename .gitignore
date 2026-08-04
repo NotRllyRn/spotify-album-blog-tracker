@@ -1,36 +1,28 @@
-# Logs
+# Runtime data
 logs/
 *.log
+*.db
+*.db-*
+out/
 
-# Environment files
+# Credentials
 .env
 .env.local
 .env.*.local
 .spotify_tokens
 
-# Dependency directories
-node_modules/
-vendor/
+# Python
+.venv/
+venv/
+**/__pycache__/
+*.pyc
 
-# WordPress generated files
-wp-content/uploads/
-wp-content/upgrade/
-wp-content/cache/
-wp-content/backups/
-
-# IDE and OS files
+# Editors and local agent artifacts
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
-
-*.db
-*.db-*
-
-**/__pycache__
-*.pyc
 *.code-workspace
-
 .old/
 .pi-subagents/
 

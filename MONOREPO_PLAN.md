@@ -159,15 +159,17 @@ Only implement items after core parity is green. Each item requires a focused te
 
 **Gate:** A known-good pre-cleanup commit exists and can restore the complete implementation.
 
+Pre-cleanup checkpoint: `2355eae` (`checkpoint metadata monorepo migration`).
+
 ### 9. Cleanup and final verification
 
-- [ ] Remove the temporary legacy snapshot.
-- [ ] Remove `PROGRAM_DOCUMENTATION.md`, `.old/`, stale plans, superseded reports, old schema exports, duplicate deployment docs, generated artifacts, and dead code only after confirming they are no longer referenced.
-- [ ] Keep only the active SCF export and concise README unless a file remains operationally necessary.
-- [ ] Remove obsolete dependencies and ignore rules.
-- [ ] Re-run every gate after cleanup.
-- [ ] Review the final diff from the pre-cleanup checkpoint.
-- [ ] Commit cleanup separately.
+- [x] Remove the temporary legacy snapshot.
+- [x] Remove `PROGRAM_DOCUMENTATION.md`, `.old/`, stale plans, superseded reports, old schema exports, duplicate deployment docs, generated artifacts, and dead code only after confirming they are no longer referenced.
+- [x] Keep only the active SCF export and concise README unless a file remains operationally necessary.
+- [x] Remove obsolete dependencies and ignore rules.
+- [x] Re-run every gate after cleanup.
+- [x] Review the final diff from the pre-cleanup checkpoint.
+- [x] Commit cleanup separately.
 
 **Gate:** Clean worktree; all tests and smoke checks pass; no live writes; no push.
 
@@ -213,4 +215,4 @@ Adjust boundaries when a smaller coherent commit is safer. Never push.
 | Resolved | Tracker and CLI materialized date-picker values differently. | Both use shared REST materialization with final-body parity tests. |
 | Resolved | Tracker’s `unreleased` editor targeted a deleted ACF field. | The feature uses the Unreleased category marker with round-trip tests. |
 | Resolved | CLI `listen_count=1` and tracker’s ordinal calculation conflicted. | Both now write the canonical value `1`. |
-| Cleanup | The old async tracker Last.fm helper remains only for obsolete tests. | Remove the helper and its stale tests after the pre-cleanup checkpoint. |
+| Resolved | The old async tracker Last.fm helper remained only for obsolete tests. | Removed the helper and its stale tests after the pre-cleanup checkpoint. |

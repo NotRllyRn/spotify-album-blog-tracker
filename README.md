@@ -11,7 +11,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Fill in `.env`. WordPress must expose the SCF fields and the `artist`, `genre`, and `release_type` taxonomies defined by `scf-export-2026-07-24.json`.
+Fill in `.env`. Metadata enrichment is enabled by default and requires Last.fm credentials; set `SPOTIFY_BLOG_TRACKER_FILL_SCF=0` to disable it. WordPress must expose the SCF fields and the `artist`, `genre`, and `release_type` taxonomies defined by `scf-export-2026-07-24.json`.
 
 ## Tracker
 
@@ -55,7 +55,7 @@ The shared engine manages provider-derived SCF fields, categories, and custom ta
 Code is split into three parts:
 
 - `src/album_metadata/`: reusable schema, providers, matching, enrichment, and payloads
-- `src/tracker_metadata.py`: tracker adapter
+- `src/tracker_metadata_adapter.py`: tracker adapter
 - `src/metadata_cli/`: manual CLI adapter
 
 ## Verification
