@@ -6,7 +6,7 @@ import aiosqlite
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Set
+from typing import List, Optional, Dict, Any, Set, Sequence
 from datetime import datetime
 
 from config import Config
@@ -25,11 +25,39 @@ from models import (
 
 logger = logging.getLogger(__name__)
 
+
+def _load_json_list(value: str) -> list:
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("Database contains malformed JSON") from exc
+    if not isinstance(parsed, list):
+        raise RuntimeError("Database JSON value is not a list")
+    return parsed
+
+
+def _as_int(value: Any, field: str) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Database contains invalid {field}") from exc
+
+
 class Database:
     def __init__(self, config: Config):
         self.config = config
         self.db_path = config.db_path
-        self.connection: Optional[aiosqlite.Connection] = None
+        self._connection: Optional[aiosqlite.Connection] = None
+
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        if self._connection is None:
+            raise RuntimeError("Database is not initialized")
+        return self._connection
+
+    @connection.setter
+    def connection(self, value: Optional[aiosqlite.Connection]) -> None:
+        self._connection = value
 
     async def initialize(self):
         """Initialize database and run migrations."""
@@ -42,8 +70,9 @@ class Database:
 
     async def close(self):
         """Close database connection."""
-        if self.connection:
-            await self.connection.close()
+        if self._connection:
+            await self._connection.close()
+            self._connection = None
 
     async def _run_migrations(self):
         """Run database migrations."""
@@ -56,10 +85,13 @@ class Database:
 
         # Run pending migrations
         for migration_file in sorted(migrations_dir.glob("*.sql")):
-            migration_version = int(migration_file.stem.split("_")[0])
+            try:
+                migration_version = int(migration_file.stem.split("_")[0])
+                sql = migration_file.read_text(encoding="utf-8")
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Invalid migration: {migration_file.name}") from exc
             if migration_version > version:
                 logger.info(f"Running migration {migration_file.name}")
-                sql = migration_file.read_text()
                 await self.connection.executescript(sql)
                 await self._set_schema_version(migration_version)
 
@@ -69,7 +101,8 @@ class Database:
             cursor = await self.connection.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
             row = await cursor.fetchone()
             return row[0] if row else 0
-        except aiosqlite.OperationalError:
+        except aiosqlite.OperationalError as exc:
+            logger.debug("Schema version is not initialized: %s", exc)
             return 0
 
     async def _set_schema_version(self, version: int):
@@ -135,6 +168,8 @@ class Database:
         """, data)
 
         release_id = cursor.lastrowid
+        if release_id is None:
+            raise RuntimeError("Database did not return a release ID")
 
         # Save artists
         await self._save_release_artists(release_id, release.artists)
@@ -270,7 +305,7 @@ class Database:
                 track.highlight,
             ))
 
-    def _row_to_release(self, row: tuple, artists: List[Artist], tracks: List[Track]) -> Release:
+    def _row_to_release(self, row: Sequence[Any], artists: List[Artist], tracks: List[Track]) -> Release:
         """Convert database row to Release object."""
         return Release(
             spotify_id=row[1],
@@ -314,8 +349,8 @@ class Database:
             id=row[0],
             title=row[1],
             normalized_title=row[2],
-            artists=json.loads(row[3]),
-            normalized_artists=json.loads(row[4]),
+            artists=_load_json_list(row[3]),
+            normalized_artists=_load_json_list(row[4]),
             link=row[5]
         ) for row in rows]
 
@@ -381,7 +416,7 @@ class Database:
                 spotify_id=row[0],
                 spotify_uri=row[1],
                 added_at=datetime.fromisoformat(row[2]),
-                position=int(row[3]),
+                position=_as_int(row[3], "snapshot position"),
                 last_seen_at=datetime.fromisoformat(row[4]),
             )
             for row in rows
@@ -513,12 +548,12 @@ class Database:
             FROM saved_library_album
         """)
         row = await cursor.fetchone()
-        total = int(row[0] or 0)
-        posted_listened = int(row[1] or 0)
+        total = _as_int(row[0], "saved-library total") if row else 0
+        posted_listened = _as_int(row[1], "saved-library posted count") if row else 0
         percent = (posted_listened / total) if total else 0.0
         return SavedLibraryStats(total=total, posted_listened=posted_listened, percent=percent)
 
-    def _row_to_saved_library_album(self, row: tuple) -> SavedLibraryAlbum:
+    def _row_to_saved_library_album(self, row: Sequence[Any]) -> SavedLibraryAlbum:
         """Convert a saved-library database row to a model."""
         return SavedLibraryAlbum(
             spotify_id=row[0],
@@ -526,8 +561,8 @@ class Database:
             spotify_url=row[2],
             title=row[3],
             normalized_title=row[4],
-            artists=json.loads(row[5]),
-            normalized_artists=json.loads(row[6]),
+            artists=_load_json_list(row[5]),
+            normalized_artists=_load_json_list(row[6]),
             album_type=row[7],
             release_type=ReleaseType(row[8]),
             cover_url=row[9],
