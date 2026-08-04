@@ -73,17 +73,17 @@ The exact module count may shrink where merging files is simpler. Avoid abstract
 ### 1. Import a recoverable CLI snapshot
 
 - [x] Copy the current CLI source, tests, active schema, and user-facing reference into a temporary `legacy/` snapshot.
-- [ ] Commit the snapshot before refactoring it.
+- [x] Commit the snapshot before refactoring it.
 - [x] Confirm the source CLI checkout remains untouched.
 
 **Gate:** The imported snapshot independently runs all 119 original tests.
 
 ### 2. Establish the shared schema contract
 
-- [ ] Add `album_metadata.schema` with the exact July 24 managed fields, editor-owned fields, track keys, taxonomies, category mapping, and removed-field denylist.
-- [ ] Move release-type classification and common text/date helpers into the library.
-- [ ] Add a contract test that reads the active SCF export and rejects schema drift.
-- [ ] Point tracker release-type classification at the shared function.
+- [x] Add `album_metadata.schema` with the exact July 24 managed fields, editor-owned fields, track keys, taxonomies, category mapping, and removed-field denylist.
+- [x] Move release-type classification and common text/date helpers into the library.
+- [x] Add a contract test that reads the active SCF export and rejects schema drift.
+- [x] Point tracker release-type classification at the shared function.
 
 **Gate:** Original suites pass; tracker and CLI classification tests exercise one function.
 
