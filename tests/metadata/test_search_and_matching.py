@@ -1,3 +1,4 @@
+import importlib
 import io
 import json
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 from typing import Any, cast
 
 import post_to_album as mod
+spotify_mod = importlib.import_module("album_metadata.spotify")
 
 
 SPOTIFY = {"name": "Blue - Remastered", "artists": [{"name": "Beyoncé"}]}
@@ -80,7 +82,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         class Response:
             def __init__(self, value): self.value = value
             def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def __exit__(self, _exc_type, _exc_value, _traceback): pass
             def read(self): return json.dumps(self.value).encode()
 
         for payload in ([], {}, {"access_token": ""}, {"access_token": 7}):
@@ -132,7 +134,8 @@ class SearchAndMatchingTests(unittest.TestCase):
               "artist_score": mod.LASTFM_MIN_ARTIST, "candidate": lastfm_candidate}),
         ]
         for chooser, candidates, scorer, boundary in cases:
-            with self.subTest(scorer=scorer), patch.object(mod, scorer, return_value=boundary):
+            target = spotify_mod if scorer.startswith("spotify") else mod
+            with self.subTest(scorer=scorer), patch.object(target, scorer, return_value=boundary):
                 if chooser is mod.choose_spotify_candidate:
                     result = chooser(candidates, "not exact", ["artist"])
                 else:
@@ -156,7 +159,8 @@ class SearchAndMatchingTests(unittest.TestCase):
                                             "score": "SCORE"}[field])
             row = {**base, field: threshold - .001}
             chooser: Any = chooser_value
-            with self.subTest(scorer=scorer, field=field), patch.object(mod, scorer, return_value=row):
+            target = spotify_mod if scorer.startswith("spotify") else mod
+            with self.subTest(scorer=scorer, field=field), patch.object(target, scorer, return_value=row):
                 result = (chooser([base["candidate"]], "not exact", ["artist"])
                           if scorer.startswith("spotify") else chooser(SPOTIFY, [base["candidate"]]))
                 self.assertIsNone(result["candidate"])
@@ -171,7 +175,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         edition = {**c, "id": "3", "name": "Album (Deluxe Edition)"}
         exact = mod.choose_spotify_candidate([edition, c], "Album", ["Artist"])
         self.assertEqual(exact["candidate"], c)
-        with patch.object(mod, "spotify_candidate_score", side_effect=[
+        with patch.object(spotify_mod, "spotify_candidate_score", side_effect=[
             {"score": .87, "title_score": .9, "artist_score": .8, "candidate": c},
             {"score": .82, "title_score": .9, "artist_score": .8, "candidate": c2},
         ]):
@@ -245,11 +249,11 @@ class SearchAndMatchingTests(unittest.TestCase):
             {"score": .90, "title_score": .9, "artist_score": .9, "candidate": album},
             {"score": .84, "title_score": .9, "artist_score": .9, "candidate": single},
         ]
-        with patch.object(mod, "spotify_candidate_score", side_effect=rows):
+        with patch.object(spotify_mod, "spotify_candidate_score", side_effect=rows):
             self.assertIs(mod.choose_spotify_candidate(
                 [album, single], "x", ["y"], "Single")["candidate"], album)
         second_album = {"id": "album-2", "album_type": "album", "total_tracks": 12}
-        with patch.object(mod, "spotify_candidate_score", side_effect=[
+        with patch.object(spotify_mod, "spotify_candidate_score", side_effect=[
             {**rows[0], "candidate": album}, {**rows[0], "candidate": second_album},
         ]):
             self.assertEqual(mod.choose_spotify_candidate(
@@ -503,7 +507,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         class Response:
             def __init__(self, value): self.value = value
             def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def __exit__(self, _exc_type, _exc_value, _traceback): pass
             def read(self): return self.value
         seen = []
         def open_api(req, timeout):
@@ -521,7 +525,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         class Response:
             def __init__(self, value): self.value = value
             def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def __exit__(self, _exc_type, _exc_value, _traceback): pass
             def read(self): return json.dumps(self.value).encode()
 
         errors = [urllib.error.HTTPError("secret-url", 502, "body", Message(), None)
@@ -551,7 +555,7 @@ class SearchAndMatchingTests(unittest.TestCase):
     def test_direct_oserror_retries_and_counts_toward_circuit(self):
         class BrokenResponse:
             def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def __exit__(self, _exc_type, _exc_value, _traceback): pass
             def read(self): raise ConnectionResetError("connection lost")
 
         circuit = mod.ProviderCircuit("lastfm")
@@ -602,7 +606,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         class Response:
             def __init__(self, value): self.value = value
             def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def __exit__(self, _exc_type, _exc_value, _traceback): pass
             def read(self): return json.dumps(self.value).encode()
 
         headers = Message(); headers["Retry-After"] = "99"
@@ -645,7 +649,7 @@ class SearchAndMatchingTests(unittest.TestCase):
     def test_provider_circuits_reset_independently_and_diagnostics_redact(self):
         class Response:
             def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def __exit__(self, _exc_type, _exc_value, _traceback): pass
             def read(self): return b'{"ok": true}'
 
         spotify_circuit = mod.ProviderCircuit("spotify")
@@ -701,7 +705,7 @@ class SearchAndMatchingTests(unittest.TestCase):
     def test_retry_after_malformed_uses_normal_delay(self):
         class Response:
             def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def __exit__(self, _exc_type, _exc_value, _traceback): pass
             def read(self): return b'{"ok": true}'
 
         headers = Message(); headers["Retry-After"] = "not-an-integer"

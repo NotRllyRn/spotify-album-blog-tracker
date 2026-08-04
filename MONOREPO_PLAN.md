@@ -91,8 +91,8 @@ The exact module count may shrink where merging files is simpler. Avoid abstract
 
 Extract in small, test-backed commits:
 
-- [ ] Provider error/retry/circuit infrastructure.
-- [ ] Spotify client, search, scoring, ambiguity recovery, and evidence validation.
+- [x] Provider error/retry/circuit infrastructure.
+- [x] Spotify client, search, scoring, ambiguity recovery, and evidence validation.
 - [ ] Last.fm client, search, validation, recovery, and genre discovery.
 - [ ] Shared enrichment and managed-write policy.
 - [ ] Plan/artifact validation and WordPress body materialization.
