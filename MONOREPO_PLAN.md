@@ -128,13 +128,13 @@ Extract in small, test-backed commits:
 
 ### 6. Restore and simplify user interfaces
 
-- [ ] Keep `python post_to_album.py stats|fuzzy|run|apply-plan` straightforward.
-- [ ] Accept the unified tracker `.env` names while retaining `WORDPRESS_BASE_URL` as a CLI compatibility alias.
-- [ ] Keep dry-run as the default and artifacts easy to review.
-- [ ] Update `.env.example` for both interfaces without duplicating credentials.
-- [ ] Update Docker paths/dependencies only as required; retain the tracker command and volumes.
-- [ ] Replace the README with concise setup, tracker usage, CLI usage, artifacts, and architecture sections.
-- [ ] Move only essential non-obvious explanations into code docstrings/comments.
+- [x] Keep `python post_to_album.py stats|fuzzy|run|apply-plan` straightforward.
+- [x] Accept the unified tracker `.env` names while retaining `WORDPRESS_BASE_URL` as a CLI compatibility alias.
+- [x] Keep dry-run as the default and artifacts easy to review.
+- [x] Update `.env.example` for both interfaces without duplicating credentials.
+- [x] Update Docker paths/dependencies only as required; retain the tracker command and volumes.
+- [x] Replace the README with concise setup, tracker usage, CLI usage, artifacts, and architecture sections.
+- [x] Move only essential non-obvious explanations into code docstrings/comments.
 
 **Gate:** CLI `--help`, tracker startup configuration tests, Docker image build, and Compose config validation pass.
 

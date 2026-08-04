@@ -1,148 +1,67 @@
-# Spotify WordPress Album Tracker
+# Spotify Album Blog Tracker
 
-A standalone Python service that monitors Spotify playback and automatically posts album releases to WordPress via REST API, with Discord bot control.
+Tracks Spotify listening, publishes releases to WordPress, and provides a manual metadata CLI. Both interfaces use the same Spotify/Last.fm enrichment and WordPress payload code.
 
-## Quick Start
-
-1. **Set up environment:**
-
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
-
-2. **Configure credentials:**
-
-   ```bash
-   cp .env.example .env
-   # Edit .env with your Spotify, WordPress, and Discord credentials
-   ```
-
-3. **Initialize database:**
-
-   ```bash
-   PYTHONPATH=src python scripts/migrate.py
-   ```
-
-4. **Run the service:**
-
-   ```bash
-   PYTHONPATH=src python main.py
-   ```
-
-   The service will prompt for Spotify authorization on first run.
-
-## Docker Deployment
-
-For containerized deployment:
+## Setup
 
 ```bash
-docker-compose up --build
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 ```
 
-See [DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md) for detailed instructions.
+Fill in `.env`. WordPress must expose the SCF fields and the `artist`, `genre`, and `release_type` taxonomies defined by `scf-export-2026-07-24.json`.
 
-## Configuration
+## Tracker
 
-Required environment variables in `.env`:
-
-```env
-# Spotify API
-SPOTIFY_CLIENT_ID=your_client_id
-SPOTIFY_CLIENT_SECRET=your_client_secret
-SPOTIFY_REDIRECT_URI=https://your-domain.com/callback
-
-# WordPress REST API
-WORDPRESS_URL=https://your-wordpress-site.com
-WORDPRESS_USERNAME=albumtracker
-WORDPRESS_APP_PASSWORD=your_app_password
-
-# Discord Bot
-DISCORD_BOT_TOKEN=your_bot_token
-DISCORD_USER_ID=your_user_id
-
-# Last.fm + SCF auto-fill (optional but recommended)
-LASTFM_API_KEY=your_lastfm_api_key
-# Set to "1" to auto-fill the same SCF `acf` block that Wordpress-PostToAlbum-Script writes.
-# When enabled, LASTFM_API_KEY becomes required.
-SPOTIFY_BLOG_TRACKER_FILL_SCF=1
+```bash
+PYTHONPATH=src python3 main.py
 ```
 
-## Discord Commands
+The tracker monitors playback, avoids duplicate posts, manages a saved-album queue, and sends Discord controls. Important commands are `/inprogress`, `/current`, `/random`, `/search`, and `/editor`.
 
-- `/inprogress` - Show currently tracked releases
-- `/current` - Show current playback status
-- `/random` - Pick a random unposted album from your saved Spotify library, with a re-roll button
-- `/service` - Show service status
-- `/search query:str` - Fuzzy search cached WordPress posts; pick one to open the persistent metadata editor in your DM
-- `/editor post_id:int` - Open the metadata editor against a known WordPress post ID
+Docker keeps the same service entry point and persistent `data/` and `logs/` volumes:
 
-## SCF Editor
+```bash
+docker compose up --build -d
+```
 
-Every Discord-published post can be edited through a persistent editor embed sent to your DM. The editor supports both pre-publish and post-publish modes:
+## Manual metadata CLI
 
-- **Pre-publish**: open from `/inprogress` → select a release → "Edit metadata". Edits land in the SQLite row and ride along with the publish flow (rating, favorite, notes, unreleased, per-track highlight).
-- **Post-publish**: open from the publish-confirmation embed's "Edit metadata" button. Edits PATCH the live WordPress `acf` block via `POST /wp/v2/posts/{id}`. After an auto-fill failure, "Retry metadata" re-runs only the SCF write and never creates another post.
+The CLI is dry-run-first:
 
-Bool fields (`favorite`, `unreleased`) flip inline with one click. Number and long-text fields open a single-field modal. Per-track highlights live in a paginated sub-view. There is also a "Re-sync from WP" button to re-read SCF after manual WP edits, and a "Body" modal that **pre-fills with the current WP body** (HTML stripped back to plain text) so iterative edits replace rather than overwrite from scratch.
+```bash
+python3 post_to_album.py stats
+python3 post_to_album.py fuzzy "Album title" "Artist"
+python3 post_to_album.py run                 # dry run to out/
+python3 post_to_album.py run --limit 10 --out-dir out
+python3 post_to_album.py apply-plan out/planned.json
+```
 
-## SCF Auto-Fill
+Review these files before applying a plan:
 
-When `SPOTIFY_BLOG_TRACKER_FILL_SCF=1`, every Discord-published release is backfilled with the same SCF `acf` block that the `Wordpress-PostToAlbum-Script` writes for the rest of the blog: `music_tracks`, `music_length_ms`, `spotify_album_id`, `spotify_album_url`, `music_release_date`, `music_listened_at`, `lastfm_release_id`, `music_total_tracks`, `music_avg_track_ms`, `music_explicit`, `music_mood_tags`, and `listen-count`. Spotify data is reused from the in-memory `Release`; mood tags and the MusicBrainz release ID come from one Last.fm `album.getinfo` call. Unset numeric values are omitted instead of being sent as invalid empty strings. After the write, the tracker re-reads and verifies `music_tracks`, `spotify_album_id`, and `listen-count`.
+- `planned.json`: validated WordPress updates
+- `unresolved.json`: releases requiring attention
+- `ignored.json`: safely skipped releases
+- `applied.json`: apply results
 
-The publish notification surfaces a `Listen count` field when the value is greater than one. Missing Last.fm tags produce a warning but do not invalidate the other metadata. A rejected or unverified SCF write produces an explicit failure warning and leaves the existing WordPress post available for the metadata-only retry action.
+`run --apply` remains available for compatibility but is deprecated. Use `apply-plan` for a reviewable, replay-safe workflow. The CLI accepts both `WORDPRESS_URL` and its legacy `WORDPRESS_BASE_URL` alias.
 
-### Troubleshooting SCF metadata
+## Metadata ownership
 
-- Check the service log for WordPress's REST error code, invalid parameter names/field paths, and submitted ACF field types. Response messages and submitted values are never logged.
-- Use **Retry metadata** on a failed publish notification within 24 hours, before the retained release data expires. This backfills generated fields on the existing post, preserves curated metadata and existing track highlights, and cannot create a duplicate.
-- Use **Edit metadata** for individual manual corrections.
-- A successful retry is followed by a live read-back verification; do not treat HTTP 200 alone as proof that SCF persisted the fields.
+The shared engine manages provider-derived SCF fields, categories, and custom taxonomies. Rating, favorite, notes, and track highlights remain editor-owned. The tracker uses the known Spotify release ID; the CLI discovers an identity from the WordPress title and artist tags, then both follow the same validation and enrichment path.
 
-## WordPress Setup
+Code is split into three parts:
 
-1. Enable WordPress REST API (enabled by default in WordPress 4.7+)
-2. Create an Application Password for the albumtracker user
-3. Optionally install the companion Album Art Picker plugin
+- `src/album_metadata/`: reusable schema, providers, matching, enrichment, and payloads
+- `src/tracker_metadata.py`: tracker adapter
+- `src/metadata_cli/`: manual CLI adapter
 
-## Architecture
+## Verification
 
-- **main.py**: Service orchestration
-- **src/config.py**: Configuration management
-- **src/database.py**: SQLite persistence
-- **src/spotify_client.py**: Spotify API integration
-- **src/tracker.py**: Playback monitoring logic
-- **src/publisher.py**: WordPress publishing + SCF auto-fill
-- **src/wordpress_client.py**: WordPress REST API client
-- **src/discord_bot.py**: Discord control interface
-- **src/lastfm_client.py**: Last.fm client used for SCF mood tags
-- **src/editor_view.py**: Persistent Discord editor (pre/post-publish SCF edits)
-- **src/models.py**: Data structures
-- **src/utils.py**: Classification utilities
-
-## Commands
-
-- `/inprogress`: View active releases
-- `/current`: Show current playback and manual publish
-- `/random`: Pick a random unposted saved-library album
-- `/service`: Service status
-- `/search query`: Fuzzy search cached WordPress posts; pick one to open the persistent metadata editor in your DM
-- `/editor post_id`: Open the metadata editor against a known WordPress post ID
-
-## Editor Flow
-
-The SCF editor is the recommended way to add ratings, notes, favorites, unreleased flags, and per-track highlights. Pre-publish edits are persisted to the local database and emitted as part of the SCF auto-fill payload when the release is published. Post-publish edits immediately PATCH the live `acf` block on WordPress; a re-fetch via "Re-sync from WP" reads the canonical values back from the post.
-
-## Troubleshooting: slash commands not appearing
-
-Slash commands are registered globally on every bot startup. Discord's UI caches the per-server command list, so even if the bot has 6 commands registered, your Discord client may show only the ones it cached from a previous bot startup. Symptoms:
-
-- Typing `/` shows a stale subset (often the four original commands).
-- Typing `/search` (or any newer command) as plain text does nothing — Discord only fires slash commands selected from its autocomplete UI.
-
-Fix: reload your Discord client (`Ctrl+R` / `Cmd+R`, or fully quit and reopen). On `on_ready` the service logs both the local command count and the count Discord returned from `tree.sync()`; if those numbers match, your Discord client just needs a refresh. Global command updates can also take up to ~1 hour to propagate across Discord after the PUT to `/applications/<id>/commands`, so repeated bot restarts within minutes can be ignored at Discord's side (daily command-write limit).
-
-## License
-
-CC BY-NC 4.0 license
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests
+python3 -m compileall -q main.py post_to_album.py src tests
+docker compose config
+```

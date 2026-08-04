@@ -237,9 +237,10 @@ def require_env(env: dict[str, str], *names: str) -> dict[str, str]:
 # --------------------------------------------------------------------------- #
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="post_to_album",
-                                 description="Verbose Python CLI to backfill SCF music metadata "
-                                             "from Spotify (album + tracks) and Last.fm (genre + mood).")
+    ap = argparse.ArgumentParser(
+        prog="post_to_album",
+        description="Review and backfill WordPress album metadata from Spotify and Last.fm.",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     base = argparse.ArgumentParser(add_help=False)
