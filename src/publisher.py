@@ -23,12 +23,7 @@ logger = logging.getLogger(__name__)
 
 POST_CACHE_TOTAL_KEY = "wordpress_post_cache.x_wp_total"
 POST_CACHE_FIRST_PAGE_HASH_KEY = "wordpress_post_cache.first_page_hash"
-SCF_VERIFY_FIELDS = ("music_tracks", "spotify_album_id", "listen-count")
-SCF_AUTO_FIELDS = (
-    "music_tracks", "music_length_ms", "spotify_album_id", "spotify_album_url",
-    "music_release_date", "music_listened_at", "lastfm_release_id", "music_total_tracks",
-    "music_avg_track_ms", "music_explicit", "music_mood_tags", "listen-count",
-)
+UNRELEASED_CATEGORY = "Unreleased"
 
 
 def format_discord_content_for_wordpress(raw_content: str) -> str:
@@ -87,9 +82,10 @@ class Publisher:
 
             # Determine categories
             category_ids = [self.category_cache[release.release_type.value]]
-            if as_relisten:
-                if "Relisten" in self.category_cache:
-                    category_ids.append(self.category_cache["Relisten"])
+            if as_relisten and "Relisten" in self.category_cache:
+                category_ids.append(self.category_cache["Relisten"])
+            if release.unreleased:
+                category_ids.append(self.category_cache[UNRELEASED_CATEGORY])
 
             # Create post
             post_data = {
@@ -103,9 +99,8 @@ class Publisher:
             if release.rating is not None or release.favorite or release.notes:
                 post_data["acf"] = TrackerMetadata.editor_acf(release)
 
-            # Count existing matching posts BEFORE create_post so the count
-            # does not double-count the about-to-be-created post.
-            listen_count = await self._count_listen_index(release) if self._fill_scf_enabled else 1
+            # The active metadata contract records one listen per post.
+            listen_count = 1
 
             post = await self.wordpress.create_post(post_data)
             logger.info(f"Post created: {post['id']} - {post['title']}")
@@ -170,47 +165,34 @@ class Publisher:
         logger.info("Updated SCF metadata for post %s: %s", post_id, sorted(partial_acf.keys()))
         return post
 
-    async def retry_post_scf(self, release: Release, post_id: int, listen_count: int) -> list[str]:
-        """Retry SCF metadata only; never create another WordPress post."""
-        post = await self.wordpress.get_post(post_id, context="edit", _fields="id,date,acf")
-        generated, fetch_status = await self._build_scf_payload(release, listen_count, post)
-        raw_acf = post.get("acf")
-        live_acf = raw_acf if isinstance(raw_acf, dict) else {}
-        identity_missing = live_acf.get("spotify_album_id") in (None, "")
-        acf_payload = {
-            field: generated[field]
-            for field in SCF_AUTO_FIELDS
-            if live_acf.get(field) in (None, "", [])
-            or (field == "music_explicit" and identity_missing)
-        }
-        if acf_payload:
-            await self._fill_post_scf(post_id, acf_payload)
-        mood_tags_missing = (
-            fetch_status.get("mood_tags") is None
-            and live_acf.get("music_mood_tags") in (None, "", [])
-        )
-        return ["mood_tags"] if mood_tags_missing else []
+    async def get_post_unreleased(self, post_id: int) -> bool:
+        await self._ensure_categories()
+        categories = await self.wordpress.get_post_categories(post_id)
+        return self.category_cache[UNRELEASED_CATEGORY] in categories
+
+    async def update_post_unreleased(self, post_id: int, unreleased: bool) -> Dict[str, Any]:
+        """Store the editor's unreleased flag as the active WordPress category."""
+        await self._ensure_categories()
+        category_id = self.category_cache[UNRELEASED_CATEGORY]
+        categories = await self.wordpress.get_post_categories(post_id)
+        updated = [value for value in categories if value != category_id]
+        if unreleased:
+            updated.append(category_id)
+        return await self.wordpress.update_post(post_id, {"categories": updated})
 
     async def _ensure_categories(self):
-        """Ensure required categories exist."""
-        required_categories = ["Album", "EP", "Single", "Compilation", "Relisten"]
-
-        for category_name in required_categories:
-            if category_name not in self.category_cache:
-                # Try to get existing
-                categories = await self.wordpress.get_categories()
-                found = False
-                for cat in categories:
-                    if cat["name"] == category_name:
-                        self.category_cache[category_name] = cat["id"]
-                        found = True
-                        break
-
-                # Create if not found
-                if not found:
-                    new_cat = await self.wordpress.create_category(category_name)
-                    self.category_cache[category_name] = new_cat["id"]
-                    logger.info(f"Created category: {category_name}")
+        """Resolve the categories used by publication and the editor."""
+        required = ("Album", "EP", "Single", "Compilation", "Relisten", UNRELEASED_CATEGORY)
+        if all(name in self.category_cache for name in required):
+            return
+        existing = {row["name"]: row["id"] for row in await self.wordpress.get_categories()}
+        for name in required:
+            if name in self.category_cache:
+                continue
+            if name not in existing:
+                existing[name] = (await self.wordpress.create_category(name))["id"]
+                logger.info("Created category: %s", name)
+            self.category_cache[name] = existing[name]
 
     async def _resolve_tags(self, artist_names: list) -> list:
         """Resolve or create artist tags."""
@@ -329,17 +311,3 @@ class Publisher:
             POST_CACHE_LAST_SYNCED_AT_KEY,
             datetime.now().isoformat(timespec="seconds"),
         )
-
-    async def _count_listen_index(self, release: Release) -> int:
-        """Return the listen-count to write to SCF (matches + 1 for the new post)."""
-        from utils import normalize_artist_list
-
-        title = release.normalized_title
-        artists = set(normalize_artist_list([a.name for a in release.artists]))
-        posts = await self.db.get_wordpress_posts()
-        matches = sum(
-            1 for post in posts
-            if post.normalized_title == title
-            and set(post.normalized_artists) == artists
-        )
-        return matches + 1

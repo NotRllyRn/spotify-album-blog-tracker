@@ -66,18 +66,22 @@ def state_from_release(release: Release) -> EditorState:
     )
 
 
-def state_from_acf(acf: Dict[str, Any]) -> EditorState:
+def state_from_acf(acf: Dict[str, Any], *, unreleased: bool = False) -> EditorState:
     tracks = acf.get("music_tracks")
     if isinstance(tracks, list):
         music_tracks = [dict(row) for row in tracks if isinstance(row, dict)]
     else:
         music_tracks = None
     rating = acf.get("music_rating")
+    try:
+        parsed_rating = int(rating) if isinstance(rating, (int, float)) else None
+    except (OverflowError, ValueError):
+        parsed_rating = None
     return EditorState(
-        rating=int(rating) if isinstance(rating, (int, float)) else None,
+        rating=parsed_rating,
         favorite=bool(acf.get("music_favorite", False)),
         notes=(acf.get("music_notes") or None) or None,
-        unreleased=bool(acf.get("unreleased", False)),
+        unreleased=unreleased,
         music_tracks=music_tracks,
     )
 
@@ -137,15 +141,21 @@ class PostPublishSink:
         self.state = state_from_acf(initial_acf) if initial_acf else EditorState()
 
     async def snapshot(self) -> EditorState:
-        # Always re-fetch from WP so the editor reads the live SCF state.
-        acf = await self.wordpress.get_post_acf(self.post_id)
-        self.state = state_from_acf(acf)
+        # Always re-fetch from WP so the editor reads the live state.
+        acf, unreleased = await asyncio.gather(
+            self.wordpress.get_post_acf(self.post_id),
+            self.publisher.get_post_unreleased(self.post_id),
+        )
+        self.state = state_from_acf(acf, unreleased=unreleased)
         return self.state
 
     async def update_field(self, name: str, value: Any) -> None:
-        scf_field = _project_field_to_scf(name)
-        scf_value = _coerce_field_for_scf(name, value)
-        await self.publisher.update_post_scf(self.post_id, {scf_field: scf_value})
+        if name == "unreleased":
+            await self.publisher.update_post_unreleased(self.post_id, bool(value))
+        else:
+            scf_field = _project_field_to_scf(name)
+            scf_value = _coerce_field_for_scf(name, value)
+            await self.publisher.update_post_scf(self.post_id, {scf_field: scf_value})
         setattr(self.state, name, value)
 
     async def update_track_highlight(self, spotify_id: str, on: bool) -> None:
@@ -165,7 +175,6 @@ _FIELD_TO_SCF = {
     "rating": "music_rating",
     "favorite": "music_favorite",
     "notes": "music_notes",
-    "unreleased": "unreleased",
 }
 
 
@@ -173,11 +182,18 @@ def _project_field_to_scf(name: str) -> str:
     return _FIELD_TO_SCF.get(name, name)
 
 
+def _safe_int(value: Any, default: Any) -> Any:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _coerce_field_for_scf(name: str, value: Any) -> Any:
     """Format a Release-style value into the SCF ``acf`` payload shape."""
     if name == "rating":
         # SCF number field accepts integer; represent unset as 0 is wrong; use "".
-        return int(value) if value is not None else ""
+        return _safe_int(value, "")
     if name == "notes":
         return value or ""
     return value
@@ -187,7 +203,7 @@ def _coerce_field_for_scf(name: str, value: Any) -> Any:
 
 BOOL_FIELDS = ("favorite", "unreleased")
 SCALAR_MODAL_FIELDS = ("rating", "notes")
-# listen-count, music_rating, music_notes, music_favorite, unreleased, body
+# Provider fields and body are intentionally outside scalar editor projection.
 TRACKS_OPEN_BUTTONS = {"editor:open:tracks"}
 
 
@@ -390,7 +406,7 @@ class EditorTracksView(discord.ui.View):
         next_button.callback = self._nav_next
         self.add_item(next_button)
 
-    def _make_track_callback(self, spotify_id: str) -> Callable[[discord.Interaction], Awaitable[None]]:
+    def _make_track_callback(self, spotify_id: str):
         async def _cb(interaction: discord.Interaction):
             try:
                 current = next((t for t in self.editor_view.tracks_for_editor() if t.spotify_id == spotify_id), None)
@@ -661,31 +677,23 @@ class EditorView(discord.ui.View):
         )
 
     async def _done(self, interaction: discord.Interaction):
-        try:
-            await interaction.message.delete()
-        except Exception:
+        message = interaction.message
+        if message is not None:
             try:
-                await interaction.response.edit_message(
-                    content="(editor closed)",
-                    embed=None,
-                    view=None,
-                )
+                await message.delete()
                 return
-            except Exception:
-                pass
+            except discord.HTTPException as error:
+                logger.debug("Could not delete editor message: %s", error)
+        try:
+            await interaction.response.edit_message(
+                content="(editor closed)",
+                embed=None,
+                view=None,
+            )
+        except discord.HTTPException as error:
+            logger.debug("Could not close editor message: %s", error)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Single-user authorization is enforced by the parent discord_bot before
-        # the view is registered; the guard here is a belt-and-suspenders for
-        # interactions after a bot restart.
-        if not getattr(self, "_authorized_user_id", None):
-            return True
-        if interaction.user.id != self._authorized_user_id:
-            await interaction.response.send_message(
-                "❌ You are not authorized to interact with this editor.",
-                ephemeral=True,
-            )
-            return False
         return True
 
     # --- Public API used by modals and track buttons ---------------------
@@ -730,9 +738,12 @@ class EditorView(discord.ui.View):
                 embed=self.build_editor_embed(),
                 view=self,
             )
-        except discord.InteractionResponded:
+        except discord.InteractionResponded as error:
+            message = interaction.message
+            if message is None:
+                raise RuntimeError("Editor interaction has no message") from error
             await interaction.followup.edit_message(
-                message_id=interaction.message.id,
+                message_id=message.id,
                 embed=self.build_editor_embed(),
                 view=self,
             )
@@ -754,11 +765,14 @@ class EditorView(discord.ui.View):
 
     def _rebuild_button_labels(self) -> None:
         for child in list(self.children):
-            cid = getattr(child, "custom_id", "") or ""
+            if not isinstance(child, discord.ui.Button):
+                continue
+            cid = child.custom_id or ""
             if cid.startswith(f"{CUSTOM_ID_PREFIX}:bool:"):
                 name = cid.split(":")[2]
                 child.label = self._bool_label(name)
-                child.style = discord.ButtonStyle.success if getattr(self.state, name) else discord.ButtonStyle.secondary
+                child.style = (discord.ButtonStyle.success if getattr(self.state, name)
+                               else discord.ButtonStyle.secondary)
             elif cid.startswith(f"{CUSTOM_ID_PREFIX}:modal:"):
                 name = cid.split(":")[2]
                 if name in ("rating", "notes"):
@@ -932,9 +946,9 @@ def _tracks_from_acf(music_tracks: Optional[List[Dict[str, Any]]]) -> List[Track
                 spotify_id=str(row.get("spotify_id") or row.get("id") or ""),
                 title=str(row.get("title") or "Unknown"),
                 normalized_title="",
-                duration_ms=int(row.get("duration_ms") or 0),
-                disc_number=int(row.get("disc_number") or 1),
-                track_number=int(row.get("track_number") or 1),
+                duration_ms=_safe_int(row.get("duration_ms"), 0),
+                disc_number=_safe_int(row.get("disc_number"), 1),
+                track_number=_safe_int(row.get("track_number"), 1),
                 is_countable=True,
                 listened=False,
                 highlight=bool(row.get("highlight")),

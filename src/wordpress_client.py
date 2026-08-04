@@ -216,6 +216,19 @@ class WordPressClient:
         content = (response.json().get("content") or {})
         return content.get("raw") or ""
 
+    async def get_post_categories(self, post_id: int) -> List[int]:
+        """Fetch live category IDs for category-backed editor fields."""
+        response = await self.client.get(
+            f"{self.api_url}/posts/{post_id}",
+            params={"context": "edit", "_fields": "categories"},
+        )
+        response.raise_for_status()
+        categories = response.json().get("categories") or []
+        if not isinstance(categories, list) or not all(
+                isinstance(category_id, int) for category_id in categories):
+            raise ValueError("Unexpected post categories response")
+        return categories
+
     async def delete_post(self, post_id: int, force: bool = False) -> Dict[str, Any]:
         """Delete a post (move to trash if force=False)."""
         url = f"{self.api_url}/posts/{post_id}"

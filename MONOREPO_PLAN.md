@@ -142,10 +142,10 @@ Extract in small, test-backed commits:
 
 Only implement items after core parity is green. Each item requires a focused test and separate commit when behavior changes.
 
-- [ ] Replace obsolete tracker `unreleased` ACF writes with the active Unreleased category marker while preserving the editor feature.
-- [ ] Resolve the current metadata `listen_count` conflict: the canonical CLI contract writes `1`, while the old tracker calculated a duplicate-post ordinal. Preserve canonical CLI behavior unless a later explicit contract changes it.
-- [ ] Improve only clearly duplicated or unsafe code discovered during extraction.
-- [ ] Record additional findings here before changing them.
+- [x] Replace obsolete tracker `unreleased` ACF writes with the active Unreleased category marker while preserving the editor feature.
+- [x] Resolve the current metadata `listen_count` conflict: the canonical CLI contract writes `1`, while the old tracker calculated a duplicate-post ordinal. Preserve canonical CLI behavior unless a later explicit contract changes it.
+- [x] Improve only clearly duplicated or unsafe code discovered during extraction.
+- [x] Record additional findings here before changing them.
 
 **Gate:** No ledger change is mixed into mechanical extraction commits.
 
@@ -207,9 +207,10 @@ Adjust boundaries when a smaller coherent commit is safer. Never push.
 
 | Status | Finding | Decision |
 | --- | --- | --- |
-| Planned | Tracker writes four fields removed by the active SCF schema and misses four replacements. | Remove duplicate payload builder and use the shared contract. |
-| Planned | Tracker does not write `artist`, `genre`, or `release_type` custom taxonomies. | Apply shared taxonomy intent through its async WordPress adapter. |
-| Planned | Tracker Last.fm lookup lacks the CLI’s identity and track validation. | Delete it after the tracker uses the shared Last.fm pipeline. |
-| Planned | Tracker and CLI currently materialize date-picker values differently. | Use shared REST materialization and test final request bodies. |
-| Planned | Tracker’s `unreleased` editor targets a deleted ACF field. | Preserve the feature through category marker 200, with tests. |
-| Planned | CLI `listen_count=1` and tracker’s ordinal calculation conflict. | Canonicalize to the current CLI contract for parity. |
+| Resolved | Tracker wrote four fields removed by the active SCF schema and missed four replacements. | Both interfaces now use the shared contract. |
+| Resolved | Tracker did not write `artist`, `genre`, or `release_type` custom taxonomies. | The async WordPress adapter applies shared taxonomy intent. |
+| Resolved | Tracker Last.fm lookup lacked the CLI’s identity and track validation. | Tracker publication now uses the shared Last.fm pipeline. |
+| Resolved | Tracker and CLI materialized date-picker values differently. | Both use shared REST materialization with final-body parity tests. |
+| Resolved | Tracker’s `unreleased` editor targeted a deleted ACF field. | The feature uses the Unreleased category marker with round-trip tests. |
+| Resolved | CLI `listen_count=1` and tracker’s ordinal calculation conflicted. | Both now write the canonical value `1`. |
+| Cleanup | The old async tracker Last.fm helper remains only for obsolete tests. | Remove the helper and its stale tests after the pre-cleanup checkpoint. |

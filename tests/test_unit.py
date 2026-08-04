@@ -2911,6 +2911,7 @@ class TestEditorStateProjection(unittest.TestCase):
         self.assertEqual(_project_field_to_scf("rating"), "music_rating")
         self.assertEqual(_project_field_to_scf("favorite"), "music_favorite")
         self.assertEqual(_project_field_to_scf("notes"), "music_notes")
+        # Category-backed and unknown names are not SCF aliases.
         self.assertEqual(_project_field_to_scf("unreleased"), "unreleased")
         # Unknown names pass through unchanged so future fields "just work".
         self.assertEqual(_project_field_to_scf("custom"), "custom")
@@ -2928,7 +2929,6 @@ class TestEditorStateProjection(unittest.TestCase):
             "music_rating": 73,
             "music_favorite": True,
             "music_notes": "Some notes",
-            "unreleased": False,
             "music_tracks": [
                 {"title": "Track A", "track_number": 1, "duration_ms": 1000,
                  "spotify_id": "sp1", "highlight": True, "disc_number": 1},
@@ -2937,11 +2937,11 @@ class TestEditorStateProjection(unittest.TestCase):
         state = EditorState(rating=0, favorite=False, notes=None, unreleased=False)
         # Recreate what open_post_publish_editor would do.
         from editor_view import state_from_acf
-        new_state = state_from_acf(acf)
+        new_state = state_from_acf(acf, unreleased=True)
         self.assertEqual(new_state.rating, 73)
         self.assertTrue(new_state.favorite)
         self.assertEqual(new_state.notes, "Some notes")
-        self.assertFalse(new_state.unreleased)
+        self.assertTrue(new_state.unreleased)
         self.assertEqual(new_state.music_tracks[0]["title"], "Track A")
         self.assertTrue(new_state.music_tracks[0]["highlight"])
 
@@ -3027,6 +3027,8 @@ class TestPostPublishSink(unittest.IsolatedAsyncioTestCase):
     def make_sink(self, initial_acf=None, wp_response=None):
         publisher = MagicMock()
         publisher.update_post_scf = AsyncMock(return_value=wp_response or {"id": 42})
+        publisher.get_post_unreleased = AsyncMock(return_value=False)
+        publisher.update_post_unreleased = AsyncMock(return_value=wp_response or {"id": 42})
         wp_client = MagicMock()
         wp_client.get_post_acf = AsyncMock(return_value=initial_acf or {})
         sink = PostPublishSink(
@@ -3038,12 +3040,14 @@ class TestPostPublishSink(unittest.IsolatedAsyncioTestCase):
     async def test_snapshot_re_reads_live_acf(self):
         sink, _, wp_client = self.make_sink(initial_acf={})
         wp_client.get_post_acf = AsyncMock(return_value={
-            "music_rating": 70, "music_favorite": True, "music_notes": "n", "unreleased": True,
+            "music_rating": 70, "music_favorite": True, "music_notes": "n",
         })
+        sink.publisher.get_post_unreleased = AsyncMock(return_value=True)
 
         state = await sink.snapshot()
 
         wp_client.get_post_acf.assert_awaited_once_with(42)
+        sink.publisher.get_post_unreleased.assert_awaited_once_with(42)
         self.assertEqual(state.rating, 70)
         self.assertTrue(state.favorite)
         self.assertEqual(state.notes, "n")
@@ -3064,6 +3068,15 @@ class TestPostPublishSink(unittest.IsolatedAsyncioTestCase):
         await sink.update_field("rating", None)
 
         publisher.update_post_scf.assert_awaited_once_with(42, {"music_rating": ""})
+
+    async def test_unreleased_updates_category_instead_of_scf(self):
+        sink, publisher, _ = self.make_sink(initial_acf={})
+
+        await sink.update_field("unreleased", True)
+
+        publisher.update_post_unreleased.assert_awaited_once_with(42, True)
+        publisher.update_post_scf.assert_not_awaited()
+        self.assertTrue(sink.state.unreleased)
 
     async def test_update_track_highlight_patches_repeater(self):
         acf = {"music_tracks": [
@@ -3295,8 +3308,9 @@ class TestEditorWiring(unittest.IsolatedAsyncioTestCase):
         publisher = MagicMock()
         publisher.wordpress = MagicMock()
         publisher.wordpress.get_post_acf = AsyncMock(return_value={
-            "music_rating": 70, "music_favorite": False, "music_notes": "n", "unreleased": False,
+            "music_rating": 70, "music_favorite": False, "music_notes": "n",
         })
+        publisher.get_post_unreleased = AsyncMock(return_value=False)
         self.publisher = publisher
         self.bot.tracker = MagicMock()
         self.bot.tracker.publisher = publisher

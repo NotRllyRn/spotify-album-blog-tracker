@@ -149,7 +149,7 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wordpress.body, expected)
 
     async def test_publisher_sends_shared_body_and_preserves_editor_values(self):
-        patch = await self.adapter.build_patch(self.release, self.post, [7], [5], 3)
+        patch = await self.adapter.build_patch(self.release, self.post, [7], [5], 1)
         self.release.rating = 91
         self.release.favorite = True
         self.release.notes = "Editorial notes"
@@ -176,7 +176,6 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
             editor_acf=TrackerMetadata.editor_acf,
         )
         publisher._fill_scf_enabled = True
-        publisher._count_listen_index = AsyncMock(return_value=3)
         publisher._ensure_categories = AsyncMock()
         publisher._upload_artwork = AsyncMock(return_value=None)
         publisher._resolve_tags = AsyncMock(return_value=[7])
@@ -191,7 +190,44 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
             "music_notes": "Editorial notes",
         })
         self.assertEqual(result.scf_pending_tags, [])
-        self.assertEqual(result.listen_count, 3)
+        self.assertEqual(result.listen_count, 1)
+
+    async def test_unreleased_publication_preserves_category_marker(self):
+        self.release.unreleased = True
+        created, updates = {}, []
+
+        async def build_patch(release, post, tag_ids, category_ids, listen_count):
+            self.assertEqual(category_ids, [5, 200])
+            self.assertEqual(listen_count, 1)
+            return {"write": {"categories": [200, 5], "taxonomies": {}}}
+
+        class WordPressFake:
+            async def create_post(_, data):
+                created.update(data)
+                return {**self.post, **data, "title": {"rendered": data["title"]}}
+
+            async def resolve_taxonomy_terms(_, wanted):
+                return term_ids()
+
+            async def update_post(_, post_id, body):
+                updates.append(body)
+                return {"id": post_id}
+
+        publisher: Any = Publisher.__new__(Publisher)
+        publisher.wordpress = WordPressFake()
+        publisher.db = AsyncMock()
+        publisher.category_cache = {"Single": 5, "Unreleased": 200}
+        publisher.metadata = SimpleNamespace(build_patch=build_patch)
+        publisher._fill_scf_enabled = True
+        publisher._ensure_categories = AsyncMock()
+        publisher._upload_artwork = AsyncMock(return_value=None)
+        publisher._resolve_tags = AsyncMock(return_value=[7])
+        publisher.refresh_post_cache = AsyncMock()
+
+        await publisher.publish_release(self.release)
+
+        self.assertEqual(created["categories"], [5, 200])
+        self.assertEqual(updates, [{"categories": [200, 5]}])
 
     async def test_publisher_surfaces_metadata_failure_without_losing_post(self):
         class WordPressFake:
@@ -205,7 +241,6 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         publisher.metadata = SimpleNamespace(
             build_patch=AsyncMock(side_effect=RuntimeError("provider down")))
         publisher._fill_scf_enabled = True
-        publisher._count_listen_index = AsyncMock(return_value=1)
         publisher._ensure_categories = AsyncMock()
         publisher._upload_artwork = AsyncMock(return_value=None)
         publisher._resolve_tags = AsyncMock(return_value=[7])
@@ -216,15 +251,35 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.post["id"], 42)
         self.assertEqual(result.scf_pending_tags, ["metadata_error"])
 
-    async def test_listen_count_counts_matching_title_and_artist(self):
+    async def test_unreleased_editor_reads_and_updates_category(self):
+        class WordPressFake:
+            def __init__(self):
+                self.categories = [5, 200]
+                self.updated = None
+
+            async def get_categories(self):
+                return [{"id": 5, "name": "Single"}, {"id": 200, "name": "Unreleased"}]
+
+            async def create_category(self, name):
+                return {"id": 300 + len(name), "name": name}
+
+            async def get_post_categories(self, post_id):
+                return list(self.categories)
+
+            async def update_post(self, post_id, body):
+                self.updated = body
+                return {"id": post_id, **body}
+
         publisher: Any = Publisher.__new__(Publisher)
-        publisher.db = SimpleNamespace(get_wordpress_posts=AsyncMock(return_value=[
-            WordPressPost(1, "Élan", "élan", ["The Artist"], ["the artist"], "one"),
-            WordPressPost(2, "Other", "other", ["The Artist"], ["the artist"], "two"),
-        ]))
+        publisher.wordpress = WordPressFake()
+        publisher.category_cache = {
+            "Album": 6, "EP": 7, "Single": 5, "Compilation": 98,
+            "Relisten": 99, "Unreleased": 200,
+        }
 
-        self.assertEqual(await publisher._count_listen_index(self.release), 2)
-
+        self.assertTrue(await publisher.get_post_unreleased(42))
+        await publisher.update_post_unreleased(42, False)
+        self.assertEqual(publisher.wordpress.updated, {"categories": [5]})
 
 class WordPressTaxonomyTests(unittest.IsolatedAsyncioTestCase):
     async def test_resolves_existing_and_new_terms_before_update(self):
