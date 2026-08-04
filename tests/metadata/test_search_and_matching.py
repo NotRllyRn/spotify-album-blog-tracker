@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import post_to_album as mod
 spotify_mod = importlib.import_module("album_metadata.spotify")
+lastfm_mod = importlib.import_module("album_metadata.lastfm")
 
 
 SPOTIFY = {"name": "Blue - Remastered", "artists": [{"name": "Beyoncé"}]}
@@ -134,7 +135,7 @@ class SearchAndMatchingTests(unittest.TestCase):
               "artist_score": mod.LASTFM_MIN_ARTIST, "candidate": lastfm_candidate}),
         ]
         for chooser, candidates, scorer, boundary in cases:
-            target = spotify_mod if scorer.startswith("spotify") else mod
+            target = spotify_mod if scorer.startswith("spotify") else lastfm_mod
             with self.subTest(scorer=scorer), patch.object(target, scorer, return_value=boundary):
                 if chooser is mod.choose_spotify_candidate:
                     result = chooser(candidates, "not exact", ["artist"])
@@ -159,7 +160,7 @@ class SearchAndMatchingTests(unittest.TestCase):
                                             "score": "SCORE"}[field])
             row = {**base, field: threshold - .001}
             chooser: Any = chooser_value
-            target = spotify_mod if scorer.startswith("spotify") else mod
+            target = spotify_mod if scorer.startswith("spotify") else lastfm_mod
             with self.subTest(scorer=scorer, field=field), patch.object(target, scorer, return_value=row):
                 result = (chooser([base["candidate"]], "not exact", ["artist"])
                           if scorer.startswith("spotify") else chooser(SPOTIFY, [base["candidate"]]))
@@ -823,7 +824,7 @@ class SearchAndMatchingTests(unittest.TestCase):
         candidates = [{"name": "a"}, {"name": "b"}]
         for gap, reason in ((mod.LASTFM_MAX_TIE_GAP - .001, "lastfm_ambiguous"),
                             (mod.LASTFM_MAX_TIE_GAP, "lastfm_fuzzy")):
-            with self.subTest(gap=gap), patch.object(mod, "lastfm_candidate_score", side_effect=[
+            with self.subTest(gap=gap), patch.object(lastfm_mod, "lastfm_candidate_score", side_effect=[
                 {"score": .90, "title_score": .9, "artist_score": .9, "candidate": candidates[0]},
                 {"score": .90 - gap, "title_score": .9, "artist_score": .9,
                  "candidate": candidates[1]},
@@ -937,12 +938,10 @@ class SearchAndMatchingTests(unittest.TestCase):
         self.assertEqual(mod._track_overlap(["Song", "Song"], ["Song", "Other"]), 0.5)
         for score, expected in ((mod.LASTFM_MIN_TRACK_SIMILARITY, 1.0),
                                 (mod.LASTFM_MIN_TRACK_SIMILARITY - .001, 0.0)):
-            with self.subTest(score=score), patch.object(
-                    mod, "_track_similarity", return_value=score):
+            with self.subTest(score=score), patch.object(lastfm_mod, "_track_similarity", return_value=score):
                 self.assertEqual(mod._track_overlap(["a"], ["b"]), expected)
         edges = {("a", "x"), ("a", "y"), ("b", "x")}
-        with patch.object(mod, "_track_similarity",
-                          side_effect=lambda a, b: float((a, b) in edges)):
+        with patch.object(lastfm_mod, "_track_similarity", side_effect=lambda a, b: float((a, b) in edges)):
             self.assertEqual(mod._track_overlap(["a", "b"], ["x", "y"]), 1.0)
 
     def test_track_provider_labels_and_placeholders_are_non_contradictory(self):
@@ -1013,12 +1012,11 @@ class SearchAndMatchingTests(unittest.TestCase):
     def test_track_match_count_is_duplicate_aware_at_boundary(self):
         self.assertEqual(mod._track_match_count(["Song", "Song"], ["Song", "Other"]), 1)
         edges = {("a", "x"), ("a", "y"), ("b", "x")}
-        with patch.object(mod, "_track_similarity",
-                          side_effect=lambda a, b: float((a, b) in edges)):
+        with patch.object(lastfm_mod, "_track_similarity", side_effect=lambda a, b: float((a, b) in edges)):
             self.assertEqual(mod._track_match_count(["a", "b"], ["x", "y"]), 2)
         for score, expected in ((mod.LASTFM_MIN_TRACK_SIMILARITY, 1),
                                 (mod.LASTFM_MIN_TRACK_SIMILARITY - .001, 0)):
-            with patch.object(mod, "_track_similarity", return_value=score):
+            with patch.object(lastfm_mod, "_track_similarity", return_value=score):
                 self.assertEqual(mod._track_match_count(["a"], ["b"]), expected)
 
     def test_lastfm_recovery_uses_full_spotify_coverage_and_exact_title(self):
