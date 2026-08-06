@@ -69,11 +69,8 @@ class WordPressClient:
 
         self.client = httpx.AsyncClient(
             auth=httpx.BasicAuth(self.username, self.app_password),
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            timeout=30.0
+            headers={"Accept": "application/json"},
+            timeout=30.0,
         )
         self._cached_tags: Optional[List[Dict[str, Any]]] = None
         self._cached_tags_x_wp_total: Optional[str] = None
@@ -468,17 +465,14 @@ class WordPressClient:
         except OSError as exc:
             raise RuntimeError(f"Could not open media file: {file_path.name}") from exc
         with file_handle as f:
-            files = {"file": (file_path.name, f, "image/jpeg")}
-            data = {"alt_text": alt_text} if alt_text else {}
-
-            # Remove content-type header for file upload
-            headers = self.client.headers.copy()
-            headers.pop("Content-Type", None)
-
-            async with httpx.AsyncClient(headers=headers, timeout=60.0) as upload_client:
-                response = await upload_client.post(url, files=files, data=data)
-                response.raise_for_status()
-                return response.json()
+            response = await self.client.post(
+                url,
+                files={"file": (file_path.name, f, "image/jpeg")},
+                data={"alt_text": alt_text} if alt_text else {},
+                timeout=60.0,
+            )
+            response.raise_for_status()
+            return response.json()
 
     async def update_media(self, media_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
         """Update media metadata."""

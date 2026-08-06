@@ -10,7 +10,7 @@ import logging
 import tempfile
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import sys
 from pathlib import Path
@@ -2667,6 +2667,45 @@ class TestGetPostAcf(unittest.IsolatedAsyncioTestCase):
         ))
         acf = await client.get_post_acf(1)
         self.assertEqual(acf, {})
+
+
+@unittest.skipIf(httpx is None, "httpx is not installed")
+class TestWordPressMediaUpload(unittest.IsolatedAsyncioTestCase):
+    async def test_upload_uses_authenticated_client_with_multipart_content_type(self):
+        from wordpress_client import WordPressClient
+
+        config = type("Config", (), {
+            "wordpress_url": "https://example.com",
+            "wordpress_username": "albumtracker",
+            "wordpress_app_password": "app-password",
+        })()
+        client = WordPressClient(config)
+        request_seen = None
+
+        def handler(request):
+            nonlocal request_seen
+            request_seen = request
+            return httpx.Response(201, request=request, json={"id": 42})
+
+        await client.client._transport.aclose()
+        client.client._transport = httpx.MockTransport(handler)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                artwork = Path(directory) / "cover.jpg"
+                artwork.write_bytes(b"image-data")
+                with patch(
+                    "wordpress_client.httpx.AsyncClient",
+                    side_effect=AssertionError("upload created an unauthenticated client"),
+                ):
+                    result = await client.upload_media(artwork, "Album artwork")
+        finally:
+            await client.close()
+
+        self.assertEqual(result, {"id": 42})
+        self.assertTrue(request_seen.headers["authorization"].startswith("Basic "))
+        self.assertTrue(request_seen.headers["content-type"].startswith("multipart/form-data;"))
+        self.assertIn(b"Album artwork", request_seen.content)
+        self.assertIn(b"cover.jpg", request_seen.content)
 
 
 @unittest.skipIf(httpx is None, "httpx is not installed")
