@@ -203,6 +203,9 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(result.scf_pending_tags, [])
         self.assertEqual(result.listen_count, 1)
+        self.assertEqual(result.quick_metadata.genres, ["Rock", "Pop"])
+        self.assertEqual(result.quick_metadata.artists, ["The Artist"])
+        self.assertEqual(result.quick_metadata.total_tracks, 2)
 
     async def test_retry_fills_missing_metadata_without_overwriting_live_values(self):
         live_acf = {"spotify_title": "Keep this title"}
@@ -233,6 +236,33 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("spotify_title", submitted["acf"])
         self.assertEqual(live_acf["spotify_title"], "Keep this title")
         self.assertEqual(live_acf["spotify_album_id"], "album-id")
+
+    async def test_reads_quick_metadata_from_live_post(self):
+        publisher: Any = Publisher.__new__(Publisher)
+        publisher.wordpress = SimpleNamespace(
+            get_post=AsyncMock(return_value={
+                "acf": {
+                    "music_release_date": "20240315",
+                    "music_total_tracks": 10,
+                    "music_length_ms": 3_900_000,
+                    "music_explicit": True,
+                },
+                "artist": [10, 11], "genre": [20], "release_type": [30],
+            }),
+            get_taxonomy_names=AsyncMock(side_effect=lambda taxonomy, ids: {
+                "artist": ["Artist", "Guest"],
+                "genre": ["Rock"],
+                "release_type": ["Album"],
+            }[taxonomy]),
+        )
+
+        quick = await publisher.get_post_quick_metadata(42)
+
+        self.assertEqual(quick.artists, ["Artist", "Guest"])
+        self.assertEqual(quick.genres, ["Rock"])
+        self.assertEqual(quick.release_type, "Album")
+        self.assertEqual(quick.duration_ms, 3_900_000)
+        self.assertTrue(quick.explicit)
 
     async def test_metadata_verification_rejects_silently_dropped_fields(self):
         patch = await self.adapter.build_patch(self.release, self.post, [7], [5], 1)
@@ -341,6 +371,17 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(publisher.wordpress.updated, {"categories": [5]})
 
 class WordPressTaxonomyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_returns_taxonomy_names_in_post_order(self):
+        wordpress: Any = WordPressClient.__new__(WordPressClient)
+        wordpress._get_taxonomy_terms = AsyncMock(return_value=[
+            {"id": 10, "name": "Artist One"},
+            {"id": 11, "name": "Artist Two"},
+        ])
+
+        names = await wordpress.get_taxonomy_names("artist", [11, 10, 99])
+
+        self.assertEqual(names, ["Artist Two", "Artist One"])
+
     async def test_resolves_existing_and_new_terms_before_update(self):
         class Response:
             headers = {"X-WP-TotalPages": "1"}

@@ -15,7 +15,7 @@ from config import Config
 from database import Database
 from album_metadata.plans import materialize_body
 from wordpress_client import WordPressClient
-from models import PublishResult, Release
+from models import PublishResult, QuickMetadata, Release
 from tracker_metadata_adapter import TrackerMetadataAdapter  # pyright: ignore[reportMissingImports]
 from search import LAST_SYNCED_AT_KEY as POST_CACHE_LAST_SYNCED_AT_KEY
 
@@ -25,6 +25,17 @@ POST_CACHE_TOTAL_KEY = "wordpress_post_cache.x_wp_total"
 POST_CACHE_FIRST_PAGE_HASH_KEY = "wordpress_post_cache.first_page_hash"
 UNRELEASED_CATEGORY = "Unreleased"
 METADATA_VERIFY_FIELDS = ("spotify_album_id", "music_tracks", "listen_count")
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _int_list(value: Any) -> list[int]:
+    return [item for item in value if type(item) is int] if isinstance(value, list) else []
 
 
 def format_discord_content_for_wordpress(raw_content: str) -> str:
@@ -111,10 +122,13 @@ class Publisher:
             release.published_at = None  # Will be set by tracker
 
             scf_pending_tags: list[str] = []
+            quick_metadata = QuickMetadata.from_release(release)
             if self.metadata is not None:
                 try:
-                    await self._apply_shared_metadata(
+                    patch = await self._apply_shared_metadata(
                         release, post, tag_ids, category_ids, listen_count)
+                    quick_metadata.genres = list(
+                        patch["write"].get("taxonomies", {}).get("genre", []))
                 except Exception as metadata_error:
                     logger.error(
                         "Metadata auto-fill failed for post %s: %s",
@@ -131,6 +145,7 @@ class Publisher:
                 scf_pending_tags=scf_pending_tags,
                 listen_count=listen_count,
                 scf_attempted=self._fill_scf_enabled,
+                quick_metadata=quick_metadata,
             )
 
         except Exception as e:
@@ -144,7 +159,7 @@ class Publisher:
         tag_ids: list[int],
         category_ids: list[int],
         listen_count: int,
-    ) -> None:
+    ) -> Dict[str, Any]:
         if self.metadata is None:
             raise RuntimeError("Metadata enrichment is disabled")
         patch = await self.metadata.build_patch(
@@ -163,6 +178,31 @@ class Publisher:
                 raise RuntimeError(
                     "Metadata verification failed for fields: " + ", ".join(mismatches))
         logger.info("Filled and verified shared metadata for post %s", post["id"])
+        return patch
+
+    async def get_post_quick_metadata(self, post_id: int) -> QuickMetadata:
+        post = await self.wordpress.get_post(
+            post_id, context="edit", _fields="acf,artist,genre,release_type")
+        raw_acf = post.get("acf")
+        acf: Dict[str, Any] = raw_acf if isinstance(raw_acf, dict) else {}
+        artist_ids = _int_list(post.get("artist"))
+        genre_ids = _int_list(post.get("genre"))
+        release_type_ids = _int_list(post.get("release_type"))
+        term_names = {
+            "artist": await self.wordpress.get_taxonomy_names("artist", artist_ids),
+            "genre": await self.wordpress.get_taxonomy_names("genre", genre_ids),
+            "release_type": await self.wordpress.get_taxonomy_names(
+                "release_type", release_type_ids),
+        }
+        return QuickMetadata(
+            artists=term_names["artist"],
+            genres=term_names["genre"],
+            release_type=(term_names["release_type"] or ["—"])[0],
+            release_date=str(acf.get("music_release_date") or "—"),
+            total_tracks=_safe_int(acf.get("music_total_tracks")),
+            duration_ms=_safe_int(acf.get("music_length_ms")),
+            explicit=bool(acf.get("music_explicit")),
+        )
 
     async def retry_post_metadata(
         self, release: Release, post_id: int, listen_count: int = 1

@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, run
 
 import discord
 
-from models import Release, Track
+from models import QuickMetadata, Release, Track
 
 if TYPE_CHECKING:
     from database import Database
@@ -207,7 +207,35 @@ SCALAR_MODAL_FIELDS = ("rating", "notes")
 TRACKS_OPEN_BUTTONS = {"editor:open:tracks"}
 
 
-def build_editor_embed(release_title: str, state: EditorState, *, mode: str) -> discord.Embed:
+def add_quick_metadata_fields(
+    embed: discord.Embed, metadata: Optional[QuickMetadata]
+) -> None:
+    if metadata is None:
+        return
+    minutes = metadata.duration_ms // 60_000
+    duration = f"{minutes // 60}h {minutes % 60}m" if minutes >= 60 else f"{minutes}m"
+    date = metadata.release_date
+    if len(date) == 8 and date.isdigit():
+        date = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+    details = " · ".join(filter(None, (
+        metadata.release_type,
+        date,
+        f"{metadata.total_tracks} tracks",
+        duration,
+        "Explicit" if metadata.explicit else "Clean",
+    )))
+    embed.add_field(name="Artists", value=", ".join(metadata.artists) or "—", inline=False)
+    embed.add_field(name="Genres", value=", ".join(metadata.genres) or "—", inline=False)
+    embed.add_field(name="Release details", value=details or "—", inline=False)
+
+
+def build_editor_embed(
+    release_title: str,
+    state: EditorState,
+    *,
+    mode: str,
+    quick_metadata: Optional[QuickMetadata] = None,
+) -> discord.Embed:
     embed = discord.Embed(
         title=f"{'Pre-publish' if mode == 'pre-publish' else 'Post-publish'} editor",
         description=f"Editing: {release_title}",
@@ -230,6 +258,7 @@ def build_editor_embed(release_title: str, state: EditorState, *, mode: str) -> 
             value=f"{highlighted}/{len(state.music_tracks)}",
             inline=True,
         )
+    add_quick_metadata_fields(embed, quick_metadata)
     embed.set_footer(text=f"Mode: {mode}")
     return embed
 
@@ -458,10 +487,12 @@ class EditorView(discord.ui.View):
         sink: EditorSink,
         release_title: str,
         tracks_for_editor: Callable[[], List[Track]],
+        quick_metadata: Optional[QuickMetadata] = None,
     ):
         super().__init__(timeout=None)
         self.sink = sink
         self.release_title = release_title
+        self.quick_metadata = quick_metadata
         self._tracks_for_editor = tracks_for_editor
         # NB: ``state`` is a @property below that always reads ``self.sink.state``; the
         # manual assignment here is intentionally a no-op so callers that pass the old
@@ -699,7 +730,12 @@ class EditorView(discord.ui.View):
     # --- Public API used by modals and track buttons ---------------------
 
     def build_editor_embed(self) -> discord.Embed:
-        return build_editor_embed(self.release_title, self.state, mode=self.sink.mode)
+        return build_editor_embed(
+            self.release_title,
+            self.state,
+            mode=self.sink.mode,
+            quick_metadata=self.quick_metadata,
+        )
 
     def build_tracks_embed(self, page: int) -> discord.Embed:
         tracks = self.tracks_for_editor()
@@ -749,6 +785,7 @@ class EditorView(discord.ui.View):
             )
 
     async def _apply_track_toggle(self, interaction: discord.Interaction, track: Track, page: int):
+        await interaction.response.defer()
         new_value = not bool(track.highlight)
         await self.sink.update_track_highlight(track.spotify_id, new_value)
         # Re-fetch release to keep in-memory truth aligned for the next click.
@@ -758,7 +795,7 @@ class EditorView(discord.ui.View):
                 t.highlight = new_value
                 break
         new_view = EditorTracksView(self, page=page)
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             embed=self.build_tracks_embed(page=page),
             view=new_view,
         )
@@ -896,6 +933,7 @@ async def open_pre_publish_editor(
         sink=sink,
         release_title=release.title,
         tracks_for_editor=tracks_provider,
+        quick_metadata=QuickMetadata.from_release(release),
     )
     if on_open is not None:
         await on_open(view, view.build_editor_embed())
@@ -919,6 +957,11 @@ async def open_post_publish_editor(
         initial_acf=initial_acf,
     )
     await sink.snapshot()
+    try:
+        quick_metadata = await publisher.get_post_quick_metadata(post_id)
+    except Exception as error:
+        logger.warning("Could not load quick metadata for post %s: %s", post_id, error)
+        quick_metadata = None
 
     def tracks_provider() -> List[Track]:
         # For post-publish, the authoritative highlight state is the acf block,
@@ -929,6 +972,7 @@ async def open_post_publish_editor(
         sink=sink,
         release_title=release_title,
         tracks_for_editor=tracks_provider,
+        quick_metadata=quick_metadata,
     )
     if on_open is not None:
         await on_open(view, view.build_editor_embed())

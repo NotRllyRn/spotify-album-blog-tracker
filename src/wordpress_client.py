@@ -265,6 +265,15 @@ class WordPressClient:
                     resolved[taxonomy][key] = term["id"]
         return resolved
 
+    async def get_taxonomy_names(
+        self, taxonomy: str, term_ids: List[int]
+    ) -> List[str]:
+        """Return term names in the post's stored order."""
+        if taxonomy not in TAXONOMIES:
+            raise ValueError(f"Unknown taxonomy: {taxonomy}")
+        names = {row["id"]: row["name"] for row in await self._get_taxonomy_terms(taxonomy)}
+        return [names[term_id] for term_id in term_ids if term_id in names]
+
     async def _get_taxonomy_terms(self, taxonomy: str) -> List[Dict[str, Any]]:
         rows = []
         page = 1

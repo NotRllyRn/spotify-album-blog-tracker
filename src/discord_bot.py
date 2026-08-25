@@ -15,9 +15,12 @@ from urllib.parse import urlparse, urlunparse
 from config import Config
 from database import Database
 from tracker import Tracker
-from models import PublishResult, Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost, SavedLibraryAlbum
+from models import PublishResult, QuickMetadata, Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost, SavedLibraryAlbum
 from inprogress import INPROGRESS_PAGE_SIZE, InProgressPage, build_inprogress_page, get_next_unlistened_track
-from editor_view import EditorView, open_pre_publish_editor, open_post_publish_editor
+from editor_view import (
+    EditorView, add_quick_metadata_fields, open_pre_publish_editor,
+    open_post_publish_editor,
+)
 from search import (
     FUZZY_BASE_THRESHOLD,
     FUZZY_LOOSE_THRESHOLD,
@@ -621,6 +624,9 @@ class DiscordBot:
 
         if release.is_relisten and release.duplicate_post_id:
             embed.add_field(name="Relisten", value=f"Original post ID: {release.duplicate_post_id}", inline=False)
+
+        add_quick_metadata_fields(
+            embed, result.quick_metadata or QuickMetadata.from_release(release))
 
         if result.listen_count > 1:
             embed.add_field(name="Listen count", value=str(result.listen_count), inline=True)

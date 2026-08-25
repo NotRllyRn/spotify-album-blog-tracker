@@ -156,8 +156,35 @@ class DiscordPrompt:
 
 
 @dataclass
+class QuickMetadata:
+    artists: List[str]
+    genres: List[str]
+    release_type: str
+    release_date: str
+    total_tracks: int
+    duration_ms: int
+    explicit: bool
+
+    @classmethod
+    def from_release(
+        cls, release: Release, genres: Optional[List[str]] = None
+    ) -> "QuickMetadata":
+        tracks = [track for track in release.tracks if track.is_countable]
+        return cls(
+            artists=[artist.name for artist in release.artists],
+            genres=list(genres or []),
+            release_type=release.release_type.value,
+            release_date=release.release_date,
+            total_tracks=len(tracks),
+            duration_ms=sum(track.duration_ms for track in tracks),
+            explicit=any(track.explicit for track in tracks),
+        )
+
+
+@dataclass
 class PublishResult:
     post: Dict[str, Any]
     scf_pending_tags: List[str]
     listen_count: int
     scf_attempted: bool = True
+    quick_metadata: Optional[QuickMetadata] = None

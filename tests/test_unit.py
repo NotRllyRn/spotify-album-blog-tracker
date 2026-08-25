@@ -38,6 +38,7 @@ from models import (
     SavedLibraryStats,
     DiscordPrompt,
     PublishResult,
+    QuickMetadata,
     PromptState,
     PromptType,
 )
@@ -2380,6 +2381,34 @@ class TestPublishNotificationEmbed(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Listen count", field_names)
         self.assertNotIn("⚠️ Metadata", field_names)
 
+    async def test_quick_metadata_matches_editor_embed(self):
+        quick = QuickMetadata(
+            artists=["Artist", "Guest"], genres=["Rock", "Pop"],
+            release_type="Album", release_date="20240315", total_tracks=10,
+            duration_ms=3_900_000, explicit=True,
+        )
+        result = PublishResult(
+            post=self.make_post(), scf_pending_tags=[], listen_count=1,
+            quick_metadata=quick,
+        )
+
+        await self.bot.send_publish_notification(self.make_release(), result)
+
+        confirmation = {field.name: field.value for field in self.extract_embed().fields}
+        editor = build_editor_embed(
+            "Album Embed", EditorState(), mode="post-publish",
+            quick_metadata=quick,
+        )
+        editor_fields = {field.name: field.value for field in editor.fields}
+        for name in ("Artists", "Genres", "Release details"):
+            self.assertEqual(confirmation[name], editor_fields[name])
+        self.assertEqual(confirmation["Artists"], "Artist, Guest")
+        self.assertEqual(confirmation["Genres"], "Rock, Pop")
+        self.assertEqual(
+            confirmation["Release details"],
+            "Album · 2024-03-15 · 10 tracks · 1h 5m · Explicit",
+        )
+
     async def test_surfaces_metadata_error_message_and_field(self):
         result = PublishResult(post=self.make_post(), scf_pending_tags=["metadata_error"], listen_count=1)
 
@@ -2784,6 +2813,11 @@ class TestEditorWiring(unittest.IsolatedAsyncioTestCase):
             "music_rating": 70, "music_favorite": False, "music_notes": "n",
         })
         publisher.get_post_unreleased = AsyncMock(return_value=False)
+        publisher.get_post_quick_metadata = AsyncMock(return_value=QuickMetadata(
+            artists=["Artist"], genres=["Rock"], release_type="Album",
+            release_date="2024-01-01", total_tracks=1,
+            duration_ms=300_000, explicit=False,
+        ))
         self.publisher = publisher
         self.bot.tracker = MagicMock()
         self.bot.tracker.publisher = publisher
@@ -2859,6 +2893,10 @@ class TestEditorWiring(unittest.IsolatedAsyncioTestCase):
         kwargs = self.bot._send_dm.await_args.kwargs
         self.assertIn("Post-publish editor", kwargs["content"])
         self.assertIsNotNone(kwargs["view"])
+        fields = {field.name: field.value for field in kwargs["embed"].fields}
+        self.assertEqual(fields["Artists"], "Artist")
+        self.assertEqual(fields["Genres"], "Rock")
+        self.assertIn("Album", fields["Release details"])
 
     async def test_post_publish_editor_rejects_missing_post_id(self):
         prompt = DiscordPrompt(
@@ -3040,6 +3078,7 @@ class TestEditorViewRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
                 "followup": followup,
                 "message": type("FakeMessage", (), {"id": "m1"})(),
                 "user": type("FakeUser", (), {"id": 123})(),
+                "edit_original_response": AsyncMock(),
             },
         )()
 
@@ -3260,7 +3299,10 @@ class TestEditorTracksRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
         toggle = self.make_interaction()
         await first_buttons["editor:track:t1:0"].callback(toggle)
         self.assertTrue(release.tracks[0].highlight)
-        toggle.response.edit_message.assert_awaited_once()
+        toggle.response.defer.assert_awaited_once()
+        toggle.edit_original_response.assert_awaited_once()
+        toggled_embed = toggle.edit_original_response.await_args.kwargs["embed"]
+        self.assertEqual(toggled_embed.fields[0].value.split()[0], "⭐")
 
         next_page = self.make_interaction()
         await first_buttons["editor:nav:tracks_next:0"].callback(next_page)
