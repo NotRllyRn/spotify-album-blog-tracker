@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 import discord
 import httpx
 import main
+from config import Config
 from discord_bot import DiscordBot, ReleaseActionView
 from models import DiscordPrompt, LifecycleStatus, PromptState, PromptType
 from tests.test_unit import make_release_for_test
@@ -221,6 +222,22 @@ class DiscordReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         response = interaction.followup.send.await_args.args[0]
         self.assertNotIn(secret, response)
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_wordpress_url_is_required_instead_of_using_private_default(self):
+        environment = {
+            "SPOTIFY_CLIENT_ID": "id",
+            "SPOTIFY_CLIENT_SECRET": "secret",
+            "WORDPRESS_USERNAME": "user",
+            "WORDPRESS_APP_PASSWORD": "password",
+            "DISCORD_BOT_TOKEN": "token",
+            "DISCORD_USER_ID": "1",
+            "SPOTIFY_BLOG_TRACKER_FILL_SCF": "0",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "WORDPRESS_URL"):
+                Config()
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ class Config:
         self.spotify_refresh_token = os.getenv("SPOTIFY_REFRESH_TOKEN")
 
         # WordPress
-        self.wordpress_url = os.getenv("WORDPRESS_URL", "http://10.17.3.3:8085")
+        self.wordpress_url = os.getenv("WORDPRESS_URL")
         self.wordpress_public_url = os.getenv("WORDPRESS_PUBLIC_URL", "https://musicblog.callita.day")  # Used for links in posts
         self.wordpress_username = os.getenv("WORDPRESS_USERNAME")
         self.wordpress_app_password = os.getenv("WORDPRESS_APP_PASSWORD")
