@@ -3,6 +3,8 @@ Main tracking service.
 """
 
 import asyncio
+import aiosqlite
+import httpx
 import json
 import logging
 from datetime import datetime, timedelta
@@ -10,7 +12,7 @@ from typing import Optional, Dict, Any, TYPE_CHECKING
 
 from config import Config
 from database import Database
-from spotify_client import SpotifyClient
+from spotify_client import SpotifyClient, SpotifyRateLimitError
 from models import PlaybackState, Release, Track, Artist, ReleaseType, LifecycleStatus, PromptType, PromptState, DiscordPrompt
 from utils import normalize_text, normalize_artist_list, compute_release_type
 
@@ -67,7 +69,10 @@ class Tracker:
             try:
                 await self._cleanup_published_releases_if_due()
                 await self._poll_once()
-            except Exception as e:
+            except SpotifyRateLimitError as error:
+                logger.warning("Spotify rate limited polling for %s seconds.", error.retry_after)
+                await asyncio.sleep(error.retry_after)
+            except (httpx.HTTPError, aiosqlite.Error) as e:
                 logger.error(f"Poll error: {e}", exc_info=True)
                 await asyncio.sleep(self.backoff_interval)
 

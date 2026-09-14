@@ -14,6 +14,7 @@ from discord_bot import DiscordBot, ReleaseActionView
 from models import DiscordPrompt, LifecycleStatus, PromptState, PromptType
 from tests.test_unit import make_release_for_test
 from tracker import Tracker
+from spotify_client import SpotifyClient, SpotifyRateLimitError
 from wordpress_client import WordPressClient
 
 
@@ -150,6 +151,40 @@ class MultiPageWordPressCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.cache_unchanged)
         self.assertEqual(result.posts[-1]["title"], "Edited")
         self.assertEqual(http.get.await_count, 2)
+
+
+class SpotifyRateLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_response_exposes_retry_after_to_tracker_loop(self):
+        client = SpotifyClient.__new__(SpotifyClient)
+        response = httpx.Response(
+            429,
+            headers={"Retry-After": "7"},
+            request=httpx.Request("GET", "https://api.spotify.com/v1/me/player"),
+        )
+        with self.assertRaises(SpotifyRateLimitError) as raised:
+            client._raise_for_status(response)
+        self.assertEqual(raised.exception.retry_after, 7)
+
+        tracker = Tracker.__new__(Tracker)
+        tracker.running = False
+        tracker._cleanup_published_releases_if_due = AsyncMock()
+        tracker._poll_once = AsyncMock(side_effect=raised.exception)
+
+        async def stop_after_sleep(delay):
+            tracker.running = False
+
+        with patch("tracker.asyncio.sleep", side_effect=stop_after_sleep) as sleep:
+            await tracker.run()
+        sleep.assert_awaited_once_with(7)
+
+    async def test_programming_errors_escape_poll_loop(self):
+        tracker = Tracker.__new__(Tracker)
+        tracker.running = False
+        tracker._cleanup_published_releases_if_due = AsyncMock()
+        tracker._poll_once = AsyncMock(side_effect=ValueError("bug"))
+
+        with self.assertRaisesRegex(ValueError, "bug"):
+            await tracker.run()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,13 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+
+class SpotifyRateLimitError(RuntimeError):
+    def __init__(self, retry_after: int):
+        super().__init__(f"Spotify rate limit requires a {retry_after}-second delay")
+        self.retry_after = retry_after
+
+
 class SpotifyClient:
     def __init__(self, config: Config):
         self.config = config
@@ -94,7 +101,7 @@ class SpotifyClient:
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"}
             )
-            response.raise_for_status()
+            self._raise_for_status(response)
             data = response.json()
 
             self.access_token = data["access_token"]
@@ -111,6 +118,15 @@ class SpotifyClient:
     async def close(self):
         """Close HTTP client."""
         await self.client.aclose()
+
+    def _raise_for_status(self, response: httpx.Response) -> None:
+        if response.status_code == 429:
+            try:
+                retry_after = max(0, int(response.headers.get("Retry-After", "1")))
+            except (TypeError, ValueError):
+                retry_after = 1
+            raise SpotifyRateLimitError(retry_after)
+        response.raise_for_status()
 
     async def _ensure_token(self):
         """Ensure we have a valid access token."""
@@ -133,7 +149,7 @@ class SpotifyClient:
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"}
             )
-            response.raise_for_status()
+            self._raise_for_status(response)
             data = response.json()
 
             self.access_token = data["access_token"]
@@ -157,7 +173,7 @@ class SpotifyClient:
             response = await self.client.get("/me/player")
             if response.status_code == 204:
                 return None
-            response.raise_for_status()
+            self._raise_for_status(response)
             return response.json()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
@@ -170,7 +186,7 @@ class SpotifyClient:
         await self._ensure_token()
 
         response = await self.client.get(f"/albums/{album_id}")
-        response.raise_for_status()
+        self._raise_for_status(response)
         return response.json()
 
     async def get_album_tracks(self, album_id: str) -> List[Dict[str, Any]]:
@@ -182,7 +198,7 @@ class SpotifyClient:
 
         while url:
             response = await self.client.get(url)
-            response.raise_for_status()
+            self._raise_for_status(response)
             data = response.json()
 
             tracks.extend(data["items"])
@@ -195,7 +211,7 @@ class SpotifyClient:
         await self._ensure_token()
 
         response = await self.client.get(f"/me/player/recently-played?limit={limit}")
-        response.raise_for_status()
+        self._raise_for_status(response)
         return response.json()["items"]
 
     async def get_saved_albums_page(
@@ -214,7 +230,7 @@ class SpotifyClient:
                 "/me/albums",
                 params={"limit": min(limit, 50), "offset": offset}
             )
-        response.raise_for_status()
+        self._raise_for_status(response)
         return response.json()
 
     async def get_all_saved_albums(self, first_page: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -241,6 +257,6 @@ class SpotifyClient:
             album_uri = f"spotify:album:{album_id_or_uri}"
 
         response = await self.client.get("/me/library/contains", params={"uris": album_uri})
-        response.raise_for_status()
+        self._raise_for_status(response)
         results = response.json()
         return bool(results[0]) if results else False
