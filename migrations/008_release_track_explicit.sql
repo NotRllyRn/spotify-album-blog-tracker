@@ -1,0 +1,1 @@
+ALTER TABLE release_track ADD COLUMN explicit BOOLEAN NOT NULL DEFAULT 0;

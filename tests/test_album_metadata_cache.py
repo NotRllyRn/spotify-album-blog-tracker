@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from database import Database
 from album_metadata.lastfm import parse_lastfm_listeners
-from models import CachedAlbumMetadata, LifecycleStatus, Release, ReleaseType, SavedLibraryAlbum
+from models import CachedAlbumMetadata, LifecycleStatus, Release, ReleaseType, SavedLibraryAlbum, Track
 
 
 class AlbumMetadataCacheDatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -86,6 +86,18 @@ class AlbumMetadataCacheDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.delete_release("album-a")
         self.assertIsNotNone(await self.db.get_album_metadata_cache("album-a"))
 
+    async def test_release_track_explicitness_survives_round_trip(self):
+        now = datetime.now()
+        track = Track("track-a", "Track", "track", 1000, 1, 1, True, False, explicit=True)
+        await self.db.save_release(Release(
+            spotify_id="album-explicit", title="Album", normalized_title="album", artists=[],
+            release_type=ReleaseType.ALBUM, raw_spotify_type="album", cover_url="",
+            release_date="2026", total_tracks=1, total_duration_ms=1000, tracks=[track], progress=0,
+            status=LifecycleStatus.ACTIVE, first_seen=now, last_seen=now,
+        ))
+
+        stored = await self.db.get_release("album-explicit")
+        self.assertTrue(stored.tracks[0].explicit)
 
 class ListenerParsingTests(unittest.TestCase):
     def test_parses_only_non_negative_listener_counts(self):

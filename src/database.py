@@ -260,7 +260,7 @@ class Database:
         """Get tracks for a release."""
         cursor = await self.connection.execute("""
             SELECT spotify_id, title, normalized_title, duration_ms, disc_number, track_number,
-                   is_countable, listened, listened_at, listened_source, highlight
+                   is_countable, listened, listened_at, listened_source, highlight, explicit
             FROM release_track WHERE release_id = ? ORDER BY disc_number, track_number
         """, (release_id,))
         rows = await cursor.fetchall()
@@ -276,6 +276,7 @@ class Database:
             listened_at=datetime.fromisoformat(row[8]) if row[8] else None,
             listened_source=row[9],
             highlight=bool(row[10]) if len(row) > 10 else False,
+            explicit=bool(row[11]) if len(row) > 11 else False,
         ) for row in rows]
 
     async def _save_release_artists(self, release_id: int, artists: List[Artist]):
@@ -294,8 +295,9 @@ class Database:
             await self.connection.execute("""
                 INSERT INTO release_track
                 (release_id, spotify_id, title, normalized_title, duration_ms, disc_number,
-                 track_number, is_countable, listened, listened_at, listened_source, highlight)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 track_number, is_countable, listened, listened_at, listened_source, highlight,
+                 explicit)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 release_id, track.spotify_id, track.title, track.normalized_title,
                 track.duration_ms, track.disc_number, track.track_number,
@@ -303,6 +305,7 @@ class Database:
                 track.listened_at.isoformat() if track.listened_at else None,
                 track.listened_source,
                 track.highlight,
+                track.explicit,
             ))
 
     def _row_to_release(self, row: Sequence[Any], artists: List[Artist], tracks: List[Track]) -> Release:
