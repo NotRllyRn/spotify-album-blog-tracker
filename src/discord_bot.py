@@ -413,6 +413,7 @@ class DiscordBot:
         self.db = db
         self.tracker = tracker
         self.ready_event = asyncio.Event()
+        self._commands_synced = False
 
         intents = discord.Intents.default()
         # intents.message_content = True  # Not needed for slash commands
@@ -462,14 +463,16 @@ class DiscordBot:
 
         @self.bot.event
         async def on_ready():
-            synced = await self.tree.sync()
+            if not self._commands_synced:
+                synced = await self.tree.sync()
+                self._commands_synced = True
+                logger.info(
+                    "tree.sync() returned %d command(s) from Discord: %s",
+                    len(synced),
+                    [c.name for c in synced],
+                )
             self.ready_event.set()
             logger.info(f"Discord bot logged in as {self.bot.user}")
-            logger.info(
-                "tree.sync() returned %d command(s) from Discord: %s",
-                len(synced),
-                [c.name for c in synced],
-            )
 
     def _register_views(self):
         self.bot.add_view(SeventyFivePromptView(self))
@@ -795,10 +798,10 @@ class DiscordBot:
             else:
                 await self._unknown_prompt_action(interaction)
         except Exception as e:
-            logger.error(f"Error handling prompt action {action}: {e}")
+            logger.error("Error handling prompt action %s", action, exc_info=True)
             await self._send_prompt_action_response(
                 interaction,
-                f"❌ Error handling prompt action: {str(e)[:100]}",
+                "❌ Unable to complete that action. Check the service logs and try again.",
             )
 
     async def _send_prompt_action_response(self, interaction: discord.Interaction, content: str):
@@ -855,9 +858,9 @@ class DiscordBot:
                 ephemeral=True,
             )
         except Exception as e:
-            logger.error(f"Failed to open pre-publish editor: {e}")
+            logger.error("Failed to open pre-publish editor", exc_info=True)
             await interaction.followup.send(
-                f"❌ Failed to open editor: {str(e)[:100]}",
+                "❌ Failed to open the editor. Check the service logs and try again.",
                 ephemeral=True,
             )
 
@@ -902,9 +905,9 @@ class DiscordBot:
                 ephemeral=True,
             )
         except Exception as e:
-            logger.error(f"Failed to open post-publish editor: {e}")
+            logger.error("Failed to open post-publish editor", exc_info=True)
             await interaction.followup.send(
-                f"❌ Failed to open editor: {str(e)[:100]}",
+                "❌ Failed to open the editor. Check the service logs and try again.",
                 ephemeral=True,
             )
 
@@ -1052,7 +1055,7 @@ class DiscordBot:
         except Exception as e:
             logger.error(f"Error updating post content for post {post_id}: {e}", exc_info=True)
             await interaction.followup.send(
-                f"❌ Error updating WordPress post: {str(e)[:100]}",
+                "❌ Error updating the WordPress post. Check the service logs and try again.",
                 ephemeral=True
             )
             return
@@ -1440,7 +1443,7 @@ class DiscordBot:
         except Exception as e:
             logger.error(f"Error publishing release {release.spotify_id}: {e}", exc_info=True)
             await interaction.followup.send(
-                f"❌ Error publishing release: {str(e)[:100]}",
+                "❌ Error publishing the release. Check the service logs and try again.",
                 ephemeral=True
             )
             return None
@@ -1524,8 +1527,8 @@ class DiscordBot:
                 view=InProgressView(self, page_data)
             )
         except Exception as e:
-            logger.error(f"Error paging /inprogress: {e}")
-            message = f"❌ Error refreshing releases: {str(e)[:100]}"
+            logger.error("Error paging /inprogress", exc_info=True)
+            message = "❌ Error refreshing releases. Check the service logs and try again."
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
             else:
@@ -1541,7 +1544,7 @@ class DiscordBot:
             )
             return
 
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         try:
             # Get active releases
@@ -1559,9 +1562,9 @@ class DiscordBot:
             await interaction.followup.send(embed=embed, view=InProgressView(self, page_data), ephemeral=True)
 
         except Exception as e:
-            logger.error(f"Error in /inprogress: {e}")
+            logger.error("Error in /inprogress", exc_info=True)
             await interaction.followup.send(
-                f"❌ Error fetching releases: {str(e)[:100]}",
+                "❌ Error fetching releases. Check the service logs and try again.",
                 ephemeral=True
             )
 
@@ -1575,7 +1578,7 @@ class DiscordBot:
             )
             return
 
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         try:
             # Get current playback state
@@ -1606,9 +1609,9 @@ class DiscordBot:
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
         except Exception as e:
-            logger.error(f"Error in /current: {e}")
+            logger.error("Error in /current", exc_info=True)
             await interaction.followup.send(
-                f"❌ Error fetching playback: {str(e)[:100]}",
+                "❌ Error fetching playback. Check the service logs and try again.",
                 ephemeral=True
             )
 
@@ -1621,7 +1624,7 @@ class DiscordBot:
             )
             return
 
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         try:
             album = await self.db.get_random_unposted_saved_library_album()
@@ -1638,9 +1641,9 @@ class DiscordBot:
                 ephemeral=True
             )
         except Exception as e:
-            logger.error(f"Error in /random: {e}")
+            logger.error("Error in /random", exc_info=True)
             await interaction.followup.send(
-                f"❌ Error picking a random album: {str(e)[:100]}",
+                "❌ Error picking a random album. Check the service logs and try again.",
                 ephemeral=True
             )
 
@@ -1669,8 +1672,8 @@ class DiscordBot:
                 view=RandomAlbumView(self)
             )
         except Exception as e:
-            logger.error(f"Error re-rolling /random: {e}")
-            message = f"❌ Error picking a random album: {str(e)[:100]}"
+            logger.error("Error re-rolling /random", exc_info=True)
+            message = "❌ Error picking a random album. Check the service logs and try again."
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
             else:
@@ -1703,7 +1706,7 @@ class DiscordBot:
             )
             return
 
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         try:
             # Get service status
@@ -1769,9 +1772,9 @@ class DiscordBot:
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
-            logger.error(f"Error in /service: {e}")
+            logger.error("Error in /service", exc_info=True)
             await interaction.followup.send(
-                f"❌ Error fetching status: {str(e)[:100]}",
+                "❌ Error fetching status. Check the service logs and try again.",
                 ephemeral=True
             )
 
@@ -1790,9 +1793,9 @@ class DiscordBot:
             render = await self.render_picker(query, FUZZY_BASE_THRESHOLD)
             await interaction.followup.send(embed=render.embed, view=render.view)
         except Exception as e:
-            logger.error(f"Error in /search: {e}")
+            logger.error("Error in /search", exc_info=True)
             await interaction.followup.send(
-                f"❌ Error searching: {str(e)[:100]}",
+                "❌ Error searching. Check the service logs and try again.",
                 ephemeral=True,
             )
 
@@ -1812,9 +1815,9 @@ class DiscordBot:
                 PickerRequest(query=f"editor:{post_id}", threshold=FUZZY_BASE_THRESHOLD, source="cache"),
             )
         except Exception as e:
-            logger.error(f"Error in /editor: {e}")
+            logger.error("Error in /editor", exc_info=True)
             await interaction.followup.send(
-                f"❌ Error opening editor: {str(e)[:100]}",
+                "❌ Error opening the editor. Check the service logs and try again.",
                 ephemeral=True,
             )
 
@@ -1910,9 +1913,9 @@ class DiscordBot:
                 on_open=_deliver,
             )
         except Exception as e:
-            logger.error(f"Failed to open editor for post {post_id}: {e}")
+            logger.error("Failed to open editor for post %s", post_id, exc_info=True)
             await interaction.followup.send(
-                f"❌ Failed to open editor for post {post_id}: {str(e)[:100]}",
+                f"❌ Failed to open the editor for post {post_id}. Check the service logs and try again.",
                 ephemeral=True,
             )
             return

@@ -187,5 +187,41 @@ class SpotifyRateLimitTests(unittest.IsolatedAsyncioTestCase):
             await tracker.run()
 
 
+class DiscordReliabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ready_syncs_commands_only_once(self):
+        config = SimpleNamespace(discord_user_id=1)
+        bot = DiscordBot(config, SimpleNamespace(), SimpleNamespace())
+        bot.tree.sync = AsyncMock(return_value=[])
+
+        await bot.bot.on_ready()
+        await bot.bot.on_ready()
+
+        bot.tree.sync.assert_awaited_once_with()
+
+    async def test_operational_error_is_not_returned_to_discord(self):
+        bot = DiscordBot.__new__(DiscordBot)
+        secret = "http://internal.example.test?token=secret"
+        bot.db = SimpleNamespace(
+            get_discord_prompt=AsyncMock(return_value=DiscordPrompt(
+                id=1, prompt_type=PromptType.PROMPT_75_PERCENT.value,
+                release_id="album", wordpress_post_id=None,
+                discord_message_id="message", state=PromptState.PENDING.value)),
+            get_release=AsyncMock(return_value=make_release_for_test(
+                "album", "Album", datetime(2024, 1, 1))),
+        )
+        bot._handle_75_publish = AsyncMock(side_effect=RuntimeError(secret))
+        interaction = SimpleNamespace(
+            message=SimpleNamespace(id="message"),
+            response=SimpleNamespace(
+                defer=AsyncMock(), is_done=lambda: True, send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        await bot.handle_prompt_action(interaction, "publish_now")
+
+        response = interaction.followup.send.await_args.args[0]
+        self.assertNotIn(secret, response)
+
+
 if __name__ == "__main__":
     unittest.main()

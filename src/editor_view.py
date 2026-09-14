@@ -693,9 +693,9 @@ class EditorView(discord.ui.View):
                 view=self,
             )
         except Exception as error:
-            logger.warning("Re-sync from WP failed: %s", error)
+            logger.warning("Re-sync from WP failed", exc_info=True)
             await interaction.response.send_message(
-                f"⚠️ Re-sync failed: {error}",
+                "⚠️ Re-sync failed. Check the service logs and try again.",
                 ephemeral=True,
             )
 
@@ -873,9 +873,9 @@ class BodyModal(discord.ui.Modal):
         try:
             await publisher.update_post_content(post_id, str(self.body_input.value))
         except Exception as error:
-            logger.error("Body update failed: %s", error)
+            logger.error("Body update failed", exc_info=True)
             await interaction.response.send_message(
-                f"❌ Body update failed: {error}",
+                "❌ Body update failed. Check the service logs and try again.",
                 ephemeral=True,
             )
             return

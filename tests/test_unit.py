@@ -1051,7 +1051,7 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         await self.bot._handle_random(interaction)
 
-        interaction.response.defer.assert_awaited_once()
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
         interaction.followup.send.assert_awaited_once()
         kwargs = interaction.followup.send.await_args.kwargs
         self.assertEqual(kwargs["embed"].title, "Random Album")
@@ -1266,7 +1266,10 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         publisher.update_post_content.assert_awaited_once_with(321, "First paragraph")
         db.update_discord_prompt_state.assert_not_awaited()
-        self.assertIn("❌ Error updating WordPress post:", interaction.followup.send.await_args.args[0])
+        self.assertEqual(
+            interaction.followup.send.await_args.args[0],
+            "❌ Error updating the WordPress post. Check the service logs and try again.",
+        )
 
     async def test_undo_post_trashes_wordpress_post_and_deletes_release(self):
         release = make_release_for_test("album_undo", "Album Undo", datetime(2024, 1, 1, 12, 0, 0))
