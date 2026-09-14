@@ -1,7 +1,6 @@
 """Persistent static album metadata preparation and reuse."""
 
 import asyncio
-import contextlib
 import logging
 from datetime import datetime
 from typing import Any, Callable, Optional
@@ -11,6 +10,7 @@ from album_metadata.enrichment import (
     ResolvedAlbumMetadata,
     resolve_known_album_metadata,
 )
+from album_metadata.common import safe_error
 from album_metadata.lastfm import LastFM
 from album_metadata.spotify import Spotify
 from models import CachedAlbumMetadata, Release
@@ -133,7 +133,7 @@ class AlbumMetadataCacheService:
                 resolved = await asyncio.to_thread(
                     self._resolve, spotify_id, spotify, lastfm, album, tracks)
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
-                raise MetadataCacheProviderError(str(exc)) from exc
+                raise MetadataCacheProviderError(safe_error(exc)) from exc
             if (isinstance(resolved, MetadataResolutionFailure) and
                     resolved.code in _PROVIDER_FAILURE_CODES):
                 raise MetadataCacheProviderError(resolved.message)
@@ -188,6 +188,15 @@ class AlbumMetadataCacheService:
         """Start one resumable background pass unless one is already running."""
         if self._backfill_task is None or self._backfill_task.done():
             self._backfill_task = asyncio.create_task(self._run_saved_library_backfill())
+            self._backfill_task.add_done_callback(self._backfill_done)
+
+    @staticmethod
+    def _backfill_done(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error:
+            logger.error("Metadata backfill failed: %s", safe_error(error))
 
     async def _run_saved_library_backfill(self) -> None:
         spotify_ids = await self.db.get_unposted_saved_library_ids_missing_metadata(
@@ -213,5 +222,4 @@ class AlbumMetadataCacheService:
         for task in tasks:
             task.cancel()
         if tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)

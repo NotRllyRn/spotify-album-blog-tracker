@@ -19,7 +19,7 @@ Fill in `.env`. Metadata enrichment is enabled by default and requires Last.fm c
 PYTHONPATH=src python3 main.py
 ```
 
-The tracker monitors playback, avoids duplicate posts, manages a saved-album queue, and sends Discord controls. Important commands are `/inprogress`, `/current`, `/random`, `/search`, and `/editor`.
+The tracker monitors playback, avoids duplicate posts, manages a saved-album queue, and sends Discord controls. Important commands are `/inprogress`, `/current`, `/random`, `/search`, and `/editor`. `/random` accepts an optional popularity focus from `0` (the full true-random queue) to `100` (a random choice from the ten most-listened-to rankable albums).
 
 Docker keeps the same service entry point and persistent `data/` and `logs/` volumes:
 
@@ -51,6 +51,8 @@ Review these files before applying a plan:
 ## Metadata ownership
 
 The shared engine manages provider-derived SCF fields, categories, and custom taxonomies. Rating, favorite, notes, and track highlights remain editor-owned. The tracker uses the known Spotify release ID; the CLI discovers an identity from the WordPress title and artist tags, then both follow the same validation and enrichment path.
+
+The service prepares static Last.fm metadata for unposted saved albums in the background and caches it by Spotify album ID. Newly tracked releases are prioritized from their already-persisted Spotify evidence, so normal publication reuses local metadata instead of repeating provider requests.
 
 Code is split into three parts:
 
