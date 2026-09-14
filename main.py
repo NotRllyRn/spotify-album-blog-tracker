@@ -89,24 +89,37 @@ class Service:
 
 async def main():
     service = None
-
-    def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, shutting down...")
-        if service is not None:
-            asyncio.create_task(service.stop())
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    service_task = None
+    stop_task = None
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(signum, stop_event.set)
 
     try:
         service = Service()
-        await service.start()
+        service_task = asyncio.create_task(service.start())
+        stop_task = asyncio.create_task(stop_event.wait())
+        done, _ = await asyncio.wait(
+            (service_task, stop_task), return_when=asyncio.FIRST_COMPLETED)
+        if stop_task in done:
+            logger.info("Shutdown signal received.")
+        else:
+            await service_task
     except Exception as e:
         logger.error(f"Service error: {e}", exc_info=True)
+        return 1
+    finally:
+        for task in (service_task, stop_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         if service is not None:
             await service.stop()
-        sys.exit(1)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(signum)
+    return 0
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
