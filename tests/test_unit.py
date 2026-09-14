@@ -3564,12 +3564,28 @@ class TestSearchScoring(unittest.TestCase):
         matches = rank_matches(posts, "pink floyd")
         self.assertEqual([m.post_id for m in matches], [1])
 
+    def test_multitoken_ranking_uses_weakest_required_token(self):
+        posts = [_wp_post(1, "Candidate A"), _wp_post(2, "Candidate B")]
+
+        def scores(token, haystack):
+            return {
+                ("alpha", "candidate a"): 1.0,
+                ("beta", "candidate a"): 0.61,
+                ("alpha", "candidate b"): 0.85,
+                ("beta", "candidate b"): 0.85,
+            }[(token, haystack)]
+
+        with patch("search._score_token", side_effect=scores):
+            matches = rank_matches(posts, "alpha beta", threshold=0.60)
+
+        self.assertEqual([match.post_id for match in matches], [2, 1])
+
 
 @unittest.skipUnless(rank_matches is not None, "search.py not importable")
 class TestSearchLiveRanking(unittest.IsolatedAsyncioTestCase):
     """Spec user stories 11: live WP search uses the cache ladder for ranking."""
 
-    async def test_live_search_calls_wp_with_search_kwarg_and_ranks(self):
+    async def test_live_search_scans_wordpress_and_ranks(self):
         from unittest.mock import AsyncMock
         from types import SimpleNamespace
 
@@ -3580,12 +3596,13 @@ class TestSearchLiveRanking(unittest.IsolatedAsyncioTestCase):
         ])
         client = AsyncMock()
         client.get_posts = AsyncMock(return_value=fake_result)
+        client.get_tags = AsyncMock(return_value=[])
 
         matches = await search_live(client, "pink floyd moon")
 
         client.get_posts.assert_awaited_once()
         kwargs = client.get_posts.await_args.kwargs
-        self.assertEqual(kwargs.get("search"), "pink floyd moon")
+        self.assertNotIn("search", kwargs)
         self.assertEqual(kwargs.get("per_page"), 100)
         self.assertEqual([m.post_id for m in matches], [1])
 
@@ -3595,6 +3612,23 @@ class TestSearchLiveRanking(unittest.IsolatedAsyncioTestCase):
         client.get_posts = AsyncMock(return_value=None)
         matches = await search_live(client, "anything")
         self.assertEqual(matches, [])
+        client.get_tags.assert_not_awaited()
+
+    async def test_live_search_ranks_artist_tags_like_the_cache(self):
+        from types import SimpleNamespace
+
+        client = AsyncMock()
+        client.get_posts = AsyncMock(return_value=SimpleNamespace(posts=[
+            {"id": 1, "title": {"rendered": "Untitled"}, "tags": [7], "link": "https://x/1"},
+            {"id": 2, "title": {"rendered": "Untitled"}, "tags": [8], "link": "https://x/2"},
+        ]))
+        client.get_tags = AsyncMock(return_value=[
+            {"id": 7, "name": "Pink Floyd"}, {"id": 8, "name": "Beatles"},
+        ])
+
+        matches = await search_live(client, "pink floyd")
+
+        self.assertEqual([match.post_id for match in matches], [1])
 
 
 # --- Search picker UI ------------------------------------------------------

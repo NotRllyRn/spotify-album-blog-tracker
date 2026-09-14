@@ -14,7 +14,7 @@ newest WP ID first. Capped at ``RESULT_CAP``.
 Cache freshness: when the local ``wordpress_post_cache`` table is
 empty or older than ``WORDPRESS_CACHE_MAX_AGE_HOURS`` (read from
 ``service_state[LAST_SYNCED_AT_KEY]``), ``search_for_posts`` falls
-back to a live ``GET /wp/v2/posts?search=…`` and reports the swap via
+back to a live WordPress post scan and reports the swap via
 ``SearchOutcome.fell_back_to_live``. The operator's Discord pick may
 point at a fresh live result that's not in ``wordpress_post_cache``
 yet — that's intentional.
@@ -127,7 +127,7 @@ def rank_matches(
                     title=post.title,
                     artists=list(getattr(post, "artists", []) or []),
                     link=getattr(post, "link", "") or "",
-                    score=max(scores),
+                    score=min(scores),
                 )
             )
 
@@ -142,6 +142,7 @@ class WordPressClientLike(Protocol):
     """Shape we depend on from WordPressClient."""
 
     async def get_posts(self, **params: Any) -> Any: ...
+    async def get_tags(self) -> Any: ...
 
 
 class _RawPostProxy:
@@ -149,11 +150,15 @@ class _RawPostProxy:
 
     __slots__ = ("id", "title", "artists", "link")
 
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, tags_by_id: dict[int, str]):
         title_obj = payload.get("title") or {}
         self.title = title_obj.get("rendered", "") if isinstance(title_obj, dict) else str(title_obj)
         self.id = int(payload["id"])
-        self.artists: List[str] = []
+        self.artists = [
+            tags_by_id[tag_id]
+            for tag_id in payload.get("tags", [])
+            if tag_id in tags_by_id
+        ]
         self.link = str(payload.get("link", "") or "")
 
 
@@ -162,10 +167,16 @@ async def search_live(
     query: str,
     threshold: float = FUZZY_BASE_THRESHOLD,
 ) -> List[SearchMatch]:
-    """Hit ``GET /wp/v2/posts?search=…&per_page=100`` and rank via the same ladder."""
-    result = await wordpress_client.get_posts(search=query, per_page=100)
+    """Scan live WordPress posts and rank titles plus resolved artist tags."""
+    result = await wordpress_client.get_posts(
+        per_page=100, status="publish", _fields="id,title,tags,link")
     raw_posts = list(getattr(result, "posts", None) or result or [])
-    return rank_matches([_RawPostProxy(p) for p in raw_posts], query, threshold)
+    if not raw_posts:
+        return []
+    tags = await wordpress_client.get_tags()
+    tags_by_id = {tag["id"]: tag["name"] for tag in tags}
+    return rank_matches(
+        [_RawPostProxy(post, tags_by_id) for post in raw_posts], query, threshold)
 
 
 # --- Single deep-module seam ------------------------------------------------
