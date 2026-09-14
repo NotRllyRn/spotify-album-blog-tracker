@@ -91,7 +91,8 @@ class WordPressClient:
         url = f"{self.api_url}/posts"
         all_posts = []
 
-        request_params = {**params, "per_page": params.get("per_page", 100), "page": 1}
+        per_page = params.get("per_page", 100)
+        request_params = {**params, "per_page": per_page, "page": 1}
         response = await self.client.get(url, params=request_params)
         response.raise_for_status()
 
@@ -105,6 +106,7 @@ class WordPressClient:
             first_page_hash,
             previous_x_wp_total,
             previous_first_page_hash,
+            per_page,
         ):
             return WordPressPostsResult(
                 posts=[],
@@ -125,7 +127,7 @@ class WordPressClient:
             total_pages = 1
 
         for page in range(2, total_pages + 1):
-            request_params = {**params, "per_page": params.get("per_page", 100), "page": page}
+            request_params = {**params, "per_page": per_page, "page": page}
             response = await self.client.get(url, params=request_params)
             response.raise_for_status()
             data = response.json()
@@ -146,6 +148,7 @@ class WordPressClient:
         first_page_hash: str,
         previous_x_wp_total: Optional[str],
         previous_first_page_hash: Optional[str],
+        per_page: int,
     ) -> bool:
         """Return whether page-1 metadata proves the cached post list is current."""
         if not validate_first_page:
@@ -160,6 +163,9 @@ class WordPressClient:
             return False
 
         if not isinstance(x_wp_total, str) or not x_wp_total.isdigit():
+            return False
+
+        if int(x_wp_total) > per_page:
             return False
 
         return (
@@ -329,7 +335,8 @@ class WordPressClient:
         first_page_hash = hashlib.sha256(response.content).hexdigest()
 
         cached_tags = getattr(self, "_cached_tags", None)
-        if self._tag_cache_matches(x_wp_total, first_page_hash) and cached_tags is not None:
+        if self._tag_cache_matches(
+            x_wp_total, first_page_hash, per_page) and cached_tags is not None:
             logger.info("Using cached WordPress tags; X-WP-Total and first-page hash matched.")
             return list(cached_tags)
 
@@ -376,7 +383,9 @@ class WordPressClient:
         except ValueError:
             return None
 
-    def _tag_cache_matches(self, x_wp_total: Optional[str], first_page_hash: str) -> bool:
+    def _tag_cache_matches(
+        self, x_wp_total: Optional[str], first_page_hash: str, per_page: int
+    ) -> bool:
         cached_tags = getattr(self, "_cached_tags", None)
         cached_x_wp_total = getattr(self, "_cached_tags_x_wp_total", None)
         cached_first_page_hash = getattr(self, "_cached_tags_first_page_hash", None)
@@ -388,6 +397,9 @@ class WordPressClient:
             return False
 
         if not isinstance(x_wp_total, str) or not x_wp_total.isdigit():
+            return False
+
+        if int(x_wp_total) > per_page:
             return False
 
         return (

@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import signal
 import unittest
 from datetime import datetime
@@ -6,11 +8,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import discord
+import httpx
 import main
 from discord_bot import DiscordBot, ReleaseActionView
 from models import DiscordPrompt, LifecycleStatus, PromptState, PromptType
 from tests.test_unit import make_release_for_test
 from tracker import Tracker
+from wordpress_client import WordPressClient
 
 
 class GracefulShutdownTests(unittest.IsolatedAsyncioTestCase):
@@ -118,6 +122,34 @@ class SeventyFivePromptReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         bot.db.update_discord_prompt_state.assert_awaited_once_with(
             "message-75", PromptState.ACCEPTED.value)
+
+
+class MultiPageWordPressCacheTests(unittest.IsolatedAsyncioTestCase):
+    def response(self, rows, *, total="101", pages="2"):
+        return httpx.Response(
+            200,
+            content=json.dumps(rows).encode(),
+            headers={"X-WP-Total": total, "X-WP-TotalPages": pages},
+            request=httpx.Request("GET", "https://example.test/wp-json/wp/v2/posts"),
+        )
+
+    async def test_matching_page_one_does_not_hide_page_two_post_edit(self):
+        page_one = self.response([{"id": 101, "title": "Newest"}])
+        changed_page_two = self.response([{"id": 1, "title": "Edited"}])
+        http = SimpleNamespace(get=AsyncMock(side_effect=[page_one, changed_page_two]))
+        client = WordPressClient.__new__(WordPressClient)
+        client.api_url = "https://example.test/wp-json/wp/v2"
+        client.client = http
+
+        result = await client.get_posts(
+            validate_first_page=True,
+            previous_x_wp_total="101",
+            previous_first_page_hash=hashlib.sha256(page_one.content).hexdigest(),
+        )
+
+        self.assertFalse(result.cache_unchanged)
+        self.assertEqual(result.posts[-1]["title"], "Edited")
+        self.assertEqual(http.get.await_count, 2)
 
 
 if __name__ == "__main__":

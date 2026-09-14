@@ -2102,19 +2102,20 @@ class TestWordPressTagFetch(unittest.IsolatedAsyncioTestCase):
         client.client = fake_http
         return client
 
-    async def test_get_tags_populates_cache_then_returns_cached_full_list(self):
-        page_one = self.make_response([{"id": 1, "name": "Artist One"}], total="2", total_pages="2")
-        page_two = self.make_response([{"id": 2, "name": "Artist Two"}], total="2", total_pages="2")
-        matching_page_one = self.make_response([{"id": 1, "name": "Artist One"}], total="2", total_pages="2")
-        fake_http = self.FakeHTTPClient([page_one, page_two, matching_page_one])
+    async def test_get_tags_refreshes_page_two_even_when_page_one_matches(self):
+        page_one = self.make_response([{"id": 1, "name": "Artist One"}], total="101", total_pages="2")
+        page_two = self.make_response([{"id": 2, "name": "Artist Two"}], total="101", total_pages="2")
+        matching_page_one = self.make_response([{"id": 1, "name": "Artist One"}], total="101", total_pages="2")
+        changed_page_two = self.make_response([{"id": 2, "name": "Artist Two Edited"}], total="101", total_pages="2")
+        fake_http = self.FakeHTTPClient([page_one, page_two, matching_page_one, changed_page_two])
         client = self.make_client(fake_http)
 
         first_result = await client.get_tags()
         second_result = await client.get_tags()
 
         self.assertEqual([tag["id"] for tag in first_result], [1, 2])
-        self.assertEqual([tag["id"] for tag in second_result], [1, 2])
-        self.assertEqual([request[1]["page"] for request in fake_http.get_requests], [1, 2, 1])
+        self.assertEqual([tag["name"] for tag in second_result], ["Artist One", "Artist Two Edited"])
+        self.assertEqual([request[1]["page"] for request in fake_http.get_requests], [1, 2, 1, 2])
 
     async def test_get_tags_refreshes_cache_when_first_page_hash_changes(self):
         page_one = self.make_response([{"id": 1, "name": "Artist One"}], total="1", total_pages="1")
