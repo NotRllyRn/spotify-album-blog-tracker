@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from database import Database
+from album_metadata.lastfm import parse_lastfm_listeners
 from models import CachedAlbumMetadata, LifecycleStatus, Release, ReleaseType, SavedLibraryAlbum
 
 
@@ -85,6 +86,15 @@ class AlbumMetadataCacheDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.delete_release("album-a")
         self.assertIsNotNone(await self.db.get_album_metadata_cache("album-a"))
 
+
+class ListenerParsingTests(unittest.TestCase):
+    def test_parses_only_non_negative_listener_counts(self):
+        self.assertEqual(parse_lastfm_listeners({"listeners": "123456"}), 123456)
+        self.assertEqual(parse_lastfm_listeners({"listeners": 0}), 0)
+        for value in (None, "", "many", -1):
+            with self.subTest(value=value):
+                self.assertIsNone(parse_lastfm_listeners({"listeners": value}))
+        self.assertIsNone(parse_lastfm_listeners({}))
 
 if __name__ == "__main__":
     unittest.main()

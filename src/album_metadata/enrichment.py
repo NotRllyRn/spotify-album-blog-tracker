@@ -2,6 +2,7 @@
 
 import logging
 import re
+from dataclasses import dataclass, field
 from typing import Any
 
 from album_metadata.common import (
@@ -10,6 +11,7 @@ from album_metadata.common import (
 from album_metadata.lastfm import (
     _UUID_RE, _accept_stale_lastfm_tracks, choose_lastfm_candidate,
     lastfm_candidate_score, lookup_combined_lastfm, pick_top_tags,
+    parse_lastfm_listeners,
     recover_lastfm_candidate, resolve_lastfm_mbid, resolve_lastfm_url,
     search_lastfm_candidates, validate_lastfm_info,
 )
@@ -28,6 +30,24 @@ from album_metadata.spotify import (
 )
 
 log = logging.getLogger("post_to_album")
+
+
+@dataclass(frozen=True)
+class ResolvedAlbumMetadata:
+    lastfm_url: str | None
+    lastfm_mbid: str | None
+    genres: list[str]
+    lastfm_listeners: int | None
+    lastfm_evidence: dict = field(default_factory=dict)
+    diagnostics: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MetadataResolutionFailure:
+    code: str
+    message: str
+    details: dict | None = None
+    ignored: bool = False
 
 def is_field_present(field: str, v: Any) -> bool:
     """Plan says never overwrite anything currently populated. Treat:
@@ -209,36 +229,28 @@ def enrich(post: dict, spt: Any, lfm: Any,
         post, spt, lfm, album, tracks, tag_names, write_policy, spotify_match)
 
 
-def enrich_known(
-    post: dict,
-    spt: Any,
-    lfm: Any,
-    album: dict,
-    tracks: list[dict],
-    artist_names: list[str],
-    write_policy: str = WRITE_FILL_ONLY,
-    spotify_match: dict | None = None,
-    listen_count: int = 1,
-    track_highlights: dict[str, bool] | None = None,
-) -> dict | None:
-    """Enrich one post from an already selected canonical Spotify release."""
-    if write_policy not in (WRITE_FILL_ONLY, WRITE_OVERWRITE_MANAGED):
-        raise ValueError(f"Unknown write policy: {write_policy}")
-    if write_policy == WRITE_FILL_ONLY and post_is_complete(post):
-        return None
+def _resolution_provider_failure(
+    code: str, exc: BaseException, operation: str
+) -> MetadataResolutionFailure:
+    if isinstance(exc, ProviderError):
+        diagnostic = exc.diagnostic(code)
+    else:
+        cls = SpotifyProviderError if code.startswith("spotify_") else LastFMProviderError
+        provider = "Spotify" if code.startswith("spotify_") else "Last.fm"
+        diagnostic = cls(
+            f"{provider} {operation} failed unexpectedly.",
+            operation=operation,
+            failure_kind="unexpected",
+            retryable=False,
+        ).diagnostic(code)
+    return MetadataResolutionFailure(
+        diagnostic["code"], diagnostic["message"], diagnostic["details"])
 
-    pid = post["id"]
-    acf_in = post.get("acf") or {}
-    title = post["title"]["rendered"]
-    post_date = post["date"]
-    tag_names = [name for name in artist_names if name]
-    q_title = raw_query(title)
-    q_artists = [raw_query(name) for name in tag_names if raw_query(name)]
-    if not q_artists:
-        return _unresolved(post, "spotify_missing_artist", "No artist tags were available.")
-    winner = album
-    spotify_match = spotify_match or {"candidate": album, "score": 1.0}
 
+def resolve_known_album_metadata(
+    spt: Any, lfm: Any, album: dict, tracks: list[dict]
+) -> ResolvedAlbumMetadata | MetadataResolutionFailure:
+    """Resolve and validate static provider metadata for one canonical Spotify album."""
     try:
         validate_spotify_album_tracks(album, tracks)
         if not _spotify_tracks_complete(album, tracks):
@@ -246,14 +258,17 @@ def enrich_known(
                 "Spotify track.list response was incomplete.", operation="track.list")
     except SpotifyProviderError as exc:
         if _spotify_tracks_market_restricted(tracks):
-            return _ignored(
-                post, "spotify_catalog_unavailable",
-                "Spotify market restrictions hide required track titles and durations.")
-        return _provider_unresolved(post, "spotify_provider_error", exc, "track.list")
+            return MetadataResolutionFailure(
+                "spotify_catalog_unavailable",
+                "Spotify market restrictions hide required track titles and durations.",
+                ignored=True,
+            )
+        return _resolution_provider_failure("spotify_provider_error", exc, "track.list")
+
     try:
         lfm_candidates = search_lastfm_candidates(lfm, album, limit=10)
     except (OSError, RuntimeError, ValueError, KeyError) as exc:
-        return _provider_unresolved(post, "lastfm_provider_error", exc, "album.search")
+        return _resolution_provider_failure("lastfm_provider_error", exc, "album.search")
     lastfm_match = choose_lastfm_candidate(album, lfm_candidates)
     selected = lastfm_match.get("candidate")
     info = validation = None
@@ -281,23 +296,28 @@ def enrich_known(
                     lastfm_match = {**lastfm_candidate_score(album, selected),
                                     "reason": "lastfm_exact_primary"}
                 else:
-                    lastfm_match = recover_lastfm_candidate(
-                        lfm, album, tracks, contenders)
+                    lastfm_match = recover_lastfm_candidate(lfm, album, tracks, contenders)
                     selected = lastfm_match.get("candidate")
                     info = lastfm_match.get("info")
                     validation = lastfm_match.get("validation")
         except (OSError, RuntimeError, ValueError) as exc:
-            # Missing one contender means uniqueness cannot be established safely.
-            return _provider_unresolved(post, "lastfm_provider_error", exc, "album.getinfo")
+            return _resolution_provider_failure(
+                "lastfm_provider_error", exc, "album.getinfo")
     if selected is None:
         if lastfm_match["reason"] in {"lastfm_no_results", "lastfm_low_confidence"}:
-            return _ignored(
-                post, "lastfm_catalog_unavailable",
-                "Last.fm's current catalog has no safe title/artist match for this release.")
-        return _unresolved(post, lastfm_match["reason"],
-                           "Last.fm did not produce a safe unique match.")
+            return MetadataResolutionFailure(
+                "lastfm_catalog_unavailable",
+                "Last.fm's current catalog has no safe title/artist match for this release.",
+                ignored=True,
+            )
+        return MetadataResolutionFailure(
+            _diagnostic_code(lastfm_match["reason"]),
+            "Last.fm did not produce a safe unique match.",
+        )
+
     lookup_fallback = None
     lookup_route = "artist/title"
+    mbid = None
     try:
         raw_mbid = selected.get("mbid")
         mbid = raw_mbid if isinstance(raw_mbid, str) and _UUID_RE.fullmatch(raw_mbid) else None
@@ -309,14 +329,12 @@ def enrich_known(
         if validation is None:
             validation = validate_lastfm_info(album, tracks, selected, info)
     except (OSError, RuntimeError, ValueError) as exc:
-        return _provider_unresolved(post, "lastfm_provider_error", exc, "album.getinfo")
+        return _resolution_provider_failure("lastfm_provider_error", exc, "album.getinfo")
     original_validation = validation
     if not validation["accepted"] and mbid and lookup_route == "mbid":
-        # A contradictory MBID response is useful evidence. A failed retry must
-        # never hide it or be reclassified as an outage.
         try:
-            alternate = lfm.album_getinfo(artist=selected.get("artist"),
-                                          album=selected.get("name"), autocorrect=0)
+            alternate = lfm.album_getinfo(
+                artist=selected.get("artist"), album=selected.get("name"), autocorrect=0)
             alternate_validation = validate_lastfm_info(album, tracks, selected, alternate)
             if alternate_validation["accepted"]:
                 info, validation = alternate, alternate_validation
@@ -361,7 +379,8 @@ def enrich_known(
                        f"spotify_tracks={original_validation['spotify_track_count']} "
                        f"lastfm_tracks={original_validation['lastfm_track_count']}; "
                        f"gate={original_validation['gate']:.3f}.")
-        return _unresolved(post, code, message)
+        return MetadataResolutionFailure(code, message)
+
     resolved_lastfm_mbid = resolve_lastfm_mbid(info, selected)
     resolved_lastfm_url = resolve_lastfm_url(info, selected)
     artist_names = [a.get("name", "") for a in album.get("artists", [])]
@@ -369,8 +388,6 @@ def enrich_known(
         info, max_n=3, blocklist=LFM_BLOCKLIST, artist_names=artist_names)
     if not genre_names:
         try:
-            # A successful raw fallback establishes the accepted lookup identity;
-            # do not route tag discovery back through the rejected MBID.
             if lookup_fallback:
                 album_tags = lfm.album_gettoptags(
                     artist=info.get("artist"), album=info.get("name"), autocorrect=0)
@@ -388,8 +405,7 @@ def enrich_known(
         for tag_artist in tag_artists:
             for autocorrect in (0, 1):
                 try:
-                    artist_tags = lfm.artist_gettoptags(
-                        tag_artist, autocorrect=autocorrect)
+                    artist_tags = lfm.artist_gettoptags(tag_artist, autocorrect=autocorrect)
                     genre_names = pick_top_tags(
                         artist_tags, max_n=3, blocklist=LFM_BLOCKLIST,
                         artist_names=artist_names)
@@ -419,9 +435,126 @@ def enrich_known(
         genre_names = pick_top_tags(
             {"tags": {"tag": spotify_genres}}, max_n=3,
             blocklist=LFM_BLOCKLIST, artist_names=artist_names)
+
+    diagnostics = []
+    if collaboration_lookup:
+        diagnostics.append({
+            "code": "lastfm_collaboration_lookup",
+            "message": "Accepted Last.fm's exact combined-artist album page."})
+    if stale_tracks:
+        diagnostics.append({
+            "code": "lastfm_stale_tracks",
+            "message": ("Accepted exact Last.fm album/artist identity despite a stale track "
+                        "cache; no search-result MBID was retained.")})
+    if lookup_fallback:
+        diagnostics.append({
+            "code": "lastfm_lookup_fallback",
+            "message": (f"Accepted selected artist/title lookup after MBID validation failed "
+                        f"({lookup_fallback['reason']}); alternate overlap="
+                        f"{validation.get('overlap', 0.0):.3f}.")})
+    if validation.get("reason") == "lastfm_transliteration_alignment":
+        diagnostics.append({
+            "code": "lastfm_transliteration_alignment",
+            "message": (f"Accepted equal {validation['denominator']}-track sequence using "
+                        f"{validation['anchors']} same-position lexical anchors and "
+                        f"{validation['transliterated_pairs']} Latin↔Japanese pairs.")})
+    if not resolved_lastfm_mbid:
+        diagnostics.append({
+            "code": "lastfm_no_mbid",
+            "message": "Validated Last.fm album and selected search result have no usable MBID."})
     if not genre_names:
+        diagnostics.append({
+            "code": "lastfm_no_tags",
+            "message": "No acceptable Last.fm tags or Spotify artist genres were returned."})
+
+    lastfm_score = lastfm_match.get("score", lastfm_candidate_score(album, selected)["score"])
+    lastfm_evidence = {
+        "title": selected["name"], "artist": selected["artist"], "score": lastfm_score}
+    if resolved_lastfm_mbid:
+        lastfm_evidence["mbid"] = resolved_lastfm_mbid
+    if resolved_lastfm_url:
+        lastfm_evidence["url"] = resolved_lastfm_url
+    if "overlap" in validation:
+        lastfm_evidence["track_overlap"] = validation["overlap"]
+    return ResolvedAlbumMetadata(
+        lastfm_url=resolved_lastfm_url,
+        lastfm_mbid=resolved_lastfm_mbid,
+        genres=genre_names,
+        lastfm_listeners=parse_lastfm_listeners(info),
+        lastfm_evidence=lastfm_evidence,
+        diagnostics=diagnostics,
+    )
+
+
+def enrich_known(
+    post: dict,
+    spt: Any,
+    lfm: Any,
+    album: dict,
+    tracks: list[dict],
+    artist_names: list[str],
+    write_policy: str = WRITE_FILL_ONLY,
+    spotify_match: dict | None = None,
+    listen_count: int = 1,
+    track_highlights: dict[str, bool] | None = None,
+) -> dict | None:
+    """Enrich one post from an already selected canonical Spotify release."""
+    if write_policy not in (WRITE_FILL_ONLY, WRITE_OVERWRITE_MANAGED):
+        raise ValueError(f"Unknown write policy: {write_policy}")
+    if write_policy == WRITE_FILL_ONLY and post_is_complete(post):
+        return None
+
+    pid = post["id"]
+    acf_in = post.get("acf") or {}
+    title = post["title"]["rendered"]
+    post_date = post["date"]
+    tag_names = [name for name in artist_names if name]
+    q_title = raw_query(title)
+    q_artists = [raw_query(name) for name in tag_names if raw_query(name)]
+    if not q_artists:
+        return _unresolved(post, "spotify_missing_artist", "No artist tags were available.")
+    winner = album
+    spotify_match = spotify_match or {"candidate": album, "score": 1.0}
+
+    resolved = resolve_known_album_metadata(spt, lfm, album, tracks)
+    if isinstance(resolved, MetadataResolutionFailure):
+        result = _unresolved(post, resolved.code, resolved.message, resolved.details)
+        return {**result, "ignored": True} if resolved.ignored else result
+    if not resolved.genres:
         log.warning("post %d — no useful artist or release genres for %s; leaving genre unchanged",
                     pid, album["name"])
+
+    return build_known_album_patch(
+        post, album, tracks, tag_names, resolved, write_policy, spotify_match,
+        listen_count, track_highlights)
+
+
+def build_known_album_patch(
+    post: dict,
+    album: dict,
+    tracks: list[dict],
+    artist_names: list[str],
+    resolved_metadata: ResolvedAlbumMetadata,
+    write_policy: str = WRITE_FILL_ONLY,
+    spotify_match: dict | None = None,
+    listen_count: int = 1,
+    track_highlights: dict[str, bool] | None = None,
+) -> dict:
+    """Build a WordPress patch from local Spotify evidence and resolved static metadata."""
+    if write_policy not in (WRITE_FILL_ONLY, WRITE_OVERWRITE_MANAGED):
+        raise ValueError(f"Unknown write policy: {write_policy}")
+    pid = post["id"]
+    acf_in = post.get("acf") or {}
+    title = post["title"]["rendered"]
+    post_date = post["date"]
+    tag_names = [name for name in artist_names if name]
+    q_title = raw_query(title)
+    q_artists = [raw_query(name) for name in tag_names if raw_query(name)]
+    winner = album
+    spotify_match = spotify_match or {"candidate": album, "score": 1.0}
+    genre_names = resolved_metadata.genres
+    resolved_lastfm_url = resolved_metadata.lastfm_url
+    resolved_lastfm_mbid = resolved_metadata.lastfm_mbid
 
     # Rebuilding provider-owned rows must not reset the editor-owned highlight.
     highlights = track_highlights if track_highlights is not None else {
@@ -442,8 +575,6 @@ def enrich_known(
     length_ms = sum(t["duration_ms"] for t in track_rows)
     total     = album.get("total_tracks") or len(track_rows)
     rt_term_name = compute_release_type(track_rows, album.get("album_type", ""))
-    rt_term_slug = rt_term_name.lower()
-
     acf_out: dict[str, Any] = {}
     managed_values = {
         "spotify_title": album.get("name"),
@@ -479,41 +610,9 @@ def enrich_known(
     if genre_names and (write_policy == WRITE_OVERWRITE_MANAGED or not post.get("genre")):
         taxonomies["genre"] = genre_names
     write["taxonomies"] = taxonomies
-    diagnostics = []
-    if collaboration_lookup:
-        diagnostics.append({
-            "code": "lastfm_collaboration_lookup",
-            "message": "Accepted Last.fm's exact combined-artist album page."})
-    if stale_tracks:
-        diagnostics.append({
-            "code": "lastfm_stale_tracks",
-            "message": ("Accepted exact Last.fm album/artist identity despite a stale track "
-                        "cache; no search-result MBID was retained.")})
-    if lookup_fallback:
-        diagnostics.append({
-            "code": "lastfm_lookup_fallback",
-            "message": (f"Accepted selected artist/title lookup after MBID validation failed "
-                        f"({lookup_fallback['reason']}); alternate overlap="
-                        f"{validation.get('overlap', 0.0):.3f}.")})
-    if validation.get("reason") == "lastfm_transliteration_alignment":
-        diagnostics.append({
-            "code": "lastfm_transliteration_alignment",
-            "message": (f"Accepted equal {validation['denominator']}-track sequence using "
-                        f"{validation['anchors']} same-position lexical anchors and "
-                        f"{validation['transliterated_pairs']} Latin↔Japanese pairs.")})
-    if not resolved_lastfm_mbid:
-        diagnostics.append({"code": "lastfm_no_mbid", "message": "Validated Last.fm album and selected search result have no usable MBID."})
-    if not genre_names:
-        diagnostics.append({
-            "code": "lastfm_no_tags",
-            "message": "No acceptable Last.fm tags or Spotify artist genres were returned."})
+    diagnostics = list(resolved_metadata.diagnostics)
     spotify_score = spotify_match.get("score", spotify_candidate_score(winner, q_title, q_artists)["score"])
-    lastfm_score = lastfm_match.get("score", lastfm_candidate_score(album, selected)["score"])
-    lastfm_evidence = {"title": selected["name"], "artist": selected["artist"],
-                       "score": lastfm_score}
-    if resolved_lastfm_mbid: lastfm_evidence["mbid"] = resolved_lastfm_mbid
-    if resolved_lastfm_url: lastfm_evidence["url"] = resolved_lastfm_url
-    if "overlap" in validation: lastfm_evidence["track_overlap"] = validation["overlap"]
+    lastfm_evidence = dict(resolved_metadata.lastfm_evidence)
     patch = {"post_id": pid, "post_title": title,
              "matches": {"spotify": {"id": album["id"], "title": album["name"],
                                         "artists": [a["name"] for a in album.get("artists", [])],

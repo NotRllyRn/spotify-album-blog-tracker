@@ -149,6 +149,15 @@ def resolve_lastfm_url(info: dict, selected: dict) -> str | None:
     return None
 
 
+def parse_lastfm_listeners(info: dict) -> int | None:
+    """Return a non-negative listener count without conflating missing data with zero."""
+    try:
+        value = int(info.get("listeners"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 def _lastfm_artist_score(spotify_album: dict, artist: str) -> float:
     expected = [match_key(a.get("name", "")) for a in spotify_album.get("artists", [])
                 if match_key(a.get("name", ""))]
