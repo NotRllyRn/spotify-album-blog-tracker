@@ -540,6 +540,10 @@ class TestSavedLibraryService(unittest.IsolatedAsyncioTestCase):
             last_seen_at=datetime(2024, 1, 1),
         )
 
+    async def test_null_saved_album_item_is_ignored(self):
+        service = SavedLibraryService.__new__(SavedLibraryService)
+        self.assertIsNone(await service._build_saved_album(None, {}, []))
+
     async def test_matching_total_and_hash_skips_full_sync(self):
         first_page = {
             "total": 1,

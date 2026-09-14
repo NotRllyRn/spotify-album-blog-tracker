@@ -533,6 +533,8 @@ class SavedLibraryService:
         existing_by_id: Dict[str, SavedLibraryAlbum],
         wordpress_posts: List[WordPressPost],
     ) -> Optional[SavedLibraryAlbum]:
+        if not item:
+            return None
         album = item.get("album") or {}
         spotify_id = album.get("id")
         if not spotify_id:
