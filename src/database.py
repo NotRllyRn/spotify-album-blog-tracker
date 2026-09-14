@@ -21,6 +21,7 @@ from models import (
     SavedLibraryAlbum,
     SavedLibrarySnapshotItem,
     SavedLibraryStats,
+    CachedAlbumMetadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -571,6 +572,82 @@ class Database:
             created_at=datetime.fromisoformat(row[13]) if row[13] else None,
             updated_at=datetime.fromisoformat(row[14]) if row[14] else None,
         )
+
+    # Static provider metadata cache
+    async def get_album_metadata_cache(
+        self, spotify_id: str, resolver_version: Optional[int] = None
+    ) -> Optional[CachedAlbumMetadata]:
+        """Return a cached resolution, optionally requiring a current resolver version."""
+        query = """
+            SELECT spotify_id, status, lastfm_url, lastfm_mbid, genres_json,
+                   lastfm_listeners, diagnostic_code, resolver_version, updated_at
+            FROM album_metadata_cache
+            WHERE spotify_id = ?
+        """
+        values: tuple[Any, ...] = (spotify_id,)
+        if resolver_version is not None:
+            query += " AND resolver_version = ?"
+            values += (resolver_version,)
+        cursor = await self.connection.execute(query, values)
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return CachedAlbumMetadata(
+            spotify_id=row[0],
+            status=row[1],
+            lastfm_url=row[2],
+            lastfm_mbid=row[3],
+            genres=_load_json_list(row[4]),
+            lastfm_listeners=row[5],
+            diagnostic_code=row[6],
+            resolver_version=row[7],
+            updated_at=datetime.fromisoformat(row[8]),
+        )
+
+    async def save_album_metadata_cache(self, metadata: CachedAlbumMetadata) -> None:
+        """Persist one completed provider resolution independently of other domains."""
+        await self.connection.execute("""
+            INSERT INTO album_metadata_cache
+            (spotify_id, status, lastfm_url, lastfm_mbid, genres_json,
+             lastfm_listeners, diagnostic_code, resolver_version, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(spotify_id) DO UPDATE SET
+                status = excluded.status,
+                lastfm_url = excluded.lastfm_url,
+                lastfm_mbid = excluded.lastfm_mbid,
+                genres_json = excluded.genres_json,
+                lastfm_listeners = excluded.lastfm_listeners,
+                diagnostic_code = excluded.diagnostic_code,
+                resolver_version = excluded.resolver_version,
+                updated_at = excluded.updated_at
+        """, (
+            metadata.spotify_id,
+            metadata.status,
+            metadata.lastfm_url,
+            metadata.lastfm_mbid,
+            json.dumps(metadata.genres),
+            metadata.lastfm_listeners,
+            metadata.diagnostic_code,
+            metadata.resolver_version,
+            metadata.updated_at.isoformat(),
+        ))
+        await self.connection.commit()
+
+    async def get_unposted_saved_library_ids_missing_metadata(
+        self, resolver_version: int
+    ) -> List[str]:
+        """Return unposted saved releases without a completed current resolution."""
+        cursor = await self.connection.execute("""
+            SELECT saved.spotify_id
+            FROM saved_library_album AS saved
+            LEFT JOIN album_metadata_cache AS metadata
+              ON metadata.spotify_id = saved.spotify_id
+             AND metadata.resolver_version = ?
+            WHERE saved.is_posted_listened = 0
+              AND metadata.spotify_id IS NULL
+            ORDER BY saved.added_at DESC
+        """, (resolver_version,))
+        return [row[0] for row in await cursor.fetchall()]
 
     # Discord operations
     async def save_discord_prompt(self, prompt: DiscordPrompt):

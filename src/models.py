@@ -142,6 +142,29 @@ class SavedLibrarySyncResult:
     removed: int = 0
     message: str = ""
 
+
+@dataclass
+class CachedAlbumMetadata:
+    spotify_id: str
+    status: str
+    lastfm_url: Optional[str]
+    lastfm_mbid: Optional[str]
+    genres: List[str]
+    lastfm_listeners: Optional[int]
+    diagnostic_code: Optional[str]
+    resolver_version: int
+    updated_at: datetime
+
+
+@dataclass
+class RandomAlbumSelection:
+    album: SavedLibraryAlbum
+    popularity_focus: int
+    listener_count: Optional[int] = None
+    popularity_rank: Optional[int] = None
+    rankable_total: Optional[int] = None
+    candidate_pool_size: Optional[int] = None
+
 @dataclass
 class DiscordPrompt:
     id: int
