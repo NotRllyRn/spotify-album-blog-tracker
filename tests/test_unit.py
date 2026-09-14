@@ -10,6 +10,7 @@ import logging
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import sys
@@ -39,6 +40,7 @@ from models import (
     DiscordPrompt,
     PublishResult,
     QuickMetadata,
+    RandomAlbumSelection,
     PromptState,
     PromptType,
 )
@@ -950,6 +952,16 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
             added_at=datetime(2024, 1, 1, 12, 0, 0),
         )
 
+    def make_random_selection(self, spotify_id="album_random", title="Random Album", focus=0):
+        return RandomAlbumSelection(
+            album=self.make_saved_library_album(spotify_id, title),
+            popularity_focus=focus,
+            listener_count=1000 if focus else None,
+            popularity_rank=3 if focus else None,
+            rankable_total=100 if focus else None,
+            candidate_pool_size=20 if focus else None,
+        )
+
     def test_inprogress_format_includes_next_track(self):
         release = make_release_for_test(
             "album_4",
@@ -1032,9 +1044,9 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(labels, ["Re-roll"])
 
     def test_random_album_embed_uses_cached_cover_and_spotify_link(self):
-        album = self.make_saved_library_album()
+        selection = self.make_random_selection()
 
-        embed = self.bot._build_random_album_embed(album)
+        embed = self.bot._build_random_album_embed(selection)
         field_map = {field.name: field.value for field in embed.fields}
 
         self.assertEqual(embed.title, "Random Album")
@@ -1042,10 +1054,19 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(embed.thumbnail.url, "https://example.com/album_random.jpg")
         self.assertEqual(field_map["Release type"], "Album")
 
+    def test_focused_random_embed_explains_rank_and_pool(self):
+        embed = self.bot._build_random_album_embed(self.make_random_selection(focus=75))
+        fields = {field.name: field.value for field in embed.fields}
+
+        self.assertEqual(fields["Popularity focus"], "75/100")
+        self.assertEqual(fields["Last.fm rank"], "#3 of 100")
+        self.assertEqual(fields["Selection pool"], "Top 20")
+        self.assertEqual(fields["Listeners"], "1,000")
+
     async def test_random_command_sends_reroll_view(self):
-        album = self.make_saved_library_album()
+        selection = self.make_random_selection()
         db = type("FakeDatabase", (), {})()
-        db.get_random_unposted_saved_library_album = AsyncMock(return_value=album)
+        db.get_random_unposted_saved_library_album = AsyncMock(return_value=selection)
         self.bot.db = db
         interaction = self.make_interaction()
 
@@ -1056,22 +1077,25 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         kwargs = interaction.followup.send.await_args.kwargs
         self.assertEqual(kwargs["embed"].title, "Random Album")
         self.assertIsInstance(kwargs["view"], RandomAlbumView)
+        self.assertEqual(kwargs["view"].popularity_focus, 0)
         self.assertTrue(kwargs["ephemeral"])
 
     async def test_random_reroll_edits_original_message(self):
-        album = self.make_saved_library_album("album_new", "New Album")
+        selection = self.make_random_selection("album_new", "New Album", focus=75)
         db = type("FakeDatabase", (), {})()
-        db.get_random_unposted_saved_library_album = AsyncMock(return_value=album)
+        db.get_random_unposted_saved_library_album = AsyncMock(return_value=selection)
         self.bot.db = db
         interaction = self.make_interaction()
 
-        await self.bot._handle_random_reroll(interaction)
+        await self.bot._handle_random_reroll(interaction, 75)
 
         interaction.response.edit_message.assert_awaited_once()
         kwargs = interaction.response.edit_message.await_args.kwargs
         self.assertIsNone(kwargs["content"])
         self.assertEqual(kwargs["embed"].title, "New Album")
         self.assertIsInstance(kwargs["view"], RandomAlbumView)
+        self.assertEqual(kwargs["view"].popularity_focus, 75)
+        db.get_random_unposted_saved_library_album.assert_awaited_once_with(75)
 
     async def test_random_reroll_edits_to_empty_state_when_no_album_exists(self):
         db = type("FakeDatabase", (), {})()
@@ -1086,6 +1110,17 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
             embed=None,
             view=None
         )
+
+    async def test_focused_random_empty_state_does_not_fall_back(self):
+        self.bot.db = SimpleNamespace(
+            get_random_unposted_saved_library_album=AsyncMock(return_value=None))
+        interaction = self.make_interaction()
+
+        await self.bot._handle_random(interaction, 50)
+
+        message = interaction.followup.send.await_args.args[0]
+        self.assertIn("metadata is still being prepared", message)
+        self.assertIn("popularity:0", message)
 
     async def test_add_content_action_opens_modal_without_completing_prompt(self):
         release = make_release_for_test("album_modal", "Album Modal", datetime(2024, 1, 1, 12, 0, 0))

@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from database import Database
+from database import Database, popularity_pool_size
 from album_metadata.lastfm import parse_lastfm_listeners
 from album_metadata_cache import AlbumMetadataCacheService, MetadataCacheProviderError
 from models import Artist, CachedAlbumMetadata, LifecycleStatus, Release, ReleaseType, SavedLibraryAlbum, Track
@@ -101,6 +101,30 @@ class AlbumMetadataCacheDatabaseTests(unittest.IsolatedAsyncioTestCase):
         stored = await self.db.get_release("album-explicit")
         self.assertTrue(stored.tracks[0].explicit)
 
+    async def test_random_zero_includes_album_without_metadata(self):
+        await self.db.upsert_saved_library_album(self.saved_album("unknown"))
+
+        selection = await self.db.get_random_unposted_saved_library_album(0)
+
+        self.assertEqual(selection.album.spotify_id, "unknown")
+        self.assertEqual(selection.popularity_focus, 0)
+
+    async def test_focused_random_uses_only_top_ten_ranked_listener_counts(self):
+        for index in range(20):
+            spotify_id = f"album-{index:02}"
+            await self.db.upsert_saved_library_album(self.saved_album(spotify_id))
+            metadata = self.metadata(spotify_id)
+            metadata.lastfm_listeners = 20 - index
+            await self.db.save_album_metadata_cache(metadata)
+        await self.db.upsert_saved_library_album(self.saved_album("unknown"))
+
+        for _ in range(20):
+            selection = await self.db.get_random_unposted_saved_library_album(100)
+            self.assertLessEqual(selection.popularity_rank, 10)
+            self.assertEqual(selection.rankable_total, 20)
+            self.assertEqual(selection.candidate_pool_size, 10)
+            self.assertNotEqual(selection.album.spotify_id, "unknown")
+
 class ListenerParsingTests(unittest.TestCase):
     def test_parses_only_non_negative_listener_counts(self):
         self.assertEqual(parse_lastfm_listeners({"listeners": "123456"}), 123456)
@@ -109,6 +133,16 @@ class ListenerParsingTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIsNone(parse_lastfm_listeners({"listeners": value}))
         self.assertIsNone(parse_lastfm_listeners({}))
+
+    def test_popularity_pool_formula_boundaries(self):
+        self.assertEqual(popularity_pool_size(0, 100), 0)
+        self.assertEqual(popularity_pool_size(9, 100), 9)
+        self.assertEqual(popularity_pool_size(10, 100), 10)
+        self.assertEqual(popularity_pool_size(600, 0), 600)
+        self.assertEqual(popularity_pool_size(600, 50), 77)
+        self.assertEqual(popularity_pool_size(600, 100), 10)
+        with self.assertRaises(ValueError):
+            popularity_pool_size(100, 101)
 
 
 class FakeMetadataSpotify:

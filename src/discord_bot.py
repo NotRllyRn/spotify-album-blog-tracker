@@ -15,7 +15,7 @@ from urllib.parse import urlparse, urlunparse
 from config import Config
 from database import Database
 from tracker import Tracker
-from models import PublishResult, QuickMetadata, Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost, SavedLibraryAlbum
+from models import PublishResult, QuickMetadata, RandomAlbumSelection, Release, PromptType, PromptState, DiscordPrompt, LifecycleStatus, PlaybackState, WordPressPost
 from inprogress import INPROGRESS_PAGE_SIZE, InProgressPage, build_inprogress_page, get_next_unlistened_track
 from editor_view import (
     EditorView, add_quick_metadata_fields, open_pre_publish_editor,
@@ -398,13 +398,17 @@ class ConfirmCurrentPostView(PromptView):
 
 
 class RandomAlbumView(PromptView):
+    def __init__(self, discord_bot: "DiscordBot", popularity_focus: int = 0):
+        super().__init__(discord_bot)
+        self.popularity_focus = popularity_focus
+
     @discord.ui.button(
         label="Re-roll",
         style=discord.ButtonStyle.secondary,
         custom_id="random_album_reroll"
     )
     async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.discord_bot._handle_random_reroll(interaction)
+        await self.discord_bot._handle_random_reroll(interaction, self.popularity_focus)
 
 
 class DiscordBot:
@@ -442,8 +446,13 @@ class DiscordBot:
             await self._handle_service(interaction)
 
         @self.tree.command(name="random", description="Pick a random unposted saved-library album")
-        async def random(interaction: discord.Interaction):
-            await self._handle_random(interaction)
+        @app_commands.describe(
+            popularity="0 = completely random; 100 = only the most popular remaining albums")
+        async def random(
+            interaction: discord.Interaction,
+            popularity: app_commands.Range[int, 0, 100] = 0,
+        ):
+            await self._handle_random(interaction, popularity)
 
         @self.tree.command(name="search", description="Fuzzy search cached WordPress posts and open the metadata editor")
         @app_commands.describe(query="Search terms (e.g. 'pink floyd moon')")
@@ -478,7 +487,6 @@ class DiscordBot:
         self.bot.add_view(SeventyFivePromptView(self))
         self.bot.add_view(RelistenApprovalPromptView(self))
         self.bot.add_view(PublishedPostActionView(self, show_retry=True))
-        self.bot.add_view(RandomAlbumView(self))
         self.bot.add_view(ReleaseActionView(self, release_id="*", return_page=0))
         # Register a placeholder editor view so the editor's static custom_ids
         # (bool/modal/nav) are recognised after a bot restart. The placeholder
@@ -1615,7 +1623,7 @@ class DiscordBot:
                 ephemeral=True
             )
 
-    async def _handle_random(self, interaction: discord.Interaction):
+    async def _handle_random(self, interaction: discord.Interaction, popularity_focus: int = 0):
         """Handle /random command."""
         if not self._check_authorized(interaction.user.id):
             await interaction.response.send_message(
@@ -1627,17 +1635,21 @@ class DiscordBot:
         await interaction.response.defer(ephemeral=True)
 
         try:
-            album = await self.db.get_random_unposted_saved_library_album()
-            if album is None:
+            selection = await self.db.get_random_unposted_saved_library_album(popularity_focus)
+            if selection is None:
+                message = (
+                    "Popularity metadata is still being prepared. "
+                    "Use /random popularity:0 for a completely random pick."
+                    if popularity_focus else "No unposted saved-library albums found.")
                 await interaction.followup.send(
-                    "No unposted saved-library albums found.",
+                    message,
                     ephemeral=True
                 )
                 return
 
             await interaction.followup.send(
-                embed=self._build_random_album_embed(album),
-                view=RandomAlbumView(self),
+                embed=self._build_random_album_embed(selection),
+                view=RandomAlbumView(self, popularity_focus),
                 ephemeral=True
             )
         except Exception as e:
@@ -1647,7 +1659,9 @@ class DiscordBot:
                 ephemeral=True
             )
 
-    async def _handle_random_reroll(self, interaction: discord.Interaction):
+    async def _handle_random_reroll(
+        self, interaction: discord.Interaction, popularity_focus: int = 0
+    ):
         """Handle the /random re-roll button by editing the existing message."""
         if not self._check_authorized(interaction.user.id):
             await interaction.response.send_message(
@@ -1657,10 +1671,14 @@ class DiscordBot:
             return
 
         try:
-            album = await self.db.get_random_unposted_saved_library_album()
-            if album is None:
+            selection = await self.db.get_random_unposted_saved_library_album(popularity_focus)
+            if selection is None:
+                message = (
+                    "Popularity metadata is still being prepared. "
+                    "Use /random popularity:0 for a completely random pick."
+                    if popularity_focus else "No unposted saved-library albums found.")
                 await interaction.response.edit_message(
-                    content="No unposted saved-library albums found.",
+                    content=message,
                     embed=None,
                     view=None
                 )
@@ -1668,8 +1686,8 @@ class DiscordBot:
 
             await interaction.response.edit_message(
                 content=None,
-                embed=self._build_random_album_embed(album),
-                view=RandomAlbumView(self)
+                embed=self._build_random_album_embed(selection),
+                view=RandomAlbumView(self, popularity_focus)
             )
         except Exception as e:
             logger.error("Error re-rolling /random", exc_info=True)
@@ -1679,7 +1697,8 @@ class DiscordBot:
             else:
                 await interaction.response.send_message(message, ephemeral=True)
 
-    def _build_random_album_embed(self, album: SavedLibraryAlbum) -> discord.Embed:
+    def _build_random_album_embed(self, selection: RandomAlbumSelection) -> discord.Embed:
+        album = selection.album
         artist_text = ", ".join(album.artists[:5]) or "Unknown"
         embed = discord.Embed(
             title=album.title,
@@ -1690,6 +1709,23 @@ class DiscordBot:
         embed.add_field(name="Release type", value=album.release_type.value, inline=True)
         embed.add_field(name="Saved", value=f"<t:{_unix_timestamp(album.added_at)}:D>", inline=True)
         embed.add_field(name="Spotify ID", value=album.spotify_id, inline=False)
+        if selection.popularity_focus:
+            embed.add_field(
+                name="Popularity focus",
+                value=f"{selection.popularity_focus}/100",
+                inline=True)
+            embed.add_field(
+                name="Last.fm rank",
+                value=f"#{selection.popularity_rank:,} of {selection.rankable_total:,}",
+                inline=True)
+            embed.add_field(
+                name="Selection pool",
+                value=f"Top {selection.candidate_pool_size:,}",
+                inline=True)
+            embed.add_field(
+                name="Listeners",
+                value=f"{selection.listener_count:,}",
+                inline=True)
         if album.spotify_url:
             embed.add_field(name="Spotify link", value=album.spotify_url, inline=False)
         if album.cover_url:

@@ -22,9 +22,21 @@ from models import (
     SavedLibrarySnapshotItem,
     SavedLibraryStats,
     CachedAlbumMetadata,
+    RandomAlbumSelection,
 )
+from album_metadata_cache import METADATA_RESOLVER_VERSION
 
 logger = logging.getLogger(__name__)
+
+
+def popularity_pool_size(rankable_total: int, popularity_focus: int) -> int:
+    """Return the nonlinear top-ranked candidate count for a popularity focus."""
+    if not 0 <= popularity_focus <= 100:
+        raise ValueError("Popularity focus must be between 0 and 100")
+    if rankable_total <= 10 or popularity_focus == 0:
+        return max(0, rankable_total)
+    size = round(rankable_total * (10 / rankable_total) ** (popularity_focus / 100))
+    return min(rankable_total, max(10, size))
 
 
 def _load_json_list(value: str) -> list:
@@ -529,9 +541,14 @@ class Database:
         await self.connection.commit()
         return cursor.rowcount > 0
 
-    async def get_random_unposted_saved_library_album(self) -> Optional[SavedLibraryAlbum]:
-        """Return a random saved-library album that has not been posted/listened."""
-        cursor = await self.connection.execute("""
+    async def get_random_unposted_saved_library_album(
+        self, popularity_focus: int = 0
+    ) -> Optional[RandomAlbumSelection]:
+        """Pick every unposted album at focus zero or from a listener-ranked pool."""
+        if not 0 <= popularity_focus <= 100:
+            raise ValueError("Popularity focus must be between 0 and 100")
+        if popularity_focus == 0:
+            cursor = await self.connection.execute("""
             SELECT spotify_id, spotify_uri, spotify_url, title, normalized_title,
                    artists_json, normalized_artists_json, album_type, release_type,
                    cover_url, added_at, is_posted_listened, wordpress_post_id,
@@ -540,9 +557,55 @@ class Database:
             WHERE is_posted_listened = 0
             ORDER BY RANDOM()
             LIMIT 1
-        """)
+            """)
+            row = await cursor.fetchone()
+            return (RandomAlbumSelection(
+                album=self._row_to_saved_library_album(row), popularity_focus=0)
+                if row else None)
+
+        cursor = await self.connection.execute("""
+            SELECT COUNT(*)
+            FROM saved_library_album AS saved
+            JOIN album_metadata_cache AS metadata ON metadata.spotify_id = saved.spotify_id
+            WHERE saved.is_posted_listened = 0
+              AND metadata.status = 'ready'
+              AND metadata.resolver_version = ?
+              AND metadata.lastfm_listeners IS NOT NULL
+        """, (METADATA_RESOLVER_VERSION,))
         row = await cursor.fetchone()
-        return self._row_to_saved_library_album(row) if row else None
+        rankable_total = _as_int(row[0], "rankable album total") if row else 0
+        pool_size = popularity_pool_size(rankable_total, popularity_focus)
+        if pool_size == 0:
+            return None
+
+        cursor = await self.connection.execute("""
+            WITH ranked AS (
+                SELECT saved.*, metadata.lastfm_listeners,
+                       ROW_NUMBER() OVER (
+                           ORDER BY metadata.lastfm_listeners DESC, saved.spotify_id ASC
+                       ) AS popularity_rank
+                FROM saved_library_album AS saved
+                JOIN album_metadata_cache AS metadata
+                  ON metadata.spotify_id = saved.spotify_id
+                WHERE saved.is_posted_listened = 0
+                  AND metadata.status = 'ready'
+                  AND metadata.resolver_version = ?
+                  AND metadata.lastfm_listeners IS NOT NULL
+            )
+            SELECT * FROM ranked
+            WHERE popularity_rank <= ?
+            ORDER BY RANDOM()
+            LIMIT 1
+        """, (METADATA_RESOLVER_VERSION, pool_size))
+        row = await cursor.fetchone()
+        return (RandomAlbumSelection(
+            album=self._row_to_saved_library_album(row),
+            popularity_focus=popularity_focus,
+            listener_count=row[15],
+            popularity_rank=row[16],
+            rankable_total=rankable_total,
+            candidate_pool_size=pool_size,
+        ) if row else None)
 
     async def get_saved_library_stats(self) -> SavedLibraryStats:
         """Return total and posted/listened saved-library counts."""
