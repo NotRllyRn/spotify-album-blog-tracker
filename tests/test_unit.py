@@ -543,6 +543,7 @@ class TestSavedLibraryService(unittest.IsolatedAsyncioTestCase):
     async def test_null_saved_album_item_is_ignored(self):
         service = SavedLibraryService.__new__(SavedLibraryService)
         self.assertIsNone(await service._build_saved_album(None, {}, []))
+        self.assertIsNone(service._build_snapshot_item(None, 0))
 
     async def test_matching_total_and_hash_skips_full_sync(self):
         first_page = {

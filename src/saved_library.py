@@ -451,6 +451,8 @@ class SavedLibraryService:
         item: Dict[str, Any],
         position: int,
     ) -> Optional[SavedLibrarySnapshotItem]:
+        if not item:
+            return None
         album = item.get("album") or {}
         spotify_id = album.get("id")
         if not spotify_id:
