@@ -329,25 +329,27 @@ class Tracker:
 
     async def _send_75_prompt(self, release: Release):
         """Send 75% completion prompt."""
+        if not self.discord_bot:
+            return
+        message = await self.discord_bot.send_75_percent_prompt(release)
+        if not message:
+            logger.warning("75%% prompt delivery failed for %s; it will be retried.", release.title)
+            return
+        prompt = DiscordPrompt(
+            id=0,
+            prompt_type=PromptType.PROMPT_75_PERCENT.value,
+            release_id=release.spotify_id,
+            wordpress_post_id=None,
+            discord_message_id=str(message.id),
+            state=PromptState.PENDING.value
+        )
+        await self.db.save_discord_prompt(prompt)
         release.status = LifecycleStatus.AWAITING_75_DECISION
         await self.db.save_release(release)
         await self.db.log_audit_event("75_percent_prompt_sent", {
             "spotify_id": release.spotify_id,
             "release_title": release.title
         })
-
-        if self.discord_bot:
-            message = await self.discord_bot.send_75_percent_prompt(release)
-            if message:
-                prompt = DiscordPrompt(
-                    id=0,
-                    prompt_type=PromptType.PROMPT_75_PERCENT.value,
-                    release_id=release.spotify_id,
-                    wordpress_post_id=None,
-                    discord_message_id=str(message.id),
-                    state=PromptState.PENDING.value
-                )
-                await self.db.save_discord_prompt(prompt)
 
         logger.info(f"75% prompt sent for {release.title}")
 

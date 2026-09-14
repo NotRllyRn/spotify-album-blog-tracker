@@ -275,6 +275,13 @@ class ReleaseActionView(PromptView):
         self.release_id = release_id
         self.return_page = return_page
 
+    async def _resolve_release_id(self, interaction: discord.Interaction) -> Optional[str]:
+        release_id = self.discord_bot._release_action_id(interaction, self.release_id)
+        if release_id is None:
+            await interaction.response.send_message(
+                "⚠️ Unable to identify the selected release.", ephemeral=True)
+        return release_id
+
     @discord.ui.button(
         label="Publish early",
         style=discord.ButtonStyle.success,
@@ -282,7 +289,8 @@ class ReleaseActionView(PromptView):
         row=0
     )
     async def publish_early(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.discord_bot._handle_publish_release(interaction, self.release_id)
+        if release_id := await self._resolve_release_id(interaction):
+            await self.discord_bot._handle_publish_release(interaction, release_id)
 
     @discord.ui.button(
         label="Edit metadata",
@@ -291,7 +299,8 @@ class ReleaseActionView(PromptView):
         row=0
     )
     async def edit_metadata(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.discord_bot._handle_edit_metadata_pre_publish(interaction, self.release_id)
+        if release_id := await self._resolve_release_id(interaction):
+            await self.discord_bot._handle_edit_metadata_pre_publish(interaction, release_id)
 
     @discord.ui.button(
         label="Remove from database",
@@ -300,7 +309,8 @@ class ReleaseActionView(PromptView):
         row=0
     )
     async def remove_from_database(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.discord_bot._handle_remove_release_prompt(interaction, self.release_id)
+        if release_id := await self._resolve_release_id(interaction):
+            await self.discord_bot._handle_remove_release_prompt(interaction, release_id)
 
     @discord.ui.button(
         label="Show missing songs",
@@ -309,7 +319,8 @@ class ReleaseActionView(PromptView):
         row=0
     )
     async def show_missing_songs(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.discord_bot._handle_missing_songs(interaction, self.release_id)
+        if release_id := await self._resolve_release_id(interaction):
+            await self.discord_bot._handle_missing_songs(interaction, release_id)
 
     @discord.ui.button(
         label="Back",
@@ -494,6 +505,18 @@ class DiscordBot:
     def _check_authorized(self, user_id: int) -> bool:
         """Check if user is authorized."""
         return user_id == self.config.discord_user_id
+
+    def _release_action_id(
+        self, interaction: discord.Interaction, configured_id: str
+    ) -> Optional[str]:
+        """Recover a persistent release action's identity from its durable embed."""
+        if configured_id != "*":
+            return configured_id
+        for embed in getattr(interaction.message, "embeds", []):
+            for field in embed.fields:
+                if field.name == "Spotify ID" and str(field.value).strip():
+                    return str(field.value).strip()
+        return None
 
     async def _get_user(self) -> Optional[discord.User]:
         user = self.bot.get_user(self.config.discord_user_id)
@@ -915,8 +938,7 @@ class DiscordBot:
             interaction, "✅ Metadata was filled and verified.")
 
     async def _handle_75_publish(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
-        await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.ACCEPTED.value)
-        await self._publish_release_with_feedback(
+        outcome = await self._publish_release_with_feedback(
             interaction,
             release,
             success_message="✅ Published early. A notification has been sent.",
@@ -927,6 +949,9 @@ class DiscordBot:
             ),
             already_publishing_message="⏳ This release is already being published."
         )
+        if outcome in ("published", "already_published"):
+            await self.db.update_discord_prompt_state(
+                prompt.discord_message_id, PromptState.ACCEPTED.value)
 
     async def _handle_75_wait(self, interaction: discord.Interaction, release: Release, prompt: DiscordPrompt):
         await self.db.update_discord_prompt_state(prompt.discord_message_id, PromptState.DECLINED.value)
@@ -1396,7 +1421,7 @@ class DiscordBot:
         already_published_message: str,
         already_publishing_message: str,
         as_relisten: bool = False
-    ):
+    ) -> Optional[str]:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
@@ -1404,19 +1429,21 @@ class DiscordBot:
             outcome = await self.tracker.publish_release_now(release, as_relisten=as_relisten)
             if outcome == "already_published":
                 await interaction.followup.send(already_published_message, ephemeral=True)
-                return
+                return outcome
 
             if outcome == "already_publishing":
                 await interaction.followup.send(already_publishing_message, ephemeral=True)
-                return
+                return outcome
 
             await interaction.followup.send(success_message, ephemeral=True)
+            return outcome
         except Exception as e:
             logger.error(f"Error publishing release {release.spotify_id}: {e}", exc_info=True)
             await interaction.followup.send(
                 f"❌ Error publishing release: {str(e)[:100]}",
                 ephemeral=True
             )
+            return None
 
     def _build_inprogress_embed(self, page_data: InProgressPage) -> discord.Embed:
         featured = page_data.featured
