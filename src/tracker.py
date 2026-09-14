@@ -32,12 +32,14 @@ class Tracker:
         db: Database,
         publisher: Optional["Publisher"] = None,
         discord_bot=None,
+        metadata_cache=None,
     ):
         self.config = config
         self.db = db
         self.spotify = SpotifyClient(config)
         self._publisher = publisher
         self.discord_bot = discord_bot
+        self.metadata_cache = metadata_cache
         self.running = False
 
         # Polling intervals (seconds)
@@ -216,6 +218,9 @@ class Tracker:
             "is_relisten": is_relisten,
             "duplicate_post_id": duplicate_post_id,
         })
+        metadata_cache = getattr(self, "metadata_cache", None)
+        if metadata_cache is not None:
+            metadata_cache.schedule_for_release(release)
         return release
 
     async def _start_tracking_or_prompt_for_relisten(self, release: Release) -> Optional[Release]:

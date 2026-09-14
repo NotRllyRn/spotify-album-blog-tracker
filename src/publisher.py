@@ -65,14 +65,16 @@ class Publisher:
     _fill_scf_enabled: bool = False
     metadata: Optional[TrackerMetadataAdapter] = None
 
-    def __init__(self, config: Config, db: Database):
+    def __init__(self, config: Config, db: Database, metadata_cache=None):
         self.config = config
         self.db = db
         self.wordpress = WordPressClient(config)
         self.category_cache: Dict[str, int] = {}
         self.tag_cache: Dict[str, int] = {}
         self._fill_scf_enabled = bool(getattr(config, "fill_scf_enabled", False))
-        self.metadata = TrackerMetadataAdapter(config) if self._fill_scf_enabled else None
+        if self._fill_scf_enabled and metadata_cache is None:
+            raise ValueError("Metadata cache service is required when SCF enrichment is enabled")
+        self.metadata = TrackerMetadataAdapter(metadata_cache) if self._fill_scf_enabled else None
 
     async def close(self):
         """Close WordPress client."""

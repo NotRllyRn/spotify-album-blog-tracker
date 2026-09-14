@@ -4,65 +4,19 @@ import unittest
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from album_metadata.common import match_key, post_dmy
 from album_metadata.plans import materialize_body
 from album_metadata.schema import REMOVED_ACF_FIELDS
 from metadata_cli.cli import apply_patches, load_env
-from models import Artist, LifecycleStatus, Release, ReleaseType, Track, WordPressPost
+from models import Artist, CachedAlbumMetadata, LifecycleStatus, Release, ReleaseType, Track, WordPressPost
 from publisher import Publisher
+from tracker import Tracker
 from wordpress_client import WordPressClient
 
 TrackerMetadataAdapter = importlib.import_module(
     "tracker_metadata_adapter").TrackerMetadataAdapter
-
-
-class SpotifyFake:
-    album_data = {
-        "id": "album-id",
-        "name": "Élan",
-        "artists": [{"id": "artist-id", "name": "The Artist"}],
-        "total_tracks": 2,
-        "album_type": "single",
-        "release_date": "2024-02-03",
-    }
-    tracks = [
-        {"id": "one", "name": "First", "duration_ms": 1_000,
-         "disc_number": 1, "track_number": 1, "explicit": False},
-        {"id": "two", "name": "Second", "duration_ms": 2_000,
-         "disc_number": 1, "track_number": 2, "explicit": True},
-    ]
-
-    def album(self, album_id):
-        assert album_id == "album-id"
-        return dict(self.album_data)
-
-    def all_tracks(self, album_id):
-        assert album_id == "album-id"
-        return list(self.tracks)
-
-    def artist(self, artist_id):
-        return {"genres": []}
-
-
-class LastFmFake:
-    def album_search(self, *args, **kwargs):
-        return [{"name": "Élan", "artist": "The Artist"}]
-
-    def album_getinfo(self, **kwargs):
-        return {
-            "name": "Élan",
-            "artist": "The Artist",
-            "tracks": {},
-            "toptags": {"tag": [{"name": "Rock"}, {"name": "Pop"}]},
-        }
-
-    def album_gettoptags(self, **kwargs):
-        return {"toptags": {"tag": []}}
-
-    def artist_gettoptags(self, *args, **kwargs):
-        return {"toptags": {"tag": []}}
 
 
 def make_release() -> Release:
@@ -118,9 +72,18 @@ class CliWordPressFake:
 
 class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        config = SimpleNamespace(
-            spotify_client_id="id", spotify_client_secret="secret", lastfm_api_key="key")
-        self.adapter = TrackerMetadataAdapter(config, SpotifyFake(), LastFmFake())
+        self.metadata_cache = SimpleNamespace(ensure_for_release=AsyncMock(return_value=CachedAlbumMetadata(
+            spotify_id="album-id",
+            status="ready",
+            lastfm_url=None,
+            lastfm_mbid=None,
+            genres=["Rock", "Pop"],
+            lastfm_listeners=123,
+            diagnostic_code=None,
+            resolver_version=1,
+            updated_at=datetime.now(),
+        )))
+        self.adapter = TrackerMetadataAdapter(self.metadata_cache)
         self.release = make_release()
         self.post = {
             "id": 42,
@@ -130,6 +93,7 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_known_spotify_path_uses_shared_managed_contract(self):
         patch = await self.adapter.build_patch(self.release, self.post, [7], [5], 3)
+        self.metadata_cache.ensure_for_release.assert_awaited_once_with(self.release)
         acf = patch["write"]["acf"]
 
         self.assertEqual(acf["listen_count"], 3)
@@ -138,6 +102,16 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(acf["music_listened_at"], "04/03/2024")
         self.assertFalse(REMOVED_ACF_FIELDS & set(acf))
         self.assertEqual(patch["write"]["taxonomies"]["release_type"], ["Single"])
+
+    async def test_new_tracked_release_schedules_metadata_without_awaiting_it(self):
+        tracker = Tracker.__new__(Tracker)
+        tracker.db = SimpleNamespace(save_release=AsyncMock(), log_audit_event=AsyncMock())
+        tracker.metadata_cache = SimpleNamespace(schedule_for_release=Mock())
+
+        result = await tracker._create_tracked_release(self.release)
+
+        self.assertIs(result, self.release)
+        tracker.metadata_cache.schedule_for_release.assert_called_once_with(self.release)
 
     async def test_known_spotify_path_honors_live_fill_only_values(self):
         post = {**self.post, "acf": {"spotify_title": "Keep this title"}}

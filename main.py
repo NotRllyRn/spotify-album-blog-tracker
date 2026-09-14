@@ -27,6 +27,7 @@ from tracker import Tracker
 from discord_bot import DiscordBot
 from publisher import Publisher
 from saved_library import SavedLibraryService
+from album_metadata_cache import AlbumMetadataCacheService
 
 SAVED_LIBRARY_SYNC_INTERVAL = timedelta(hours=24)
 
@@ -34,8 +35,12 @@ class Service:
     def __init__(self):
         self.config = Config()
         self.db = Database(self.config)
-        self.publisher = Publisher(self.config, self.db)
-        self.tracker = Tracker(self.config, self.db, self.publisher)
+        self.metadata_cache = (
+            AlbumMetadataCacheService(self.config, self.db)
+            if self.config.fill_scf_enabled else None)
+        self.publisher = Publisher(self.config, self.db, self.metadata_cache)
+        self.tracker = Tracker(
+            self.config, self.db, self.publisher, metadata_cache=self.metadata_cache)
         self.saved_library = SavedLibraryService(self.db, self.tracker.spotify)
         self.discord_bot = DiscordBot(self.config, self.db, self.tracker)
         self.tracker.set_discord_bot(self.discord_bot)
@@ -68,6 +73,8 @@ class Service:
         try:
             await self.publisher.refresh_post_cache()
             await self.saved_library.sync()
+            if self.metadata_cache is not None:
+                self.metadata_cache.trigger_saved_library_backfill()
         except Exception as e:
             logger.error(f"Saved library sync failed: {e}", exc_info=True)
 
@@ -82,6 +89,8 @@ class Service:
             self.saved_library_sync_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.saved_library_sync_task
+        if self.metadata_cache is not None:
+            await self.metadata_cache.stop()
         await self.tracker.stop()
         await self.discord_bot.stop()
         await self.publisher.close()

@@ -1,11 +1,9 @@
 """Tracker adapter for the shared album metadata engine."""
 
-import asyncio
 from typing import Any
 
-from album_metadata.enrichment import enrich_known
-from album_metadata.lastfm import LastFM
-from album_metadata.spotify import Spotify
+from album_metadata.enrichment import build_known_album_patch
+from album_metadata_cache import resolved_metadata_from_cache, spotify_evidence_from_release
 from models import Release
 
 
@@ -16,23 +14,10 @@ class MetadataEnrichmentError(RuntimeError):
 class TrackerMetadataAdapter:
     """Adapt a tracked Spotify release to the provider-agnostic metadata engine."""
 
-    def __init__(self, config: Any, spotify: Any = None, lastfm: Any = None):
-        self.spotify = spotify or Spotify(
-            config.spotify_client_id, config.spotify_client_secret)
-        self.lastfm = lastfm or LastFM(config.lastfm_api_key)
+    def __init__(self, metadata_cache: Any):
+        self.metadata_cache = metadata_cache
 
     async def build_patch(
-        self,
-        release: Release,
-        post: dict,
-        tag_ids: list[int],
-        category_ids: list[int],
-        listen_count: int,
-    ) -> dict:
-        return await asyncio.to_thread(
-            self._build_patch, release, post, tag_ids, category_ids, listen_count)
-
-    def _build_patch(
         self,
         release: Release,
         post: dict,
@@ -44,8 +29,11 @@ class TrackerMetadataAdapter:
         if not isinstance(post_date, str) or not post_date:
             raise MetadataEnrichmentError("WordPress did not return the new post date.")
 
-        album = self.spotify.album(release.spotify_id)
-        tracks = self.spotify.all_tracks(release.spotify_id)
+        cached = await self.metadata_cache.ensure_for_release(release)
+        if cached.status != "ready":
+            raise MetadataEnrichmentError(
+                f"Album metadata is unresolved ({cached.diagnostic_code or 'unknown'}).")
+        album, tracks = spotify_evidence_from_release(release)
         source = {
             "id": post["id"],
             "title": {"rendered": release.title},
@@ -60,13 +48,12 @@ class TrackerMetadataAdapter:
         if "modified" in post:
             source["modified"] = post["modified"]
 
-        patch = enrich_known(
+        patch = build_known_album_patch(
             source,
-            self.spotify,
-            self.lastfm,
             album,
             tracks,
             [artist.name for artist in release.artists],
+            resolved_metadata_from_cache(cached, album),
             listen_count=listen_count,
             track_highlights={
                 track.spotify_id: track.highlight
