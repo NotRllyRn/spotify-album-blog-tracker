@@ -1,12 +1,14 @@
 import tempfile
 import unittest
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 from database import Database
 from album_metadata.lastfm import parse_lastfm_listeners
-from models import CachedAlbumMetadata, LifecycleStatus, Release, ReleaseType, SavedLibraryAlbum, Track
+from album_metadata_cache import AlbumMetadataCacheService, MetadataCacheProviderError
+from models import Artist, CachedAlbumMetadata, LifecycleStatus, Release, ReleaseType, SavedLibraryAlbum, Track
 
 
 class AlbumMetadataCacheDatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -107,6 +109,129 @@ class ListenerParsingTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIsNone(parse_lastfm_listeners({"listeners": value}))
         self.assertIsNone(parse_lastfm_listeners({}))
+
+
+class FakeMetadataSpotify:
+    def __init__(self):
+        self.album_calls = 0
+
+    def album_with_tracks(self, spotify_id):
+        self.album_calls += 1
+        return metadata_evidence(spotify_id)
+
+
+class FakeMetadataLastFM:
+    def __init__(self, *, empty=False, failure=False):
+        self.empty = empty
+        self.failure = failure
+        self.search_calls = 0
+        self.info_calls = 0
+
+    def album_search(self, query, limit=10):
+        self.search_calls += 1
+        if self.failure:
+            raise RuntimeError("provider unavailable")
+        return [] if self.empty else [{
+            "name": "Album", "artist": "Artist", "url": "https://last.fm/album"}]
+
+    def album_getinfo(self, **kwargs):
+        self.info_calls += 1
+        return {
+            "name": "Album",
+            "artist": "Artist",
+            "url": "https://last.fm/album",
+            "listeners": "9876",
+            "tracks": {"track": [{"name": "Track"}]},
+            "tags": {"tag": [{"name": "Rock"}]},
+        }
+
+
+def metadata_evidence(spotify_id="album-a"):
+    return ({
+        "id": spotify_id,
+        "name": "Album",
+        "artists": [{"id": "artist-a", "name": "Artist"}],
+        "album_type": "album",
+        "release_date": "2026-01-01",
+        "total_tracks": 1,
+    }, [{
+        "id": "track-a", "name": "Track", "duration_ms": 1000,
+        "disc_number": 1, "track_number": 1, "explicit": False,
+    }])
+
+
+def metadata_release(spotify_id="album-a"):
+    now = datetime.now()
+    return Release(
+        spotify_id=spotify_id, title="Album", normalized_title="album",
+        artists=[Artist("artist-a", "Artist", "artist")],
+        release_type=ReleaseType.ALBUM, raw_spotify_type="album", cover_url="",
+        release_date="2026-01-01", total_tracks=1, total_duration_ms=1000,
+        tracks=[Track("track-a", "Track", "track", 1000, 1, 1, True, False)],
+        progress=0, status=LifecycleStatus.ACTIVE, first_seen=now, last_seen=now,
+    )
+
+
+class AlbumMetadataCacheServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        root = Path(self.tempdir.name)
+        self.db = Database(SimpleNamespace(
+            db_path=root / "test.db", project_root=Path(__file__).parents[1]))
+        await self.db.initialize()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self.tempdir.cleanup()
+
+    def service(self, spotify, lastfm):
+        return AlbumMetadataCacheService(
+            SimpleNamespace(spotify_client_id="id", spotify_client_secret="secret", lastfm_api_key="key"),
+            self.db,
+            provider_factory=lambda: (spotify, lastfm),
+        )
+
+    async def test_release_resolution_uses_local_spotify_evidence_and_caches_once(self):
+        spotify, lastfm = FakeMetadataSpotify(), FakeMetadataLastFM()
+        service = self.service(spotify, lastfm)
+        first, second = await asyncio.gather(
+            service.ensure_for_release(metadata_release()),
+            service.ensure_for_release(metadata_release()),
+        )
+        self.assertEqual((first.status, first.lastfm_listeners, first.genres),
+                         ("ready", 9876, ["Rock"]))
+        self.assertEqual(first, second)
+        self.assertEqual(spotify.album_calls, 0)
+        self.assertEqual(lastfm.info_calls, 1)
+
+    async def test_deterministic_unresolved_is_cached_but_provider_failure_is_not(self):
+        spotify, lastfm = FakeMetadataSpotify(), FakeMetadataLastFM(empty=True)
+        service = self.service(spotify, lastfm)
+        unresolved = await service.ensure_for_release(metadata_release())
+        self.assertEqual((unresolved.status, unresolved.diagnostic_code),
+                         ("unresolved", "lastfm_catalog_unavailable"))
+        calls = lastfm.search_calls
+        await service.ensure_for_release(metadata_release())
+        self.assertEqual(lastfm.search_calls, calls)
+
+        failing = self.service(FakeMetadataSpotify(), FakeMetadataLastFM(failure=True))
+        with self.assertRaises(MetadataCacheProviderError):
+            await failing.ensure_for_release(metadata_release("album-b"))
+        self.assertIsNone(await self.db.get_album_metadata_cache("album-b"))
+
+    async def test_backfill_commits_progress_and_skips_completed_rows(self):
+        for spotify_id in ("album-a", "album-b"):
+            await self.db.upsert_saved_library_album(
+                AlbumMetadataCacheDatabaseTests.saved_album(self, spotify_id))
+        spotify, lastfm = FakeMetadataSpotify(), FakeMetadataLastFM()
+        service = self.service(spotify, lastfm)
+
+        service.trigger_saved_library_backfill()
+        await service._backfill_task
+        self.assertEqual(spotify.album_calls, 2)
+        service.trigger_saved_library_backfill()
+        await service._backfill_task
+        self.assertEqual(spotify.album_calls, 2)
 
 if __name__ == "__main__":
     unittest.main()

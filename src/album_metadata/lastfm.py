@@ -3,6 +3,7 @@
 import difflib
 import logging
 import re
+import time
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -17,11 +18,18 @@ log = logging.getLogger("post_to_album")
 LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
 
 class LastFM:
-    def __init__(self, api_key: str, circuit: ProviderCircuit | None = None):
+    def __init__(self, api_key: str, circuit: ProviderCircuit | None = None,
+                 request_interval: float = 0):
         self._key = api_key
         self._circuit = circuit or ProviderCircuit("lastfm")
+        self._request_interval = max(0, request_interval)
+        self._last_request_at = 0.0
 
     def _get(self, method: str, **params) -> dict:
+        delay = self._request_interval - (time.monotonic() - self._last_request_at)
+        if delay > 0:
+            time.sleep(delay)
+        self._last_request_at = time.monotonic()
         params.update({"method": method, "api_key": self._key, "format": "json"})
         req = urllib.request.Request(
             f"{LASTFM_BASE}?{urllib.parse.urlencode(params)}",
