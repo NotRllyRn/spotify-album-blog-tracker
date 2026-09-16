@@ -280,6 +280,27 @@ class WordPressClient:
         names = {row["id"]: row["name"] for row in await self._get_taxonomy_terms(taxonomy)}
         return [names[term_id] for term_id in term_ids if term_id in names]
 
+    async def get_taxonomy_term(self, taxonomy: str, term_id: int) -> Dict[str, Any]:
+        if taxonomy not in TAXONOMIES:
+            raise ValueError(f"Unknown taxonomy: {taxonomy}")
+        response = await self.client.get(
+            f"{self.api_url}/{taxonomy}/{term_id}", params={"context": "edit"})
+        response.raise_for_status()
+        value = response.json()
+        if not isinstance(value, dict):
+            raise ValueError(f"Unexpected {taxonomy} term response")
+        return value
+
+    async def update_taxonomy_term(
+        self, taxonomy: str, term_id: int, data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if taxonomy not in TAXONOMIES:
+            raise ValueError(f"Unknown taxonomy: {taxonomy}")
+        response = await self.client.post(
+            f"{self.api_url}/{taxonomy}/{term_id}", json=data)
+        response.raise_for_status()
+        return response.json()
+
     async def _get_taxonomy_terms(self, taxonomy: str) -> List[Dict[str, Any]]:
         rows = []
         page = 1
@@ -494,6 +515,26 @@ class WordPressClient:
             )
             response.raise_for_status()
             return response.json()
+
+    async def upload_media_bytes(
+        self,
+        content: bytes,
+        filename: str,
+        content_type: str,
+        alt_text: str = "",
+    ) -> Dict[str, Any]:
+        """Upload already-downloaded image bytes through the authenticated client."""
+        response = await self.client.post(
+            f"{self.api_url}/media",
+            files={"file": (filename, content, content_type)},
+            data={"alt_text": alt_text} if alt_text else {},
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        value = response.json()
+        if not isinstance(value, dict) or type(value.get("id")) is not int:
+            raise ValueError("Unexpected media upload response")
+        return value
 
     async def update_media(self, media_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
         """Update media metadata."""

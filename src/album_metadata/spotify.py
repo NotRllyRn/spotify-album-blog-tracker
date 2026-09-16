@@ -14,6 +14,7 @@ from album_metadata.providers import (
     ProviderCircuit, ProviderError, SpotifyProviderError, _request_json,
 )
 from album_metadata.schema import CATEGORY_MAP, RELEASE_TYPES
+from artist_images import validate_spotify_artist
 
 log = logging.getLogger("post_to_album")
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -118,6 +119,15 @@ class Spotify:
                 raise SpotifyProviderError("Spotify search candidate was malformed")
         return items
 
+    def search_artists(self, q: str, limit: int = 10) -> list[dict]:
+        url = f"{SPOTIFY_API}/search?q={urllib.parse.quote(q)}&type=artist&limit={limit}"
+        data = self._get(url, "artist.search")
+        artists = data.get("artists")
+        if not isinstance(artists, dict) or not isinstance(artists.get("items"), list):
+            raise SpotifyProviderError(
+                "Spotify artist.search response was malformed.", operation="artist.search")
+        return [validate_spotify_artist(item) for item in artists["items"]]
+
     def album(self, aid: str) -> dict:
         return self._get(f"{SPOTIFY_API}/albums/{urllib.parse.quote(aid)}?market=US")
 
@@ -129,6 +139,11 @@ class Spotify:
             raise SpotifyProviderError(
                 "Spotify artist.get response was malformed.", operation="artist.get")
         return data
+
+    def artist_profile(self, aid: str) -> dict:
+        data = self._get(
+            f"{SPOTIFY_API}/artists/{urllib.parse.quote(aid)}", "artist.get")
+        return validate_spotify_artist(data, "artist.get")
 
     def _track_pages(self, page: Any) -> list[dict]:
         out: list[dict] = []

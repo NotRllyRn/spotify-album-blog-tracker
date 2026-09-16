@@ -14,6 +14,11 @@ from html import escape
 from config import Config
 from database import Database
 from album_metadata.plans import materialize_body
+from album_metadata.common import match_key, similarity
+from artist_images import (
+    artist_image_entry, image_is_missing, is_spotify_image_url,
+    validate_spotify_artist,
+)
 from wordpress_client import WordPressClient
 from models import PublishResult, QuickMetadata, Release
 from tracker_metadata_adapter import TrackerMetadataAdapter  # pyright: ignore[reportMissingImports]
@@ -64,8 +69,9 @@ class Publisher:
     # Defaults keep test paths that bypass __init__ metadata-disabled.
     _fill_scf_enabled: bool = False
     metadata: Optional[TrackerMetadataAdapter] = None
+    spotify: Any = None
 
-    def __init__(self, config: Config, db: Database, metadata_cache=None):
+    def __init__(self, config: Config, db: Database, metadata_cache=None, spotify=None):
         self.config = config
         self.db = db
         self.wordpress = WordPressClient(config)
@@ -75,6 +81,7 @@ class Publisher:
         if self._fill_scf_enabled and metadata_cache is None:
             raise ValueError("Metadata cache service is required when SCF enrichment is enabled")
         self.metadata = TrackerMetadataAdapter(metadata_cache) if self._fill_scf_enabled else None
+        self.spotify = spotify
 
     async def close(self):
         """Close WordPress client."""
@@ -179,8 +186,82 @@ class Publisher:
             if mismatches:
                 raise RuntimeError(
                     "Metadata verification failed for fields: " + ", ".join(mismatches))
+        await self._populate_artist_images(release, term_ids.get("artist", {}))
         logger.info("Filled and verified shared metadata for post %s", post["id"])
         return patch
+
+    async def _populate_artist_images(
+        self, release: Release, artist_term_ids: Dict[str, int]
+    ) -> None:
+        """Fill only missing artist-term images using known Spotify artist IDs."""
+        if self.spotify is None:
+            logger.warning("Artist image population skipped: Spotify client is unavailable")
+            return
+        for artist in release.artists:
+            term_id = artist_term_ids.get(match_key(artist.name))
+            if term_id is None:
+                logger.warning("Artist image population skipped: no term for %s", artist.name)
+                continue
+            try:
+                await self._populate_artist_image(term_id, artist.spotify_id, artist.name)
+            except Exception as exc:
+                logger.error(
+                    "Artist image population failed for term %s (%s): %s",
+                    term_id, artist.name, exc,
+                )
+
+    async def _populate_artist_image(
+        self, term_id: int, spotify_artist_id: str, artist_name: str
+    ) -> Optional[int]:
+        term = await self.wordpress.get_taxonomy_term("artist", term_id)
+        if not image_is_missing(term):
+            return None
+
+        profile = validate_spotify_artist(
+            await self.spotify.get_artist(spotify_artist_id), "artist.get")
+        score = similarity(artist_name, profile["name"])
+        if profile["id"] != spotify_artist_id or score < 0.90:
+            raise ValueError("Spotify artist profile did not match the release artist")
+        entry = artist_image_entry(term_id, artist_name, {
+            "candidate": profile,
+            "score": score,
+            "selection_evidence": "known_album_artist_id",
+        })
+        if entry is None:
+            raise ValueError("Spotify artist has no native image at or below 256px")
+
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(entry["image"]["url"], headers={"Accept": "image/*"})
+            response.raise_for_status()
+            if not is_spotify_image_url(str(response.url)):
+                raise ValueError("Artist image redirected away from Spotify's image host")
+            content = response.content
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+        extensions = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+        if content_type not in extensions or not content or len(content) > 5 * 1024 * 1024:
+            raise ValueError("Spotify artist image had an unsupported type or size")
+
+        media = await self.wordpress.upload_media_bytes(
+            content,
+            f"spotify-artist-{spotify_artist_id}.{extensions[content_type]}",
+            content_type,
+            f"{artist_name} artist image",
+        )
+        media_id = media["id"]
+        try:
+            await self.wordpress.update_taxonomy_term(
+                "artist", term_id, {"acf": {"image": media_id}})
+            persisted = await self.wordpress.get_taxonomy_term("artist", term_id)
+            if (persisted.get("acf") or {}).get("image") != media_id:
+                raise RuntimeError("Artist image verification failed")
+        except Exception:
+            try:
+                await self.wordpress.delete_media(media_id, force=True)
+            except Exception as cleanup_error:
+                logger.warning("Could not remove orphaned artist media %s: %s", media_id, cleanup_error)
+            raise
+        logger.info("Filled artist image for %s: media_id=%s", artist_name, media_id)
+        return media_id
 
     async def get_post_quick_metadata(self, post_id: int) -> QuickMetadata:
         post = await self.wordpress.get_post(

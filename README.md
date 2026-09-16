@@ -11,7 +11,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Fill in `.env`. Metadata enrichment is enabled by default and requires Last.fm credentials; set `SPOTIFY_BLOG_TRACKER_FILL_SCF=0` to disable it. WordPress must expose the SCF fields and the `artist`, `genre`, and `release_type` taxonomies defined by `scf-export-2026-07-24.json`.
+Fill in `.env`. Metadata enrichment is enabled by default and requires Last.fm credentials; set `SPOTIFY_BLOG_TRACKER_FILL_SCF=0` to disable it. WordPress must expose the SCF fields and the `artist`, `genre`, and `release_type` taxonomies defined by `scf-export-2026-09-16.json`.
 
 ## Tracker
 
@@ -37,6 +37,8 @@ python3 post_to_album.py fuzzy "Album title" "Artist"
 python3 post_to_album.py run                 # dry run to out/
 python3 post_to_album.py run --limit 10 --out-dir out
 python3 post_to_album.py apply-plan out/planned.json
+python3 post_to_album.py artist-images --limit 25
+python3 post_to_album.py apply-artist-images out/artist-images-planned.json
 ```
 
 Review these files before applying a plan:
@@ -45,8 +47,13 @@ Review these files before applying a plan:
 - `unresolved.json`: releases requiring attention
 - `ignored.json`: safely skipped releases
 - `applied.json`: apply results
+- `artist-images-planned.json`: matched missing artist images, ready for review
+- `artist-images-corrections.json`: ambiguous, low-confidence, or image-less artists
+- `artist-images-applied.json`: artist term/media successes, skips, and failures
 
 `run --apply` remains available for compatibility but is deprecated. Use `apply-plan` for a reviewable, replay-safe workflow. The CLI accepts both `WORDPRESS_URL` and its legacy `WORDPRESS_BASE_URL` alias.
+
+`artist-images` is also dry-run-first and scans only artist taxonomy terms whose `image` field is empty. It never processes or updates album metadata. Review both artist-image artifacts, then apply the saved plan with `apply-artist-images`.
 
 ## Metadata ownership
 

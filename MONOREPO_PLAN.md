@@ -16,7 +16,7 @@ The tracker and CLI must call the same enrichment and payload code. Given the sa
 
 - Preserve the current CLI commands, arguments, JSON artifacts, dry-run-first workflow, diagnostics, exit codes, and safe replay behavior.
 - Preserve Spotify and Last.fm matching thresholds, ambiguity handling, validation, retries, circuit breakers, genre fallbacks, taxonomy behavior, category preservation, and editor-owned highlight preservation.
-- Use `scf-export-2026-07-24.json` as the active WordPress contract.
+- Use `scf-export-2026-09-16.json` as the active WordPress contract.
 - Never write removed ACF fields: `lastfm_release_id`, `music_mood_tags`, `unreleased`, or `listen-count`.
 - Manage only current provider-owned ACF fields. Protect `music_rating`, `music_favorite`, `music_notes`, and track `highlight` values.
 - Populate `artist`, `genre`, and `release_type` taxonomies through both interfaces.
@@ -48,7 +48,7 @@ The tracker and CLI must call the same enrichment and payload code. Given the sa
 │   ├── metadata/                   # imported CLI characterization tests
 │   ├── tracker/                    # tracker tests
 │   └── test_metadata_parity.py     # interface-equivalence contract
-└── scf-export-2026-07-24.json      # active schema fixture
+└── scf-export-2026-09-16.json      # active schema fixture
 ```
 
 The exact module count may shrink where merging files is simpler. Avoid abstraction that has only one caller.

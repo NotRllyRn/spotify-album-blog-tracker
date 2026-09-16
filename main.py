@@ -38,9 +38,11 @@ class Service:
         self.metadata_cache = (
             AlbumMetadataCacheService(self.config, self.db)
             if self.config.fill_scf_enabled else None)
-        self.publisher = Publisher(self.config, self.db, self.metadata_cache)
         self.tracker = Tracker(
-            self.config, self.db, self.publisher, metadata_cache=self.metadata_cache)
+            self.config, self.db, metadata_cache=self.metadata_cache)
+        self.publisher = Publisher(
+            self.config, self.db, self.metadata_cache, spotify=self.tracker.spotify)
+        self.tracker.publisher = self.publisher
         self.saved_library = SavedLibraryService(self.db, self.tracker.spotify)
         self.discord_bot = DiscordBot(self.config, self.db, self.tracker)
         self.tracker.set_discord_bot(self.discord_bot)

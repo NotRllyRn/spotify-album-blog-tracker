@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import re
+import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -57,6 +58,36 @@ class WordPress:
                         continue
                 raise
 
+    def _req_delete(self, url: str) -> Any:
+        req = urllib.request.Request(url, headers=self._hdr_get, method="DELETE")
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read())
+
+    def _req_multipart(
+        self, url: str, filename: str, content: bytes, content_type: str, alt_text: str
+    ) -> Any:
+        boundary = "----spotify-album-blog-" + secrets.token_hex(12)
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="alt_text"\r\n\r\n'
+            f"{alt_text}\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8") + content + f"\r\n--{boundary}--\r\n".encode("ascii")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": self._auth,
+                "Accept": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.loads(response.read())
+
     # ---- reads ----
 
     def list_posts(self, per_page: int = 100) -> Iterable[dict]:
@@ -86,14 +117,14 @@ class WordPress:
             except (TypeError, ValueError):
                 return 0
 
-    def list_tax_terms(self, tax: str) -> dict[str, int]:
-        """Return every term; only a later out-of-range 400 ends pagination."""
-        found: dict[str, int] = {}
+    def list_taxonomy_terms(self, tax: str) -> list[dict]:
+        """Return every term with edit-context ACF data."""
+        found: list[dict] = []
         page = 1
         while True:
             try:
                 rows, headers = self._req_get(
-                    self._url(f"/{tax}", per_page=100, page=page))
+                    self._url(f"/{tax}", per_page=100, page=page, context="edit"))
             except urllib.error.HTTPError as exc:
                 # WordPress uses this specific REST error to end headerless pagination.
                 if exc.code == 400:
@@ -108,8 +139,7 @@ class WordPress:
                 raise
             if not isinstance(rows, list):
                 raise RuntimeError(f"WordPress {tax} response was not a list")
-            for row in rows:
-                found[row["name"]] = row["id"]
+            found.extend(rows)
             raw_pages = headers.get("X-WP-TotalPages") or headers.get("x-wp-totalpages")
             if raw_pages is not None:
                 try:
@@ -120,6 +150,9 @@ class WordPress:
             elif len(rows) < 100:
                 return found
             page += 1
+
+    def list_tax_terms(self, tax: str) -> dict[str, int]:
+        return {row["name"]: row["id"] for row in self.list_taxonomy_terms(tax)}
 
     @staticmethod
     def _header(headers: dict, name: str) -> Any:
@@ -244,3 +277,39 @@ class WordPress:
     def update_post(self, pid: int, body: dict) -> dict:
         url = self._url(f"/posts/{pid}")
         return self._req_post(url, body)
+
+    def get_taxonomy_term(self, tax: str, term_id: int) -> dict:
+        value, _ = self._req_get(self._url(f"/{tax}/{term_id}", context="edit"))
+        if not isinstance(value, dict):
+            raise RuntimeError(f"WordPress {tax} term response was malformed")
+        return value
+
+    def update_taxonomy_term(self, tax: str, term_id: int, body: dict) -> dict:
+        return self._req_post(self._url(f"/{tax}/{term_id}"), body)
+
+    @staticmethod
+    def download_image(url: str, max_bytes: int = 5 * 1024 * 1024) -> tuple[bytes, str]:
+        request = urllib.request.Request(url, headers={"Accept": "image/*"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            final_url = urllib.parse.urlsplit(response.geturl())
+            if final_url.scheme != "https" or final_url.hostname != "i.scdn.co":
+                raise ValueError("Artist image redirected away from Spotify's image host")
+            content_type = response.headers.get_content_type()
+            if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+                raise ValueError(f"Unsupported artist image content type: {content_type}")
+            content = response.read(max_bytes + 1)
+        if not content or len(content) > max_bytes:
+            raise ValueError("Artist image was empty or exceeded 5 MiB")
+        return content, content_type
+
+    def upload_media_bytes(
+        self, content: bytes, filename: str, content_type: str, alt_text: str
+    ) -> dict:
+        value = self._req_multipart(
+            self._url("/media"), filename, content, content_type, alt_text)
+        if not isinstance(value, dict) or type(value.get("id")) is not int:
+            raise RuntimeError("WordPress media upload response was malformed")
+        return value
+
+    def delete_media(self, media_id: int) -> dict:
+        return self._req_delete(self._url(f"/media/{media_id}", force="true"))

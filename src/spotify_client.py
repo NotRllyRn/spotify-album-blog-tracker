@@ -189,6 +189,13 @@ class SpotifyClient:
         self._raise_for_status(response)
         return response.json()
 
+    async def get_artist(self, artist_id: str) -> Dict[str, Any]:
+        """Get one Spotify artist profile by its known ID."""
+        await self._ensure_token()
+        response = await self.client.get(f"/artists/{artist_id}")
+        self._raise_for_status(response)
+        return response.json()
+
     async def get_album_tracks(self, album_id: str) -> List[Dict[str, Any]]:
         """Get all tracks for an album."""
         await self._ensure_token()

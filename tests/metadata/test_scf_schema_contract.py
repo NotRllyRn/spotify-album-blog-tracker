@@ -5,7 +5,7 @@ from pathlib import Path
 from src.album_metadata import schema
 
 
-EXPORT = Path(__file__).parents[2] / "scf-export-2026-07-24.json"
+EXPORT = Path(__file__).parents[2] / "scf-export-2026-09-16.json"
 
 
 class SCFSchemaContractTests(unittest.TestCase):
@@ -18,8 +18,8 @@ class SCFSchemaContractTests(unittest.TestCase):
 
     def test_active_field_group_contract(self):
         groups = [item for item in self.objects if item.get("active") and "fields" in item]
-        self.assertEqual(len(groups), 1)
-        group = groups[0]
+        self.assertEqual({group["title"] for group in groups}, {"meta", "artist-meta"})
+        group = next(group for group in groups if group["title"] == "meta")
         self.assertEqual(group.get("show_in_rest"), 1)
         fields = {field["name"]: field for field in group["fields"]}
         self.assertEqual({name: field["type"] for name, field in fields.items()}, {
@@ -55,13 +55,24 @@ class SCFSchemaContractTests(unittest.TestCase):
         })
         self.assertEqual(set(track_fields), set(schema.TRACK_KEYS))
 
+    def test_artist_image_field_contract(self):
+        group = next(item for item in self.objects if item.get("title") == "artist-meta")
+        self.assertEqual(group.get("show_in_rest"), 1)
+        self.assertEqual(group.get("location"), [[{
+            "param": "taxonomy", "operator": "==", "value": "artist",
+        }]])
+        image = group["fields"][0]
+        self.assertEqual((image["name"], image["type"], image["return_format"]),
+                         ("image", "image", "id"))
+
     def test_active_taxonomies_use_default_rest_slugs(self):
         taxonomies = {item["taxonomy"]: item for item in self.objects
                       if item.get("active") and "taxonomy" in item}
         self.assertEqual(set(taxonomies), set(schema.TAXONOMIES))
         for name, taxonomy in taxonomies.items():
             with self.subTest(taxonomy=name):
-                self.assertEqual(taxonomy.get("object_type"), ["post"])
+                expected_objects = ["post", "album"] if name == "artist" else ["post"]
+                self.assertEqual(taxonomy.get("object_type"), expected_objects)
                 self.assertEqual(taxonomy.get("show_in_rest"), 1)
                 self.assertEqual(taxonomy.get("rest_base") or name, name)
 
