@@ -35,6 +35,8 @@ class Config:
         self.wordpress_public_url = os.getenv("WORDPRESS_PUBLIC_URL", "https://musicblog.callita.day")  # Used for links in posts
         self.wordpress_username = os.getenv("WORDPRESS_USERNAME")
         self.wordpress_app_password = os.getenv("WORDPRESS_APP_PASSWORD")
+        self.musicblog_webhook_url = os.getenv("MUSICBLOG_WEBHOOK_URL")
+        self.wordpress_webhook_secret = os.getenv("WORDPRESS_WEBHOOK_SECRET")
 
         # Discord
         self.discord_bot_token = os.getenv("DISCORD_BOT_TOKEN")

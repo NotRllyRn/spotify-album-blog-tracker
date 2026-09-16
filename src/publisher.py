@@ -149,6 +149,8 @@ class Publisher:
             except Exception as e:
                 logger.error(f"Post cache refresh failed after publish: {e}")
 
+            await self._notify_musicblog("published", post["id"])
+
             return PublishResult(
                 post=post,
                 scf_pending_tags=scf_pending_tags,
@@ -160,6 +162,25 @@ class Publisher:
         except Exception as e:
             logger.error(f"Error publishing release: {e}")
             raise
+
+    async def _notify_musicblog(self, event: str, post_id: int) -> None:
+        """Notify the frontend without risking a duplicate WordPress publish."""
+        config = getattr(self, "config", None)
+        url = getattr(config, "musicblog_webhook_url", None)
+        secret = getattr(config, "wordpress_webhook_secret", None)
+        if not url or not secret:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {secret}"},
+                    json={"event": event, "postId": post_id},
+                )
+                response.raise_for_status()
+            logger.info("Notified music blog of %s post %s", event, post_id)
+        except Exception as exc:
+            logger.error("Music blog webhook failed for post %s: %s", post_id, exc)
 
     async def _apply_shared_metadata(
         self,

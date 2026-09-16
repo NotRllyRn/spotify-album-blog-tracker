@@ -1,10 +1,13 @@
 import importlib
+import json
 import os
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
 
 from album_metadata.common import match_key, post_dmy
 from album_metadata.plans import materialize_body
@@ -313,6 +316,37 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.post["id"], 42)
         self.assertEqual(result.scf_pending_tags, ["metadata_error"])
+
+    async def test_musicblog_webhook_uses_frontend_contract(self):
+        requests = []
+
+        async def handle(request):
+            requests.append(request)
+            return httpx.Response(200, json={"changed": True})
+
+        publisher: Any = Publisher.__new__(Publisher)
+        publisher.config = SimpleNamespace(
+            musicblog_webhook_url="https://music.example/api/wordpress/webhook",
+            wordpress_webhook_secret="shared-secret",
+        )
+        real_client = httpx.AsyncClient
+        with patch("publisher.httpx.AsyncClient", side_effect=lambda **kwargs: real_client(
+            transport=httpx.MockTransport(handle), **kwargs
+        )):
+            await publisher._notify_musicblog("published", 42)
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].headers["Authorization"], "Bearer shared-secret")
+        self.assertEqual(json.loads(requests[0].content), {"event": "published", "postId": 42})
+
+    async def test_musicblog_webhook_failure_does_not_fail_publish(self):
+        publisher: Any = Publisher.__new__(Publisher)
+        publisher.config = SimpleNamespace(
+            musicblog_webhook_url="https://music.example/api/wordpress/webhook",
+            wordpress_webhook_secret="shared-secret",
+        )
+        with patch("publisher.httpx.AsyncClient", side_effect=httpx.ConnectError("offline")):
+            await publisher._notify_musicblog("published", 42)
 
     async def test_unreleased_editor_reads_and_updates_category(self):
         class WordPressFake:
