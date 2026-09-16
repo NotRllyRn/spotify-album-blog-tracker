@@ -169,6 +169,7 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         publisher._upload_artwork = AsyncMock(return_value=None)
         publisher._resolve_tags = AsyncMock(return_value=[7])
         publisher.refresh_post_cache = AsyncMock()
+        publisher._notify_musicblog = AsyncMock()
 
         result = await publisher.publish_release(self.release)
 
@@ -183,6 +184,7 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.quick_metadata.genres, ["Rock", "Pop"])
         self.assertEqual(result.quick_metadata.artists, ["The Artist"])
         self.assertEqual(result.quick_metadata.total_tracks, 2)
+        publisher._notify_musicblog.assert_awaited_once_with("published", 42)
 
     async def test_retry_fills_missing_metadata_without_overwriting_live_values(self):
         live_acf = {"spotify_title": "Keep this title"}
