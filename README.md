@@ -13,6 +13,8 @@ cp .env.example .env
 
 Fill in `.env`. Metadata enrichment is enabled by default and requires Last.fm credentials; set `SPOTIFY_BLOG_TRACKER_FILL_SCF=0` to disable it. WordPress must expose the SCF fields and the `artist`, `genre`, and `release_type` taxonomies defined by `scf-export-2026-09-16.json`.
 
+To refresh the frontend immediately after a publish, set `MUSICBLOG_WEBHOOK_URL` to its full `/api/wordpress/webhook` URL and set `WORDPRESS_WEBHOOK_SECRET` to the same long, random value used by the frontend. If either value is absent, webhook delivery is disabled. A delivery failure is logged without retrying the already-created WordPress post.
+
 ## Tracker
 
 ```bash
