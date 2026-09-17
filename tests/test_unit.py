@@ -939,6 +939,7 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
                 "followup": followup,
                 "message": type("FakeMessage", (), {"id": message_id})(),
                 "user": type("FakeUser", (), {"id": 123})(),
+                "edit_original_response": AsyncMock(),
             }
         )()
 
@@ -1430,11 +1431,10 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_current_post_confirm(interaction, state)
 
         self.assertEqual(tracker.published, (release, True))
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-        interaction.followup.send.assert_awaited_once_with(
-            "✅ Current content has been posted to WordPress. A notification has been sent.",
-            ephemeral=True
-        )
+        interaction.response.send_message.assert_awaited_once_with(
+            "⏳ Publishing to WordPress…", ephemeral=True)
+        interaction.edit_original_response.assert_awaited_with(content=(
+            "✅ Current content has been posted to WordPress. A notification has been sent."))
 
     async def test_inprogress_publish_uses_stored_relisten_state(self):
         release = make_release_for_test("album_7", "Album 7", datetime(2024, 1, 1, 12, 0, 0))
@@ -1460,11 +1460,10 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_publish_release(interaction, release.spotify_id)
 
         self.assertEqual(tracker.published, (release, True))
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-        interaction.followup.send.assert_awaited_once_with(
-            "✅ Release published successfully. A notification has been sent.",
-            ephemeral=True
-        )
+        interaction.response.send_message.assert_awaited_once_with(
+            "⏳ Publishing to WordPress…", ephemeral=True)
+        interaction.edit_original_response.assert_awaited_with(
+            content="✅ Release published successfully. A notification has been sent.")
 
     async def test_inprogress_publish_reports_already_publishing(self):
         release = make_release_for_test("album_9", "Album 9", datetime(2024, 1, 1, 12, 0, 0))
@@ -1483,11 +1482,10 @@ class TestDiscordBotEmbeds(unittest.IsolatedAsyncioTestCase):
 
         await self.bot._handle_publish_release(interaction, release.spotify_id)
 
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-        interaction.followup.send.assert_awaited_once_with(
-            "⏳ This release is already being published.",
-            ephemeral=True
-        )
+        interaction.response.send_message.assert_awaited_once_with(
+            "⏳ Publishing to WordPress…", ephemeral=True)
+        interaction.edit_original_response.assert_awaited_with(
+            content="⏳ This release is already being published.")
 
     async def test_context_resolver_builds_unsaved_release_for_untracked_duplicate_check(self):
         state = self.make_playback_state("album_8")
@@ -1856,6 +1854,7 @@ class TestTrackerPublishNow(unittest.IsolatedAsyncioTestCase):
         tracker.discord_bot = discord_bot
 
         await tracker._publish_release(release)
+        await asyncio.gather(*tracker._background_tasks)
 
         self.assertIs(discord_bot.missing, release)
         self.assertEqual(discord_bot.published[1].post["id"], 789)
@@ -2332,7 +2331,7 @@ class TestPublisherPostCacheRefresh(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.listen_count, 1)
         self.assertEqual(result.scf_pending_tags, [])
         self.assertEqual(release.wordpress_post_id, 99)
-        publisher.refresh_post_cache.assert_awaited_once_with(force=True)
+        publisher.refresh_post_cache.assert_not_awaited()
 
 
 class TestDuplicateDetection(unittest.TestCase):
@@ -2552,7 +2551,7 @@ class TestPrePublishSink(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_field_persists_release(self):
         db = MagicMock()
-        db.save_release = AsyncMock()
+        db.update_release_editor_field = AsyncMock()
         release = self.make_release()
         sink = PrePublishSink(db=db, release=release)
         sink.state = EditorState()  # reset
@@ -2566,12 +2565,11 @@ class TestPrePublishSink(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(release.favorite)
         self.assertEqual(release.notes, "n1")
         self.assertTrue(release.unreleased)
-        # One save per update_field call.
-        self.assertEqual(db.save_release.await_count, 4)
+        self.assertEqual(db.update_release_editor_field.await_count, 4)
 
     async def test_update_track_highlight_flips_in_place_and_saves(self):
         db = MagicMock()
-        db.save_release = AsyncMock()
+        db.update_track_highlight = AsyncMock()
         release = self.make_release()
         sink = PrePublishSink(db=db, release=release)
 
@@ -2580,17 +2578,18 @@ class TestPrePublishSink(unittest.IsolatedAsyncioTestCase):
         # t1 is now highlighted; t2 was already true, but is left alone.
         self.assertTrue(release.tracks[0].highlight)
         self.assertTrue(release.tracks[1].highlight)
-        db.save_release.assert_awaited_once()
+        db.update_track_highlight.assert_awaited_once_with(
+            release.spotify_id, "t1", True)
 
     async def test_update_track_highlight_unknown_id_is_noop(self):
         db = MagicMock()
-        db.save_release = AsyncMock()
+        db.update_track_highlight = AsyncMock()
         release = self.make_release()
         sink = PrePublishSink(db=db, release=release)
 
         await sink.update_track_highlight("not_a_real_id", True)
 
-        db.save_release.assert_not_awaited()
+        db.update_track_highlight.assert_not_awaited()
 
 
 @unittest.skipIf(EditorState is None, "editor_view module is not importable")
@@ -2602,6 +2601,9 @@ class TestPostPublishSink(unittest.IsolatedAsyncioTestCase):
         publisher.update_post_scf = AsyncMock(return_value=wp_response or {"id": 42})
         publisher.get_post_unreleased = AsyncMock(return_value=False)
         publisher.update_post_unreleased = AsyncMock(return_value=wp_response or {"id": 42})
+        publisher.get_post_editor_snapshot = AsyncMock(return_value={
+            "acf": initial_acf or {}, "unreleased": False, "body": "",
+        })
         wp_client = MagicMock()
         wp_client.get_post_acf = AsyncMock(return_value=initial_acf or {})
         sink = PostPublishSink(
@@ -2612,19 +2614,20 @@ class TestPostPublishSink(unittest.IsolatedAsyncioTestCase):
 
     async def test_snapshot_re_reads_live_acf(self):
         sink, _, wp_client = self.make_sink(initial_acf={})
-        wp_client.get_post_acf = AsyncMock(return_value={
+        sink.publisher.get_post_editor_snapshot = AsyncMock(return_value={
+            "acf": {
             "music_rating": 70, "music_favorite": True, "music_notes": "n",
+            }, "unreleased": True, "body": "<p>Body</p>",
         })
-        sink.publisher.get_post_unreleased = AsyncMock(return_value=True)
 
         state = await sink.snapshot()
 
-        wp_client.get_post_acf.assert_awaited_once_with(42)
-        sink.publisher.get_post_unreleased.assert_awaited_once_with(42)
+        sink.publisher.get_post_editor_snapshot.assert_awaited_once_with(42)
         self.assertEqual(state.rating, 70)
         self.assertTrue(state.favorite)
         self.assertEqual(state.notes, "n")
         self.assertTrue(state.unreleased)
+        self.assertEqual(state.body_content, "Body")
 
     async def test_update_field_patches_scf(self):
         sink, publisher, _ = self.make_sink(initial_acf={})
@@ -2741,6 +2744,21 @@ class TestGetPostAcf(unittest.IsolatedAsyncioTestCase):
         acf = await client.get_post_acf(1)
         self.assertEqual(acf, {})
 
+    async def test_editor_snapshot_uses_one_post_request(self):
+        client = self.make_client()
+        client.get_post = AsyncMock(return_value={"id": 123})
+
+        self.assertEqual(await client.get_post_editor_snapshot(123), {"id": 123})
+        client.get_post.assert_awaited_once_with(
+            123,
+            context="edit",
+            _embed="wp:term",
+            _fields=(
+                "id,title,content,acf,categories,artist,genre,release_type,"
+                "_embedded"
+            ),
+        )
+
 
 @unittest.skipIf(httpx is None, "httpx is not installed")
 class TestWordPressMediaUpload(unittest.IsolatedAsyncioTestCase):
@@ -2856,6 +2874,18 @@ class TestEditorWiring(unittest.IsolatedAsyncioTestCase):
         publisher.wordpress.get_post_acf = AsyncMock(return_value={
             "music_rating": 70, "music_favorite": False, "music_notes": "n",
         })
+        publisher.get_post_editor_snapshot = AsyncMock(return_value={
+            "acf": {
+                "music_rating": 70, "music_favorite": False, "music_notes": "n",
+            },
+            "unreleased": False,
+            "body": "<p>Existing body</p>",
+            "quick_metadata": QuickMetadata(
+                artists=["Artist"], genres=["Rock"], release_type="Album",
+                release_date="2024-01-01", total_tracks=1,
+                duration_ms=300_000, explicit=False,
+            ),
+        })
         publisher.get_post_unreleased = AsyncMock(return_value=False)
         publisher.get_post_quick_metadata = AsyncMock(return_value=QuickMetadata(
             artists=["Artist"], genres=["Rock"], release_type="Album",
@@ -2929,10 +2959,8 @@ class TestEditorWiring(unittest.IsolatedAsyncioTestCase):
 
         await self.bot._handle_edit_metadata_post_publish(interaction, release, prompt)
 
-        # Once at the handler (`initial_acf` fetch) plus once inside the sink
-        # initializer (`snapshot()`). Both reads come from the same WP endpoint.
-        self.assertGreaterEqual(self.publisher.wordpress.get_post_acf.await_count, 1)
-        self.publisher.wordpress.get_post_acf.assert_any_await(456)
+        self.publisher.get_post_editor_snapshot.assert_awaited_once_with(456)
+        self.publisher.wordpress.get_post_acf.assert_not_awaited()
         self.bot._send_dm.assert_awaited_once()
         kwargs = self.bot._send_dm.await_args.kwargs
         self.assertIn("Post-publish editor", kwargs["content"])
@@ -3051,29 +3079,29 @@ class TestBodyModalPrefill(unittest.IsolatedAsyncioTestCase):
         (text_input,) = view._build_body_modal().children
         self.assertEqual(text_input.default, "")
 
-    async def test_open_body_modal_prefills_with_stripped_live_body(self):
+    async def test_open_body_modal_uses_cached_body_without_wordpress(self):
         view, wordpress = self._make_view()
-        wordpress.get_post_content_raw = AsyncMock(
-            return_value="<p>First paragraph</p>\n\n<p>Second &amp; more</p>"
-        )
+        wordpress.get_post_content_raw = AsyncMock()
+        view.sink.state.body_content = "First paragraph\n\nSecond & more"
         interaction = self._make_interaction()
 
         await view._open_body_modal(interaction)
 
-        wordpress.get_post_content_raw.assert_awaited_once_with(42)
+        wordpress.get_post_content_raw.assert_not_awaited()
         modal = interaction.response.send_modal.await_args.args[0]
         (text_input,) = modal.children
         self.assertEqual(text_input.default, "First paragraph\n\nSecond & more")
 
-    async def test_open_body_modal_falls_back_to_empty_on_fetch_error(self):
+    async def test_open_body_modal_defaults_to_empty_cached_body(self):
         view, wordpress = self._make_view()
-        wordpress.get_post_content_raw = AsyncMock(side_effect=RuntimeError("WP down"))
+        wordpress.get_post_content_raw = AsyncMock()
         interaction = self._make_interaction()
 
         await view._open_body_modal(interaction)
         modal = interaction.response.send_modal.await_args.args[0]
         (text_input,) = modal.children
         self.assertEqual(text_input.default, "")
+        wordpress.get_post_content_raw.assert_not_awaited()
 
     async def test_open_body_modal_does_not_block_on_missing_wordpress_attr(self):
         view, _ = self._make_view()
@@ -3128,7 +3156,8 @@ class TestEditorViewRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
 
     async def test_bool_callback_toggles_state_and_rebuilds_label(self):
         db = MagicMock()
-        db.save_release = AsyncMock()
+        db.update_release_editor_field = AsyncMock()
+        db.update_track_highlight = AsyncMock()
         release = self.make_release()
         sink = PrePublishSink(db=db, release=release)
         await sink.snapshot()
@@ -3226,7 +3255,9 @@ class TestEditorViewRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
 
     async def test_post_publish_resync_and_body_buttons_dispatch(self):
         publisher = MagicMock()
-        publisher.get_post_unreleased = AsyncMock(return_value=False)
+        publisher.get_post_editor_snapshot = AsyncMock(return_value={
+            "acf": {}, "unreleased": False, "body": "<p>Body</p>",
+        })
         wordpress = MagicMock()
         wordpress.get_post_acf = AsyncMock(return_value={})
         wordpress.get_post_content_raw = AsyncMock(return_value="<p>Body</p>")
@@ -3236,7 +3267,8 @@ class TestEditorViewRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
 
         resync = self.make_interaction()
         await buttons["editor:nav:resync"].callback(resync)
-        resync.response.edit_message.assert_awaited_once()
+        resync.response.defer.assert_awaited_once()
+        resync.edit_original_response.assert_awaited_once()
         body = self.make_interaction()
         await buttons["editor:modal:body"].callback(body)
         body.response.send_modal.assert_awaited_once()
@@ -3334,7 +3366,7 @@ class TestEditorTracksRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
             tracks=tracks,
         )
         db = MagicMock()
-        db.save_release = AsyncMock()
+        db.update_track_highlight = AsyncMock()
         sink = PrePublishSink(db, release)
         editor = EditorView(sink, release.title, lambda: list(release.tracks))
         first_page = EditorTracksView(editor, page=0)
@@ -3343,9 +3375,8 @@ class TestEditorTracksRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
         toggle = self.make_interaction()
         await first_buttons["editor:track:t1:0"].callback(toggle)
         self.assertTrue(release.tracks[0].highlight)
-        toggle.response.defer.assert_awaited_once()
-        toggle.edit_original_response.assert_awaited_once()
-        toggled_embed = toggle.edit_original_response.await_args.kwargs["embed"]
+        toggle.response.edit_message.assert_awaited_once()
+        toggled_embed = toggle.response.edit_message.await_args.kwargs["embed"]
         self.assertEqual(toggled_embed.fields[0].value.split()[0], "⭐")
 
         next_page = self.make_interaction()
@@ -3362,6 +3393,39 @@ class TestEditorTracksRuntimeDispatch(unittest.IsolatedAsyncioTestCase):
         await second_buttons["editor:nav:back_to_editor:1"].callback(back)
         back.response.edit_message.assert_awaited_once()
         self.assertIs(back.response.edit_message.await_args.kwargs["view"], editor)
+        tracks_button = next(
+            child for child in editor.children
+            if child.custom_id == "editor:open:tracks")
+        self.assertEqual(tracks_button.label, "Highlight tracks (1) →")
+
+    async def test_track_toggle_repaints_before_persistence_finishes(self):
+        release = make_release_for_test(
+            "album_optimistic", "Optimistic", datetime(2024, 1, 1),
+            tracks=[Track(
+                spotify_id="t1", title="Track", normalized_title="track",
+                duration_ms=1000, disc_number=1, track_number=1,
+                is_countable=True, listened=False,
+            )],
+        )
+        gate = asyncio.Event()
+        async def persist(*_):
+            await gate.wait()
+        db = MagicMock()
+        db.update_track_highlight = AsyncMock(side_effect=persist)
+        editor = EditorView(
+            PrePublishSink(db, release), release.title, lambda: list(release.tracks))
+        button = next(
+            child for child in EditorTracksView(editor).children
+            if child.custom_id == "editor:track:t1:0")
+        interaction = self.make_interaction()
+
+        task = asyncio.create_task(button.callback(interaction))
+        await asyncio.sleep(0)
+
+        interaction.response.edit_message.assert_awaited_once()
+        self.assertFalse(task.done())
+        gate.set()
+        await task
 
 
 @unittest.skipIf(EditorView is None, "editor_view module is not importable")
@@ -3375,7 +3439,8 @@ class TestEditorStateStaysFreshAcrossNavigation(unittest.IsolatedAsyncioTestCase
 
     def _make_view(self):
         db = MagicMock()
-        db.save_release = AsyncMock()
+        db.update_release_editor_field = AsyncMock()
+        db.update_track_highlight = AsyncMock()
         tracks = [
             Track(spotify_id="t1", title="Track 1", normalized_title="track 1",
                   duration_ms=1000, disc_number=1, track_number=1,

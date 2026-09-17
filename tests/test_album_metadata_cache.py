@@ -101,6 +101,41 @@ class AlbumMetadataCacheDatabaseTests(unittest.IsolatedAsyncioTestCase):
         stored = await self.db.get_release("album-explicit")
         self.assertTrue(stored.tracks[0].explicit)
 
+    async def test_editor_fields_use_targeted_updates_and_body_round_trips(self):
+        now = datetime.now()
+        track = Track("track-editor", "Track", "track", 1000, 1, 1, True, False)
+        release = Release(
+            spotify_id="album-editor", title="Album", normalized_title="album",
+            artists=[], release_type=ReleaseType.ALBUM, raw_spotify_type="album",
+            cover_url="", release_date="2026", total_tracks=1,
+            total_duration_ms=1000, tracks=[track], progress=0,
+            status=LifecycleStatus.ACTIVE, first_seen=now, last_seen=now,
+        )
+        await self.db.save_release(release)
+
+        await self.db.update_release_editor_field(
+            release.spotify_id, "body_content", "Draft body")
+        await self.db.update_track_highlight(
+            release.spotify_id, track.spotify_id, True)
+
+        stored = await self.db.get_release(release.spotify_id)
+        self.assertEqual(stored.body_content, "Draft body")
+        self.assertTrue(stored.tracks[0].highlight)
+
+    async def test_publish_claim_is_atomic(self):
+        now = datetime.now()
+        release = Release(
+            spotify_id="album-claim", title="Album", normalized_title="album",
+            artists=[], release_type=ReleaseType.ALBUM, raw_spotify_type="album",
+            cover_url="", release_date="2026", total_tracks=0,
+            total_duration_ms=0, tracks=[], progress=0,
+            status=LifecycleStatus.ACTIVE, first_seen=now, last_seen=now,
+        )
+        await self.db.save_release(release)
+
+        self.assertTrue(await self.db.claim_release_for_publish(release.spotify_id))
+        self.assertFalse(await self.db.claim_release_for_publish(release.spotify_id))
+
     async def test_random_zero_includes_album_without_metadata(self):
         await self.db.upsert_saved_library_album(self.saved_album("unknown"))
 

@@ -1,4 +1,5 @@
 import importlib
+import asyncio
 import json
 import os
 import unittest
@@ -137,6 +138,7 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.release.rating = 91
         self.release.favorite = True
         self.release.notes = "Editorial notes"
+        self.release.body_content = "First paragraph\n\nSecond paragraph"
         created, updates = {}, []
         test_case = self
 
@@ -172,13 +174,29 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
         publisher._notify_musicblog = AsyncMock()
 
         result = await publisher.publish_release(self.release)
+        await asyncio.gather(*publisher._background_tasks)
 
-        self.assertEqual(updates, [materialize_body(patch["write"], term_ids())])
-        self.assertEqual(created["acf"], {
-            "music_rating": 91,
-            "music_favorite": True,
-            "music_notes": "Editorial notes",
-        })
+        expected = materialize_body(patch["write"], term_ids())
+        self.assertEqual(updates, [])
+        self.assertEqual(
+            created["content"],
+            "<p>First paragraph</p>\n\n<p>Second paragraph</p>")
+        self.assertEqual(created["release_type"], expected["release_type"])
+        self.assertEqual(created["artist"], expected["artist"])
+        self.assertEqual(created["genre"], expected["genre"])
+        self.assertEqual(
+            {key: created["acf"][key] for key in expected["acf"]},
+            expected["acf"],
+        )
+        self.assertEqual(
+            {key: created["acf"][key] for key in (
+                "music_rating", "music_favorite", "music_notes")},
+            {
+                "music_rating": 91,
+                "music_favorite": True,
+                "music_notes": "Editorial notes",
+            },
+        )
         self.assertEqual(result.scf_pending_tags, [])
         self.assertEqual(result.listen_count, 1)
         self.assertEqual(result.quick_metadata.genres, ["Rock", "Pop"])
@@ -292,8 +310,8 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
 
         await publisher.publish_release(self.release)
 
-        self.assertEqual(created["categories"], [5, 200])
-        self.assertEqual(updates, [{"categories": [200, 5]}])
+        self.assertEqual(created["categories"], [200, 5])
+        self.assertEqual(updates, [])
 
     async def test_publisher_surfaces_metadata_failure_without_losing_post(self):
         test_case = self
