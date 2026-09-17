@@ -2,9 +2,11 @@
 Async WordPress REST API client.
 """
 
+import asyncio
 import httpx
 import logging
 import hashlib
+import time
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -14,6 +16,20 @@ from album_metadata.schema import TAXONOMIES
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+
+async def _request_started(request: httpx.Request) -> None:
+    request.extensions["tracker_started_at"] = time.perf_counter()
+
+
+async def _request_finished(response: httpx.Response) -> None:
+    started_at = response.request.extensions.get("tracker_started_at")
+    if isinstance(started_at, float):
+        logger.info(
+            "wordpress_request method=%s path=%s status=%s duration_ms=%.1f",
+            response.request.method, response.request.url.path, response.status_code,
+            (time.perf_counter() - started_at) * 1000,
+        )
 
 
 def _payload_type_summary(data: Dict[str, Any]) -> str:
@@ -71,6 +87,10 @@ class WordPressClient:
             auth=httpx.BasicAuth(self.username, self.app_password),
             headers={"Accept": "application/json"},
             timeout=30.0,
+            event_hooks={
+                "request": [_request_started],
+                "response": [_request_finished],
+            },
         )
         self._cached_tags: Optional[List[Dict[str, Any]]] = None
         self._cached_tags_x_wp_total: Optional[str] = None
@@ -200,6 +220,18 @@ class WordPressClient:
         response.raise_for_status()
         return response.json()
 
+    async def get_post_editor_snapshot(self, post_id: int) -> Dict[str, Any]:
+        """Fetch every post field needed by the editor in one request."""
+        return await self.get_post(
+            post_id,
+            context="edit",
+            _embed="wp:term",
+            _fields=(
+                "id,title,content,acf,categories,artist,genre,release_type,"
+                "_embedded"
+            ),
+        )
+
     async def get_post_acf(self, post_id: int) -> dict:
         """Fetch the live ``acf`` block for a post so the editor can read current SCF values."""
         url = f"{self.api_url}/posts/{post_id}"
@@ -258,17 +290,24 @@ class WordPressClient:
         if unknown:
             raise ValueError(f"Unknown taxonomies: {sorted(unknown)}")
 
+        existing_by_taxonomy = await asyncio.gather(*(
+            self._get_taxonomy_terms(taxonomy) for taxonomy in TAXONOMIES))
         resolved = {taxonomy: {} for taxonomy in TAXONOMIES}
-        for taxonomy in TAXONOMIES:
-            existing = await self._get_taxonomy_terms(taxonomy)
+        missing = []
+        for taxonomy, existing in zip(TAXONOMIES, existing_by_taxonomy):
             resolved[taxonomy] = {
                 match_key(row["name"]): row["id"] for row in existing
             }
             for name in wanted.get(taxonomy, []):
                 key = match_key(name)
                 if key not in resolved[taxonomy]:
-                    term = await self._create_taxonomy_term(taxonomy, name)
-                    resolved[taxonomy][key] = term["id"]
+                    missing.append((taxonomy, key, name))
+        created = await asyncio.gather(*(
+            self._create_taxonomy_term(taxonomy, name)
+            for taxonomy, _, name in missing
+        ))
+        for (taxonomy, key, _), term in zip(missing, created):
+            resolved[taxonomy][key] = term["id"]
         return resolved
 
     async def get_taxonomy_names(

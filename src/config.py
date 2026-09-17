@@ -59,7 +59,9 @@ class Config:
 
     def _load_env(self):
         """Load .env file if it exists."""
-        if self.env_file.exists():
+        configured = any(os.getenv(name) for name in (
+            "SPOTIFY_CLIENT_ID", "WORDPRESS_URL", "DISCORD_BOT_TOKEN"))
+        if self.env_file.exists() and not configured:
             from dotenv import load_dotenv
             load_dotenv(self.env_file)
 

@@ -1,5 +1,6 @@
 """Tracker adapter for the shared album metadata engine."""
 
+from datetime import datetime
 from typing import Any
 
 from album_metadata.enrichment import build_known_album_patch
@@ -65,6 +66,27 @@ class TrackerMetadataAdapter:
             message = diagnostics[0].get("message") if diagnostics else "No metadata update was produced."
             raise MetadataEnrichmentError(message)
         return patch
+
+    async def build_create_patch(
+        self,
+        release: Release,
+        tag_ids: list[int],
+        category_ids: list[int],
+        listen_count: int,
+        post_date: datetime,
+    ) -> dict:
+        """Build the initial post write without requiring a persisted post."""
+        return await self.build_patch(release, {
+            "id": 1,
+            "title": {"rendered": release.title},
+            "date": post_date.isoformat(timespec="seconds"),
+            "tags": list(tag_ids),
+            "categories": list(category_ids),
+            "artist": [],
+            "genre": [],
+            "release_type": [],
+            "acf": {},
+        }, tag_ids, category_ids, listen_count)
 
     @staticmethod
     def editor_acf(release: Release) -> dict:

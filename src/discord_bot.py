@@ -7,6 +7,7 @@ import json
 import discord
 from discord import app_commands
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, cast
 from datetime import datetime, timedelta
@@ -724,7 +725,8 @@ class DiscordBot:
 
     async def handle_prompt_action(self, interaction: discord.Interaction, action: str):
         if action not in ("add_content", "edit_metadata"):
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(
+                ephemeral=True, thinking=action == "publish_now")
 
         message = interaction.message
         if message is None:
@@ -891,7 +893,6 @@ class DiscordBot:
         try:
             title = release.title if release else f"post {post_id}"
             publisher = self._publisher()
-            initial_acf = await publisher.wordpress.get_post_acf(post_id)
 
             async def _deliver(view: EditorView, embed: discord.Embed) -> None:
                 await self._send_dm(
@@ -905,7 +906,6 @@ class DiscordBot:
                 wordpress_client=publisher.wordpress,
                 post_id=post_id,
                 release_title=title,
-                initial_acf=initial_acf,
                 on_open=_deliver,
             )
             await interaction.followup.send(
@@ -1433,27 +1433,36 @@ class DiscordBot:
         already_publishing_message: str,
         as_relisten: bool = False
     ) -> Optional[str]:
+        started_at = time.perf_counter()
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.send_message(
+                "⏳ Publishing to WordPress…", ephemeral=True)
+        else:
+            await interaction.edit_original_response(
+                content="⏳ Publishing to WordPress…")
+        logger.info(
+            "discord_interaction action=publish ack_ms=%.1f release_id=%s",
+            (time.perf_counter() - started_at) * 1000, release.spotify_id)
 
         try:
             outcome = await self.tracker.publish_release_now(release, as_relisten=as_relisten)
             if outcome == "already_published":
-                await interaction.followup.send(already_published_message, ephemeral=True)
+                await interaction.edit_original_response(content=already_published_message)
                 return outcome
 
             if outcome == "already_publishing":
-                await interaction.followup.send(already_publishing_message, ephemeral=True)
+                await interaction.edit_original_response(content=already_publishing_message)
                 return outcome
 
-            await interaction.followup.send(success_message, ephemeral=True)
+            await interaction.edit_original_response(content=success_message)
+            logger.info(
+                "discord_interaction action=publish complete_ms=%.1f release_id=%s",
+                (time.perf_counter() - started_at) * 1000, release.spotify_id)
             return outcome
         except Exception as e:
             logger.error(f"Error publishing release {release.spotify_id}: {e}", exc_info=True)
-            await interaction.followup.send(
-                "❌ Error publishing the release. Check the service logs and try again.",
-                ephemeral=True
-            )
+            await interaction.edit_original_response(content=(
+                "❌ Error publishing the release. Check the service logs and try again."))
             return None
 
     def _build_inprogress_embed(self, page_data: InProgressPage) -> discord.Embed:
@@ -1920,18 +1929,12 @@ class DiscordBot:
             match = None
 
         if title is None:
-            try:
-                url = f"{publisher.wordpress.api_url}/posts/{post_id}"
-                response = await publisher.wordpress.client.get(url)
-                response.raise_for_status()
-                title_obj = response.json().get("title") or {}
-                title = title_obj.get("rendered", f"post {post_id}") if isinstance(title_obj, dict) else str(title_obj)
-            except Exception as e:
-                logger.warning(f"/editor title fetch failed for post {post_id}: {e}")
-                title = f"post {post_id}"
+            title = f"post {post_id}"
 
         try:
-            initial_acf = await publisher.wordpress.get_post_acf(post_id)
+            snapshot = await publisher.get_post_editor_snapshot(post_id)
+            if title == f"post {post_id}":
+                title = snapshot.get("title", title)
 
             async def _deliver(view: EditorView, embed: discord.Embed) -> None:
                 await self._send_dm(
@@ -1945,7 +1948,7 @@ class DiscordBot:
                 wordpress_client=publisher.wordpress,
                 post_id=post_id,
                 release_title=title,
-                initial_acf=initial_acf,
+                initial_snapshot=snapshot,
                 on_open=_deliver,
             )
         except Exception as e:

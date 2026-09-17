@@ -168,6 +168,7 @@ class Database:
             release.favorite,
             release.notes,
             release.unreleased,
+            release.body_content,
         )
 
         # pi-lens-ignore: python-sql-injection
@@ -177,8 +178,8 @@ class Database:
              cover_url, release_date, total_tracks, total_duration_ms, progress, status,
              first_seen, last_seen, completed_at, published_at, wordpress_post_id,
              wordpress_media_id, is_relisten, duplicate_state, duplicate_post_id,
-             rating, favorite, notes, unreleased)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             rating, favorite, notes, unreleased, body_content)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
 
         release_id = cursor.lastrowid
@@ -193,6 +194,52 @@ class Database:
 
         await self.connection.commit()
         return release_id
+
+    async def update_track_highlight(
+        self, release_spotify_id: str, track_spotify_id: str, highlight: bool
+    ) -> None:
+        """Persist one editor-owned track flag without rewriting the release."""
+        cursor = await self.connection.execute("""
+            UPDATE release_track SET highlight = ?
+            WHERE spotify_id = ? AND release_id = (
+                SELECT id FROM release_lifecycle WHERE spotify_id = ?
+            )
+        """, (highlight, track_spotify_id, release_spotify_id))
+        if cursor.rowcount != 1:
+            raise RuntimeError("Track highlight target was not found")
+        await self.connection.commit()
+
+    async def update_release_editor_field(
+        self, spotify_id: str, name: str, value: Any
+    ) -> None:
+        """Persist one release editor field without rewriting related rows."""
+        column = {
+            "rating": "rating", "favorite": "favorite", "notes": "notes",
+            "unreleased": "unreleased", "body_content": "body_content",
+        }.get(name)
+        if column is None:
+            raise ValueError(f"Unknown editor field: {name}")
+        cursor = await self.connection.execute(
+            f"UPDATE release_lifecycle SET {column} = ? WHERE spotify_id = ?",  # noqa: S608
+            (value, spotify_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Release editor target was not found")
+        await self.connection.commit()
+
+    async def claim_release_for_publish(self, spotify_id: str) -> bool:
+        """Atomically prevent duplicate publish workers for one release."""
+        cursor = await self.connection.execute("""
+            UPDATE release_lifecycle SET status = ?
+            WHERE spotify_id = ? AND status NOT IN (?, ?)
+        """, (
+            LifecycleStatus.PUBLISHING.value,
+            spotify_id,
+            LifecycleStatus.PUBLISHING.value,
+            LifecycleStatus.PUBLISHED_RECENTLY.value,
+        ))
+        await self.connection.commit()
+        return cursor.rowcount == 1
 
     async def delete_release(self, spotify_id: str) -> bool:
         """Delete a release and its associated data by Spotify ID."""
@@ -349,6 +396,7 @@ class Database:
             favorite=bool(row[22]) if len(row) > 22 else False,
             notes=row[23] if len(row) > 23 else None,
             unreleased=bool(row[24]) if len(row) > 24 else False,
+            body_content=row[25] if len(row) > 25 else "",
         )
 
     # WordPress operations
@@ -383,6 +431,18 @@ class Database:
                 post.link
             ))
 
+        await self.connection.commit()
+
+    async def upsert_wordpress_post(self, post: WordPressPost) -> None:
+        """Update the duplicate cache from a just-created post."""
+        await self.connection.execute("""
+            INSERT OR REPLACE INTO wordpress_post_cache
+            (id, title, normalized_title, artists_json, normalized_artists_json, link)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            post.id, post.title, post.normalized_title,
+            json.dumps(post.artists), json.dumps(post.normalized_artists), post.link,
+        ))
         await self.connection.commit()
 
     # Saved Spotify library operations

@@ -48,6 +48,7 @@ class Tracker:
         self.idle_interval = 15
         self.backoff_interval = 60
         self._last_published_cleanup_at: Optional[datetime] = None
+        self._background_tasks: set[asyncio.Task] = set()
 
     @property
     def publisher(self) -> "Publisher":
@@ -81,7 +82,17 @@ class Tracker:
     async def stop(self):
         """Stop the tracker."""
         self.running = False
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
         await self.spotify.close()
+
+    def _spawn(self, coroutine, label: str) -> None:
+        task = asyncio.create_task(coroutine, name=label)
+        tasks = getattr(self, "_background_tasks", None)
+        if tasks is None:
+            tasks = self._background_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def _poll_once(self):
         """Single poll iteration."""
@@ -505,11 +516,17 @@ class Tracker:
         if as_relisten and not release_to_publish.duplicate_post_id:
             release_to_publish.duplicate_post_id = release.duplicate_post_id
 
-        if release_to_publish.status == LifecycleStatus.PUBLISHED_RECENTLY:
-            return "already_published"
-
-        if release_to_publish.status == LifecycleStatus.PUBLISHING:
-            return "already_publishing"
+        claim = getattr(self.db, "claim_release_for_publish", None)
+        claimed = await claim(release_to_publish.spotify_id) if claim else (
+            release_to_publish.status not in {
+                LifecycleStatus.PUBLISHING, LifecycleStatus.PUBLISHED_RECENTLY})
+        if not claimed:
+            current = await self.db.get_release(release_to_publish.spotify_id)
+            return (
+                "already_published"
+                if current and current.status == LifecycleStatus.PUBLISHED_RECENTLY
+                else "already_publishing"
+            )
 
         release_to_publish.status = LifecycleStatus.PUBLISHING
         if as_relisten:
@@ -537,15 +554,16 @@ class Tracker:
             await self.db.save_release(release)
             await self.db.mark_saved_library_album_posted(release.spotify_id, post.get("id"))
 
-            if self.discord_bot:
-                await self.discord_bot.send_publish_notification(release, result)
-                await self._warn_if_published_album_not_saved(release)
-
             await self.db.log_audit_event("release_published", {
                 "spotify_id": release.spotify_id,
                 "release_title": release.title,
                 "wordpress_post_id": post["id"]
             })
+            if self.discord_bot:
+                self._spawn(
+                    self._send_publish_notifications(release, result),
+                    f"publish-notifications-{release.spotify_id}",
+                )
             logger.info(f"Published {release.title} to WordPress post {post['id']}")
 
         except Exception as e:
@@ -553,6 +571,13 @@ class Tracker:
             release.status = LifecycleStatus.ACTIVE  # Reset status on failure
             await self.db.save_release(release)
             raise
+
+    async def _send_publish_notifications(self, release: Release, result) -> None:
+        try:
+            await self.discord_bot.send_publish_notification(release, result)
+            await self._warn_if_published_album_not_saved(release)
+        except Exception:
+            logger.exception("Publish notification failed for %s", release.spotify_id)
 
     async def _warn_if_published_album_not_saved(self, release: Release):
         """Warn through Discord when a published album is not saved in Spotify library."""

@@ -15,6 +15,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable, TYPE_CHECKING
@@ -54,6 +55,7 @@ class EditorState:
     favorite: bool = False
     notes: Optional[str] = None
     unreleased: bool = False
+    body_content: str = ""
     music_tracks: Optional[List[Dict[str, Any]]] = None  # full repeater rows (post-publish only)
 
 
@@ -63,10 +65,13 @@ def state_from_release(release: Release) -> EditorState:
         favorite=release.favorite,
         notes=release.notes,
         unreleased=release.unreleased,
+        body_content=release.body_content,
     )
 
 
-def state_from_acf(acf: Dict[str, Any], *, unreleased: bool = False) -> EditorState:
+def state_from_acf(
+    acf: Dict[str, Any], *, unreleased: bool = False, body_content: str = ""
+) -> EditorState:
     tracks = acf.get("music_tracks")
     if isinstance(tracks, list):
         music_tracks = [dict(row) for row in tracks if isinstance(row, dict)]
@@ -82,6 +87,7 @@ def state_from_acf(acf: Dict[str, Any], *, unreleased: bool = False) -> EditorSt
         favorite=bool(acf.get("music_favorite", False)),
         notes=(acf.get("music_notes") or None) or None,
         unreleased=unreleased,
+        body_content=body_content,
         music_tracks=music_tracks,
     )
 
@@ -117,7 +123,7 @@ class PrePublishSink:
     async def update_field(self, name: str, value: Any) -> None:
         setattr(self.release, name, value)
         setattr(self.state, name, value)
-        await self.db.save_release(self.release)
+        await self.db.update_release_editor_field(self.release.spotify_id, name, value)
 
     async def update_track_highlight(self, spotify_id: str, on: bool) -> None:
         tracks_by_id = {t.spotify_id: t for t in self.release.tracks}
@@ -125,7 +131,8 @@ class PrePublishSink:
         if track is None:
             return
         track.highlight = bool(on)
-        await self.db.save_release(self.release)
+        await self.db.update_track_highlight(
+            self.release.spotify_id, spotify_id, track.highlight)
 
 
 class PostPublishSink:
@@ -133,24 +140,33 @@ class PostPublishSink:
 
     mode = "post-publish"
 
-    def __init__(self, publisher: "Publisher", wordpress_client, post_id: int, initial_acf: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self, publisher: "Publisher", wordpress_client, post_id: int,
+        initial_acf: Optional[Dict[str, Any]] = None, initial_body: str = "",
+    ):
         self.publisher = publisher
         self.wordpress = wordpress_client
         self.post_id = post_id
         # Trust the initial snapshot if the caller already fetched it.
-        self.state = state_from_acf(initial_acf) if initial_acf else EditorState()
+        self.state = state_from_acf(initial_acf, body_content=initial_body) if initial_acf else EditorState(body_content=initial_body)
+        self._write_lock = asyncio.Lock()
 
-    async def snapshot(self) -> EditorState:
-        # Always re-fetch from WP so the editor reads the live state.
-        acf, unreleased = await asyncio.gather(
-            self.wordpress.get_post_acf(self.post_id),
-            self.publisher.get_post_unreleased(self.post_id),
+    def load_snapshot(self, snapshot: Dict[str, Any]) -> EditorState:
+        self.state = state_from_acf(
+            snapshot.get("acf") or {},
+            unreleased=bool(snapshot.get("unreleased")),
+            body_content=_wp_html_to_modal_text(str(snapshot.get("body") or "")),
         )
-        self.state = state_from_acf(acf, unreleased=unreleased)
         return self.state
 
+    async def snapshot(self) -> EditorState:
+        return self.load_snapshot(
+            await self.publisher.get_post_editor_snapshot(self.post_id))
+
     async def update_field(self, name: str, value: Any) -> None:
-        if name == "unreleased":
+        if name == "body_content":
+            await self.publisher.update_post_content(self.post_id, str(value))
+        elif name == "unreleased":
             await self.publisher.update_post_unreleased(self.post_id, bool(value))
         else:
             scf_field = _project_field_to_scf(name)
@@ -159,14 +175,14 @@ class PostPublishSink:
         setattr(self.state, name, value)
 
     async def update_track_highlight(self, spotify_id: str, on: bool) -> None:
-        await self.snapshot()
-        rows = self.state.music_tracks or []
-        matched = [r for r in rows if r.get("spotify_id") == spotify_id]
-        if not matched:
-            return
-        for row in matched:
-            row["highlight"] = bool(on)
-        await self.publisher.update_post_scf(self.post_id, {"music_tracks": rows})
+        async with self._write_lock:
+            for row in self.state.music_tracks or []:
+                if row.get("spotify_id") == spotify_id:
+                    row["highlight"] = bool(on)
+            rows = [dict(row) for row in self.state.music_tracks or []]
+            if not any(row.get("spotify_id") == spotify_id for row in rows):
+                return
+            await self.publisher.update_post_scf(self.post_id, {"music_tracks": rows})
 
 
 # --- Field-name projection (release field ↔ SCF acf key) -------------------
@@ -251,6 +267,11 @@ def build_editor_embed(
         notes_text = notes_text[:199] + "…"
     embed.add_field(name="Rating", value=rating_text, inline=True)
     embed.add_field(name="Notes", value=notes_text, inline=False)
+    embed.add_field(
+        name="Body",
+        value=f"{len(state.body_content)} characters" if state.body_content else "—",
+        inline=True,
+    )
     if state.music_tracks:
         highlighted = sum(1 for row in state.music_tracks if row.get("highlight"))
         embed.add_field(
@@ -468,6 +489,7 @@ class EditorTracksView(discord.ui.View):
         )
 
     async def _back_to_editor(self, interaction: discord.Interaction):
+        self.editor_view._rebuild_button_labels()
         await interaction.response.edit_message(
             embed=self.editor_view.build_editor_embed(),
             view=self.editor_view,
@@ -559,20 +581,14 @@ class EditorView(discord.ui.View):
             btn.callback = self._make_modal_callback(name)
             self.add_item(btn)
 
-        # Row 1 also hosts the optional "Body" button which is the same as the
-        # existing PostContentModal flow inside the post-publish view. The
-        # editor_body button is only present post-publish to avoid two ways to
-        # open the same modal in the pre-publish view (pre-publish edits ride
-        # onto publish time).
-        if self.sink.mode == "post-publish":
-            body_btn = discord.ui.Button(
-                label="Body: ✏️",
-                style=discord.ButtonStyle.primary,
-                custom_id=f"{CUSTOM_ID_PREFIX}:modal:body",
-                row=1,
-            )
-            body_btn.callback = self._open_body_modal
-            self.add_item(body_btn)
+        body_btn = discord.ui.Button(
+            label=self._body_label(),
+            style=discord.ButtonStyle.primary,
+            custom_id=f"{CUSTOM_ID_PREFIX}:modal:body",
+            row=1,
+        )
+        body_btn.callback = self._open_body_modal
+        self.add_item(body_btn)
 
         # Row 3 — navigation row, always present
         if self.sink.mode == "post-publish":
@@ -627,6 +643,9 @@ class EditorView(discord.ui.View):
         highlighted = sum(1 for t in tracks if t.highlight)
         return f"Highlight tracks ({highlighted}) →"
 
+    def _body_label(self) -> str:
+        return "Body: ✏️" if self.state.body_content else "Body: Empty"
+
     # --- Discord callback helpers ----------------------------------------
 
     def _make_bool_callback(self, name: str):
@@ -659,20 +678,12 @@ class EditorView(discord.ui.View):
         return BodyModal(self, default=prefill)
 
     async def _open_body_modal(self, interaction: discord.Interaction):
-        prefill = ""
-        wordpress = getattr(self.sink, "wordpress", None)
-        post_id = getattr(self.sink, "post_id", None)
-        if wordpress is not None and post_id is not None:
-            try:
-                prefill = _wp_html_to_modal_text(await wordpress.get_post_content_raw(post_id))
-            except Exception:
-                logger.exception("Failed to fetch live post body for editor prefill")
-        await interaction.response.send_modal(self._build_body_modal(prefill=prefill))
+        await interaction.response.send_modal(
+            self._build_body_modal(prefill=self.state.body_content))
 
     # --- Top-level transitions -------------------------------------------
 
     async def _open_tracks(self, interaction: discord.Interaction):
-        await self.sink.snapshot()  # ensure highlight rows reflect current source
         new_view = EditorTracksView(self, page=0)
         await interaction.response.edit_message(
             embed=self.build_tracks_embed(page=0),
@@ -687,20 +698,21 @@ class EditorView(discord.ui.View):
             )
             return
         try:
+            await interaction.response.defer()
             await self.sink.snapshot()
-            await interaction.response.edit_message(
+            self._rebuild_button_labels()
+            await interaction.edit_original_response(
                 embed=self.build_editor_embed(),
                 view=self,
             )
         except Exception as error:
             logger.warning("Re-sync from WP failed", exc_info=True)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "⚠️ Re-sync failed. Check the service logs and try again.",
                 ephemeral=True,
             )
 
     async def _refresh_display(self, interaction: discord.Interaction):
-        await self.sink.snapshot()
         self._rebuild_button_labels()
         await interaction.response.edit_message(
             embed=self.build_editor_embed(),
@@ -765,9 +777,8 @@ class EditorView(discord.ui.View):
         return self._tracks_for_editor()
 
     async def _apply_field_edit(self, name: str, value: Any, interaction: discord.Interaction):
-        await self.sink.update_field(name, value)
-        # Refresh in-place button labels so toggles flip and scalar rows
-        # preview the new value before the embed re-renders.
+        started_at = time.perf_counter()
+        setattr(self.state, name, value)
         self._rebuild_button_labels()
         try:
             await interaction.response.edit_message(
@@ -783,22 +794,52 @@ class EditorView(discord.ui.View):
                 embed=self.build_editor_embed(),
                 view=self,
             )
+        logger.info(
+            "discord_interaction action=editor_field field=%s ack_ms=%.1f",
+            name, (time.perf_counter() - started_at) * 1000)
+        try:
+            await self.sink.update_field(name, value)
+        except Exception:
+            logger.exception("Editor field persistence failed: %s", name)
+            await interaction.followup.send(
+                "⚠️ The editor updated locally, but saving failed. Re-sync and try again.",
+                ephemeral=True,
+            )
+        logger.info(
+            "discord_interaction action=editor_field field=%s complete_ms=%.1f",
+            name, (time.perf_counter() - started_at) * 1000)
 
     async def _apply_track_toggle(self, interaction: discord.Interaction, track: Track, page: int):
-        await interaction.response.defer()
+        started_at = time.perf_counter()
         new_value = not bool(track.highlight)
-        await self.sink.update_track_highlight(track.spotify_id, new_value)
-        # Re-fetch release to keep in-memory truth aligned for the next click.
         tracks = self.tracks_for_editor()
         for t in tracks:
             if t.spotify_id == track.spotify_id:
                 t.highlight = new_value
                 break
+        for row in self.state.music_tracks or []:
+            if row.get("spotify_id") == track.spotify_id:
+                row["highlight"] = new_value
+        self._rebuild_button_labels()
         new_view = EditorTracksView(self, page=page)
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             embed=self.build_tracks_embed(page=page),
             view=new_view,
         )
+        logger.info(
+            "discord_interaction action=track_highlight ack_ms=%.1f",
+            (time.perf_counter() - started_at) * 1000)
+        try:
+            await self.sink.update_track_highlight(track.spotify_id, new_value)
+        except Exception:
+            logger.exception("Track highlight persistence failed: %s", track.spotify_id)
+            await interaction.followup.send(
+                "⚠️ The highlight updated locally, but saving failed. Re-sync and try again.",
+                ephemeral=True,
+            )
+        logger.info(
+            "discord_interaction action=track_highlight complete_ms=%.1f",
+            (time.perf_counter() - started_at) * 1000)
 
     def _rebuild_button_labels(self) -> None:
         for child in list(self.children):
@@ -814,6 +855,8 @@ class EditorView(discord.ui.View):
                 name = cid.split(":")[2]
                 if name in ("rating", "notes"):
                     child.label = self._scalar_label(name)
+                elif name == "body":
+                    child.label = self._body_label()
             elif cid.startswith(f"{CUSTOM_ID_PREFIX}:open:tracks"):
                 child.label = self._tracks_label()
 
@@ -859,30 +902,8 @@ class BodyModal(discord.ui.Modal):
         self.body_input = body_input
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Body is a WP-core field, not SCF. The sink exposes ``update_field``
-        # only for SCF fields; for body we route through the same publisher
-        # helper as the existing PostContentModal flow.
-        publisher = getattr(self.editor_view.sink, "publisher", None)
-        post_id = getattr(self.editor_view.sink, "post_id", None)
-        if publisher is None or post_id is None:
-            await interaction.response.send_message(
-                "⚠️ Body updates are only available in post-publish mode.",
-                ephemeral=True,
-            )
-            return
-        try:
-            await publisher.update_post_content(post_id, str(self.body_input.value))
-        except Exception as error:
-            logger.error("Body update failed", exc_info=True)
-            await interaction.response.send_message(
-                "❌ Body update failed. Check the service logs and try again.",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.edit_message(
-            embed=self.editor_view.build_editor_embed(),
-            view=self.editor_view,
-        )
+        await self.editor_view._apply_field_edit(
+            "body_content", str(self.body_input.value), interaction)
 
 
 # --- Factory helpers --------------------------------------------------------
@@ -947,6 +968,8 @@ async def open_post_publish_editor(
     post_id: int,
     release_title: str,
     initial_acf: Optional[Dict[str, Any]] = None,
+    initial_body: str = "",
+    initial_snapshot: Optional[Dict[str, Any]] = None,
     on_open: Optional[Callable[["EditorView", discord.Embed], Awaitable[None]]] = None,
 ) -> "EditorView":
     """Build an editor bound to a live WordPress post."""
@@ -955,13 +978,11 @@ async def open_post_publish_editor(
         wordpress_client=wordpress_client,
         post_id=post_id,
         initial_acf=initial_acf,
+        initial_body=initial_body,
     )
-    await sink.snapshot()
-    try:
-        quick_metadata = await publisher.get_post_quick_metadata(post_id)
-    except Exception as error:
-        logger.warning("Could not load quick metadata for post %s: %s", post_id, error)
-        quick_metadata = None
+    snapshot = initial_snapshot or await publisher.get_post_editor_snapshot(post_id)
+    sink.load_snapshot(snapshot)
+    quick_metadata = snapshot.get("quick_metadata")
 
     def tracks_provider() -> List[Track]:
         # For post-publish, the authoritative highlight state is the acf block,

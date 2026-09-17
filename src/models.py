@@ -81,6 +81,7 @@ class Release:
     favorite: bool = False
     notes: Optional[str] = None
     unreleased: bool = False
+    body_content: str = ""
 
 @dataclass
 class PlaybackState:

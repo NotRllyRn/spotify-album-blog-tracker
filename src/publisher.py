@@ -2,10 +2,11 @@
 WordPress publishing service.
 """
 
+import asyncio
 import httpx
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from pathlib import Path
 import tempfile
@@ -21,6 +22,8 @@ from artist_images import (
 )
 from wordpress_client import WordPressClient
 from models import PublishResult, QuickMetadata, Release
+from models import WordPressPost
+from utils import normalize_artist_list, normalize_text
 from tracker_metadata_adapter import TrackerMetadataAdapter  # pyright: ignore[reportMissingImports]
 from search import LAST_SYNCED_AT_KEY as POST_CACHE_LAST_SYNCED_AT_KEY
 
@@ -82,24 +85,32 @@ class Publisher:
             raise ValueError("Metadata cache service is required when SCF enrichment is enabled")
         self.metadata = TrackerMetadataAdapter(metadata_cache) if self._fill_scf_enabled else None
         self.spotify = spotify
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def close(self):
         """Close WordPress client."""
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
         await self.wordpress.close()
+
+    def _spawn(self, coroutine, label: str) -> None:
+        task = asyncio.create_task(coroutine, name=label)
+        tasks = getattr(self, "_background_tasks", None)
+        if tasks is None:
+            tasks = self._background_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def publish_release(self, release: Release, as_relisten: bool = False) -> PublishResult:
         """Publish a release to WordPress and return a typed publish outcome."""
         logger.info(f"Publishing {release.title} to WordPress")
 
         try:
-            # Ensure categories exist
-            await self._ensure_categories()
-
-            # Download and upload media
-            media_id = await self._upload_artwork(release)
-
-            # Resolve or create artist tags
-            tag_ids = await self._resolve_tags([a.name for a in release.artists])
+            _, media_id, tag_ids = await asyncio.gather(
+                self._ensure_categories(),
+                self._upload_artwork(release),
+                self._resolve_tags([a.name for a in release.artists]),
+            )
 
             # Determine categories
             category_ids = [self.category_cache[release.release_type.value]]
@@ -107,49 +118,96 @@ class Publisher:
                 category_ids.append(self.category_cache["Relisten"])
             if release.unreleased:
                 category_ids.append(self.category_cache[UNRELEASED_CATEGORY])
+            release.wordpress_media_id = media_id
 
-            # Create post
+            publish_date = datetime.now(timezone.utc)
             post_data = {
                 "title": release.title,
-                "content": "",  # Empty or minimal placeholder
+                "content": format_discord_content_for_wordpress(release.body_content),
                 "status": "publish",
                 "categories": category_ids,
                 "tags": tag_ids,
                 "featured_media": media_id if media_id else 0,
             }
-            if release.rating is not None or release.favorite or release.notes:
-                post_data["acf"] = TrackerMetadataAdapter.editor_acf(release)
+            editor_acf = TrackerMetadataAdapter.editor_acf(release)
+            post_data["acf"] = editor_acf
 
             # The active metadata contract records one listen per post.
             listen_count = 1
 
+            scf_pending_tags: list[str] = []
+            quick_metadata = QuickMetadata.from_release(release)
+            term_ids: Dict[str, Dict[str, int]] = {}
+            patch = None
+            if self.metadata is not None:
+                try:
+                    build_create_patch = getattr(
+                        self.metadata, "build_create_patch", None)
+                    if build_create_patch is not None:
+                        patch = await build_create_patch(
+                            release, tag_ids, category_ids, listen_count, publish_date)
+                    else:
+                        patch = await self.metadata.build_patch(release, {
+                            "id": 1,
+                            "title": {"rendered": release.title},
+                            "date": publish_date.isoformat(timespec="seconds"),
+                            "tags": list(tag_ids),
+                            "categories": list(category_ids),
+                            "artist": [], "genre": [], "release_type": [], "acf": {},
+                        }, tag_ids, category_ids, listen_count)
+                    term_ids = await self.wordpress.resolve_taxonomy_terms(
+                        patch["write"].get("taxonomies", {}))
+                    metadata_body = materialize_body(patch["write"], term_ids)
+                    post_data.update({
+                        key: value for key, value in metadata_body.items()
+                        if key != "acf"
+                    })
+                    post_data["acf"] = {
+                        **editor_acf, **metadata_body.get("acf", {})}
+                    quick_metadata.genres = list(
+                        patch["write"].get("taxonomies", {}).get("genre", []))
+                except Exception as metadata_error:
+                    logger.error("Metadata preparation failed: %s", metadata_error)
+                    scf_pending_tags.append("metadata_error")
+
             post = await self.wordpress.create_post(post_data)
             logger.info(f"Post created: {post['id']} - {post['title']}")
+
+            returned_acf = post.get("acf") if isinstance(post.get("acf"), dict) else None
+            if returned_acf is not None:
+                mismatches = [
+                    field for field in METADATA_VERIFY_FIELDS
+                    if field in post_data["acf"]
+                    and returned_acf.get(field) != post_data["acf"][field]
+                ]
+                if mismatches:
+                    logger.error(
+                        "Metadata create response mismatched for post %s: %s",
+                        post["id"], ", ".join(mismatches))
+                    if "metadata_error" not in scf_pending_tags:
+                        scf_pending_tags.append("metadata_error")
 
             release.wordpress_post_id = post["id"]
             release.wordpress_media_id = media_id
             release.published_at = None  # Will be set by tracker
 
-            scf_pending_tags: list[str] = []
-            quick_metadata = QuickMetadata.from_release(release)
-            if self.metadata is not None:
-                try:
-                    patch = await self._apply_shared_metadata(
-                        release, post, tag_ids, category_ids, listen_count)
-                    quick_metadata.genres = list(
-                        patch["write"].get("taxonomies", {}).get("genre", []))
-                except Exception as metadata_error:
-                    logger.error(
-                        "Metadata auto-fill failed for post %s: %s",
-                        post["id"], metadata_error)
-                    scf_pending_tags.append("metadata_error")
-
-            try:
-                await self.refresh_post_cache(force=True)
-            except Exception as e:
-                logger.error(f"Post cache refresh failed after publish: {e}")
-
-            await self._notify_musicblog("published", post["id"])
+            if db := getattr(self, "db", None):
+                await db.upsert_wordpress_post(WordPressPost(
+                    id=post["id"],
+                    title=release.title,
+                    normalized_title=normalize_text(release.title),
+                    artists=[artist.name for artist in release.artists],
+                    normalized_artists=normalize_artist_list(
+                        [artist.name for artist in release.artists]),
+                    link=post.get("link", ""),
+                ))
+            self._spawn(
+                self._finish_publish(
+                    post["id"], release, term_ids, post_data.get("acf", {}),
+                    returned_acf,
+                ),
+                f"finish-publish-{post['id']}",
+            )
 
             return PublishResult(
                 post=post,
@@ -162,6 +220,37 @@ class Publisher:
         except Exception as e:
             logger.error(f"Error publishing release: {e}")
             raise
+
+    async def _finish_publish(
+        self,
+        post_id: int,
+        release: Release,
+        term_ids: Dict[str, Dict[str, int]],
+        expected_acf: Dict[str, Any],
+        returned_acf: Optional[Dict[str, Any]],
+    ) -> None:
+        """Run verification and enrichment that do not gate publish success."""
+        try:
+            expected = {
+                field: expected_acf[field]
+                for field in METADATA_VERIFY_FIELDS if field in expected_acf
+            }
+            if expected:
+                persisted = returned_acf or await self.wordpress.get_post_acf(post_id)
+                mismatches = [
+                    field for field, value in expected.items()
+                    if persisted.get(field) != value
+                ]
+                if mismatches:
+                    logger.error(
+                        "Metadata verification failed for post %s: %s",
+                        post_id, ", ".join(mismatches))
+            await asyncio.gather(
+                self._populate_artist_images(release, term_ids.get("artist", {})),
+                self._notify_musicblog("published", post_id),
+            )
+        except Exception:
+            logger.exception("Post-publish maintenance failed for post %s", post_id)
 
     async def _notify_musicblog(self, event: str, post_id: int) -> None:
         """Notify the frontend without risking a duplicate WordPress publish."""
@@ -308,6 +397,37 @@ class Publisher:
             explicit=bool(acf.get("music_explicit")),
         )
 
+    async def get_post_editor_snapshot(self, post_id: int) -> Dict[str, Any]:
+        """Return one-request editor state plus display metadata."""
+        post = await self.wordpress.get_post_editor_snapshot(post_id)
+        acf = post.get("acf") if isinstance(post.get("acf"), dict) else {}
+        content = post.get("content") if isinstance(post.get("content"), dict) else {}
+        term_names: Dict[str, list[str]] = {
+            "artist": [], "genre": [], "release_type": [], "category": []}
+        embedded = post.get("_embedded") if isinstance(post.get("_embedded"), dict) else {}
+        for group in embedded.get("wp:term", []):
+            for term in group if isinstance(group, list) else []:
+                taxonomy = term.get("taxonomy") if isinstance(term, dict) else None
+                name = term.get("name") if isinstance(term, dict) else None
+                if taxonomy in term_names and isinstance(name, str):
+                    term_names[taxonomy].append(name)
+        title = post.get("title") if isinstance(post.get("title"), dict) else {}
+        return {
+            "acf": acf,
+            "body": str(content.get("raw") or ""),
+            "title": str(title.get("rendered") or title.get("raw") or f"post {post_id}"),
+            "unreleased": UNRELEASED_CATEGORY in term_names["category"],
+            "quick_metadata": QuickMetadata(
+                artists=term_names["artist"],
+                genres=term_names["genre"],
+                release_type=(term_names["release_type"] or ["—"])[0],
+                release_date=str(acf.get("music_release_date") or "—"),
+                total_tracks=_safe_int(acf.get("music_total_tracks")),
+                duration_ms=_safe_int(acf.get("music_length_ms")),
+                explicit=bool(acf.get("music_explicit")),
+            ),
+        }
+
     async def retry_post_metadata(
         self, release: Release, post_id: int, listen_count: int = 1
     ) -> None:
@@ -373,6 +493,8 @@ class Publisher:
 
     async def _resolve_tags(self, artist_names: list) -> list:
         """Resolve or create artist tags."""
+        if all(name in self.tag_cache for name in artist_names):
+            return [self.tag_cache[name] for name in artist_names]
         tag_ids = []
 
         # Get all existing tags
@@ -397,6 +519,8 @@ class Publisher:
 
     async def _upload_artwork(self, release: Release) -> Optional[int]:
         """Download Spotify artwork and upload to WordPress."""
+        if release.wordpress_media_id:
+            return release.wordpress_media_id
         try:
             # Download image from Spotify
             async with httpx.AsyncClient(timeout=30.0) as client:
