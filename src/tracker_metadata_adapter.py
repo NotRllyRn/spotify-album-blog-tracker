@@ -92,7 +92,7 @@ class TrackerMetadataAdapter:
     def editor_acf(release: Release) -> dict:
         """Values owned by the pre-publication editor, not metadata providers."""
         return {
-            "music_rating": release.rating if release.rating is not None else "",
+            **({"music_rating": release.rating} if release.rating is not None else {}),
             "music_favorite": release.favorite,
             "music_notes": release.notes or "",
         }

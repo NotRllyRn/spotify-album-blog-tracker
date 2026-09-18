@@ -197,6 +197,12 @@ class WordPressClient:
         """Create a new post."""
         url = f"{self.api_url}/posts"
         response = await self.client.post(url, json=data)
+        if not response.is_success:
+            logger.error(
+                "WordPress post creation failed: %s; payload types: %s",
+                _response_error_summary(response),
+                _payload_type_summary(data),
+            )
         response.raise_for_status()
         return response.json()
 

@@ -123,6 +123,12 @@ class TrackerMetadataTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("spotify_title", patch["write"].get("acf", {}))
 
+    def test_editor_acf_omits_unset_numeric_rating(self):
+        self.assertEqual(TrackerMetadataAdapter.editor_acf(self.release), {
+            "music_favorite": False,
+            "music_notes": "",
+        })
+
     async def test_cli_and_tracker_materialize_identical_managed_request_body(self):
         patch = await self.adapter.build_patch(self.release, self.post, [7], [5], 3)
         expected = materialize_body(patch["write"], term_ids())

@@ -2801,6 +2801,35 @@ class TestWordPressMediaUpload(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipIf(httpx is None, "httpx is not installed")
 class TestWordPressUpdateErrors(unittest.IsolatedAsyncioTestCase):
+    async def test_create_error_logs_response_and_payload_types_without_values(self):
+        from wordpress_client import WordPressClient
+        client = WordPressClient.__new__(WordPressClient)
+        client.api_url = "https://example.com/wp-json/wp/v2"
+        request = httpx.Request("POST", f"{client.api_url}/posts")
+        response = httpx.Response(
+            400,
+            request=request,
+            json={
+                "code": "rest_invalid_param",
+                "message": "Invalid value: secret note",
+                "data": {"params": {"acf": "music_notes contains secret note"}},
+            },
+        )
+        client.client = MagicMock()
+        client.client.post = AsyncMock(return_value=response)
+        payload = {"acf": {"music_rating": "", "music_notes": "abc"}}
+
+        with self.assertLogs("wordpress_client", level="ERROR") as logs:
+            with self.assertRaises(httpx.HTTPStatusError):
+                await client.create_post(payload)
+
+        message = " ".join(logs.output)
+        self.assertIn("rest_invalid_param", message)
+        self.assertIn("music_rating=str", message)
+        self.assertIn("music_notes=str", message)
+        self.assertNotIn("abc", message)
+        self.assertNotIn("secret note", message)
+
     async def test_update_error_logs_response_and_payload_types_without_values(self):
         from wordpress_client import WordPressClient
         client = WordPressClient.__new__(WordPressClient)
