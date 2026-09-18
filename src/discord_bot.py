@@ -11,7 +11,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, cast
 from datetime import datetime, timedelta
-from urllib.parse import unquote, urlencode, urlparse, urlunparse
 
 from config import Config
 from database import Database
@@ -35,6 +34,7 @@ from search_view import (
     SearchPickerView,
     format_picker_embed,
 )
+from utils import public_album_link
 
 logger = logging.getLogger(__name__)
 
@@ -554,23 +554,7 @@ class DiscordBot:
     def _get_public_album_link(self, raw_link: Optional[str]) -> Optional[str]:
         if not raw_link:
             return None
-
-        try:
-            parsed_link = urlparse(raw_link)
-            slug = unquote(parsed_link.path.rstrip("/").rsplit("/", 1)[-1])
-            if not slug:
-                return raw_link
-            public_base = urlparse(self.config.musicblog_public_url.rstrip("/"))
-            return urlunparse((
-                public_base.scheme,
-                public_base.netloc,
-                "/",
-                "",
-                urlencode({"album": slug}),
-                "",
-            ))
-        except Exception:
-            return raw_link
+        return public_album_link(raw_link, self.config.musicblog_public_url)
 
     async def update_presence(self, state) -> None:
         """Update the bot presence to reflect current listening state."""

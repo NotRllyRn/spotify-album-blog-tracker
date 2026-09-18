@@ -26,7 +26,7 @@ from typing import Any, List, Optional, Protocol
 
 from rapidfuzz import fuzz
 
-from utils import normalize_artist_name, normalize_text
+from utils import normalize_artist_name, normalize_text, public_album_link
 
 
 # --- Constants --------------------------------------------------------------
@@ -159,7 +159,7 @@ class _RawPostProxy:
             for tag_id in payload.get("tags", [])
             if tag_id in tags_by_id
         ]
-        self.link = str(payload.get("link", "") or "")
+        self.link = public_album_link(str(payload.get("link", "") or ""))
 
 
 async def search_live(

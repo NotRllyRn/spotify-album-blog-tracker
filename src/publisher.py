@@ -23,7 +23,7 @@ from artist_images import (
 from wordpress_client import WordPressClient
 from models import PublishResult, QuickMetadata, Release
 from models import WordPressPost
-from utils import normalize_artist_list, normalize_text
+from utils import normalize_artist_list, normalize_text, public_album_link
 from tracker_metadata_adapter import TrackerMetadataAdapter  # pyright: ignore[reportMissingImports]
 from search import LAST_SYNCED_AT_KEY as POST_CACHE_LAST_SYNCED_AT_KEY
 
@@ -199,7 +199,7 @@ class Publisher:
                     artists=[artist.name for artist in release.artists],
                     normalized_artists=normalize_artist_list(
                         [artist.name for artist in release.artists]),
-                    link=post.get("link", ""),
+                    link=public_album_link(post.get("link", "")),
                 ))
             self._spawn(
                 self._finish_publish(
@@ -585,7 +585,7 @@ class Publisher:
                     normalized_title=normalize_text(post["title"]["rendered"]),
                     artists=post_tags,
                     normalized_artists=normalize_artist_list(post_tags),
-                    link=post.get("link", "")
+                    link=public_album_link(post.get("link", ""))
                 )
                 cache.append(cache_item)
 
