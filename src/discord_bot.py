@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, cast
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import unquote, urlencode, urlparse, urlunparse
 
 from config import Config
 from database import Database
@@ -551,18 +551,24 @@ class DiscordBot:
             logger.error(f"Unable to send Discord DM: {e}")
             return None
 
-    def _get_public_wordpress_link(self, raw_link: Optional[str]) -> Optional[str]:
+    def _get_public_album_link(self, raw_link: Optional[str]) -> Optional[str]:
         if not raw_link:
             return None
 
         try:
             parsed_link = urlparse(raw_link)
-            public_base = urlparse(self.config.wordpress_public_url.rstrip("/"))
-
-            if not parsed_link.path:
+            slug = unquote(parsed_link.path.rstrip("/").rsplit("/", 1)[-1])
+            if not slug:
                 return raw_link
-
-            return urlunparse((public_base.scheme, public_base.netloc, parsed_link.path, parsed_link.params, parsed_link.query, parsed_link.fragment))
+            public_base = urlparse(self.config.musicblog_public_url.rstrip("/"))
+            return urlunparse((
+                public_base.scheme,
+                public_base.netloc,
+                "/",
+                "",
+                urlencode({"album": slug}),
+                "",
+            ))
         except Exception:
             return raw_link
 
@@ -651,8 +657,8 @@ class DiscordBot:
             color=0x1DB954
         )
         embed.add_field(name="Post ID", value=str(post["id"]), inline=True)
-        wordpress_link = self._get_public_wordpress_link(post.get("link") or post.get("guid", ""))
-        embed.add_field(name="WordPress link", value=wordpress_link or "Unavailable", inline=False)
+        album_link = self._get_public_album_link(post.get("link") or post.get("guid", ""))
+        embed.add_field(name="Album link", value=album_link or "Unavailable", inline=False)
         embed.add_field(name="Release type", value=release.release_type.value, inline=True)
         embed.add_field(name="Progress", value=f"{_progress_percent(release.progress)}%", inline=True)
         embed.set_thumbnail(url=release.cover_url)

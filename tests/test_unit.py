@@ -2379,7 +2379,7 @@ class TestPublishNotificationEmbed(unittest.IsolatedAsyncioTestCase):
         self.bot = DiscordBot.__new__(DiscordBot)
         self.bot.config = type("FakeConfig", (), {
             "discord_user_id": 123,
-            "wordpress_public_url": "https://public.example.com",
+            "musicblog_public_url": "https://music.callita.day",
         })()
         self.bot.db = AsyncMock()
         self.bot.db.save_discord_prompt = AsyncMock()
@@ -2413,6 +2413,14 @@ class TestPublishNotificationEmbed(unittest.IsolatedAsyncioTestCase):
             return call.kwargs["content"]
         return call.args[0]
 
+    def test_album_link_uses_frontend_slug_format(self):
+        self.assertEqual(
+            self.bot._get_public_album_link(
+                "http://wordpress.internal/black-boy-alternative/"
+            ),
+            "https://music.callita.day/?album=black-boy-alternative",
+        )
+
     async def test_default_content_announces_auto_fill(self):
         result = PublishResult(post=self.make_post(), scf_pending_tags=[], listen_count=1)
 
@@ -2421,6 +2429,11 @@ class TestPublishNotificationEmbed(unittest.IsolatedAsyncioTestCase):
         self.assertIn("metadata was filled automatically", self.extract_content())
         self.assertNotIn("metadata update failed", self.extract_content())
         field_names = [f.name for f in self.extract_embed().fields]
+        field_map = {f.name: f.value for f in self.extract_embed().fields}
+        self.assertEqual(
+            field_map["Album link"],
+            "https://music.callita.day/?album=album-embed",
+        )
         self.assertNotIn("Listen count", field_names)
         self.assertNotIn("⚠️ Metadata", field_names)
 

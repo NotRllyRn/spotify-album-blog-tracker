@@ -32,7 +32,8 @@ class Config:
 
         # WordPress
         self.wordpress_url = os.getenv("WORDPRESS_URL")
-        self.wordpress_public_url = os.getenv("WORDPRESS_PUBLIC_URL", "https://musicblog.callita.day")  # Used for links in posts
+        self.musicblog_public_url = os.getenv(
+            "MUSICBLOG_PUBLIC_URL", "https://music.callita.day")
         self.wordpress_username = os.getenv("WORDPRESS_USERNAME")
         self.wordpress_app_password = os.getenv("WORDPRESS_APP_PASSWORD")
         self.musicblog_webhook_url = os.getenv("MUSICBLOG_WEBHOOK_URL")
