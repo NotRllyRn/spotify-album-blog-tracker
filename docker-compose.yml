@@ -12,3 +12,10 @@ services:
     restart: unless-stopped
     stdin_open: true
     tty: true
+    networks:
+      - default
+      - lan_net
+networks:
+  lan_net:
+    external: true
+    name: lan_net
